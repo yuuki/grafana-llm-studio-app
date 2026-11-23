@@ -123,36 +123,49 @@ describe('Studio i18n shared i18next integration & locale parity', () => {
     );
   });
 
-  test('works cleanly with Grafana SystemJS Module Namespace Objects that omit EventEmitter prototype methods (.on/.off)', async () => {
-    const realInstance = i18next.createInstance();
-    await realInstance.init({
-      lng: 'ja-JP',
-      fallbackLng: 'en-US',
-      resources: {},
-      initAsync: false,
-      showSupportNotice: false,
-    });
+  test.each([
+    ['en-US', 'en', 'Permissions & Security Policy', 'Generate Dashboard Draft'],
+    ['ja-JP', 'ja', '権限とセキュリティ方針', 'ダッシュボード案を生成'],
+    ['fr-FR', 'en', 'Permissions & Security Policy', 'Generate Dashboard Draft'],
+  ] as const)(
+    'works cleanly with Grafana SystemJS i18next namespace + regional supportedLngs (lng: %s)',
+    async (grafanaLng, expectedLocale, expectedAppConfigTitle, expectedGenerateLabel) => {
+      const realInstance = i18next.createInstance();
+      await realInstance.init({
+        partialBundledLanguages: true,
+        resources: {},
+        returnEmptyString: false,
+        supportedLngs: ['en-US', 'ja-JP', 'fr-FR', 'pseudo'],
+        fallbackLng: 'en-US',
+        lng: grafanaLng,
+        ns: ['grafana'],
+        initAsync: false,
+        showSupportNotice: false,
+      });
 
-    // Simulate SystemJS `_export(getI18nInstance())`: only own enumerable properties are exposed.
-    const systemJsNamespace = Object.create(null) as Record<string, unknown>;
-    for (const key of Object.keys(realInstance)) {
-      systemJsNamespace[key] = (realInstance as unknown as Record<string, unknown>)[key];
+      // Simulate SystemJS `_export(getI18nInstance())`: only own enumerable properties are exposed.
+      const systemJsNamespace = Object.create(null) as Record<string, unknown>;
+      for (const key of Object.keys(realInstance)) {
+        systemJsNamespace[key] = (realInstance as unknown as Record<string, unknown>)[key];
+      }
+      expect(typeof systemJsNamespace.on).toBe('undefined');
+      expect(typeof systemJsNamespace.off).toBe('undefined');
+
+      const Probe: React.FC = () => {
+        const { t: hookT, locale } = useStudioTranslation(
+          systemJsNamespace as unknown as Parameters<typeof useStudioTranslation>[0]
+        );
+        return React.createElement(
+          'div',
+          { 'data-testid': 'probe' },
+          `${locale}|${hookT('appConfig.securityAlert.title')}|${hookT('studio.actions.generateDraft')}`
+        );
+      };
+
+      render(React.createElement(Probe));
+      expect(screen.getByTestId('probe').textContent).toBe(
+        `${expectedLocale}|${expectedAppConfigTitle}|${expectedGenerateLabel}`
+      );
     }
-    expect(typeof systemJsNamespace.on).toBe('undefined');
-    expect(typeof systemJsNamespace.off).toBe('undefined');
-
-    const Probe: React.FC = () => {
-      const { locale, i18n } = useStudioTranslation(
-        systemJsNamespace as unknown as Parameters<typeof useStudioTranslation>[0]
-      );
-      return React.createElement(
-        'div',
-        { 'data-testid': 'probe' },
-        `${locale}:${String(i18n.t('studio.actions.generateDraft', { ns: STUDIO_I18N_NS, lng: locale }))}`
-      );
-    };
-
-    render(React.createElement(Probe));
-    expect(screen.getByTestId('probe').textContent).toBe('ja:ダッシュボード案を生成');
-  });
+  );
 });

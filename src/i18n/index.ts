@@ -110,22 +110,45 @@ export async function setStudioLocale(
   return getActiveLocale(instance);
 }
 
+function lookupBundleValue(bundle: Record<string, unknown>, key: string): string | undefined {
+  let current: unknown = bundle;
+  for (const segment of key.split('.')) {
+    if (typeof current !== 'object' || current === null || !(segment in current)) {
+      return undefined;
+    }
+    current = (current as Record<string, unknown>)[segment];
+  }
+  return typeof current === 'string' ? current : undefined;
+}
+
 /**
- * Translates a strongly-typed plugin key using Grafana's shared i18next runtime.
- * Always disables HTML escaping so interpolated PromQL snippets, URLs, and API errors render verbatim in React.
+ * Translates a strongly-typed plugin key against a given i18next instance / SystemJS module namespace.
+ * Never forces short `lng` / `fallbackLng` codes (like `en` / `ja`) because Grafana initializes shared i18next
+ * with regional `supportedLngs` (`['en-US', 'ja-JP', ...]`), which causes i18next to ignore non-listed short tags.
+ * Also passes the English resource string as `defaultValue` and disables HTML escaping for PromQL / URL safety.
  */
-export function t(key: TranslationKey, values?: Record<string, string | number>): string {
-  const instance = initStudioI18n();
-  const lng = getActiveLocale(instance);
+export function translateWithInstance(
+  instance: I18nInstance,
+  key: TranslationKey,
+  values?: Record<string, string | number>
+): string {
+  const ready = initStudioI18n(instance);
+  const defaultValue = lookupBundleValue(en as unknown as Record<string, unknown>, key);
   return String(
-    instance.t(key, {
+    ready.t(key, {
       ns: STUDIO_I18N_NS,
-      lng,
-      fallbackLng: DEFAULT_LOCALE,
+      defaultValue,
       interpolation: { escapeValue: false },
       ...values,
     })
   );
+}
+
+/**
+ * Translates a strongly-typed plugin key using Grafana's shared i18next runtime.
+ */
+export function t(key: TranslationKey, values?: Record<string, string | number>): string {
+  return translateWithInstance(getSharedI18n(), key, values);
 }
 
 /**
@@ -154,8 +177,13 @@ export function useStudioTranslation(instanceOverride?: I18nInstance) {
     };
   }, [instance]);
 
+  const boundT = instanceOverride
+    ? (key: TranslationKey, values?: Record<string, string | number>) =>
+        translateWithInstance(instance, key, values)
+    : t;
+
   return {
-    t,
+    t: boundT,
     locale,
     i18n: instance,
   };
