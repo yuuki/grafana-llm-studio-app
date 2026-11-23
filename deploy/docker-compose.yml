@@ -2,7 +2,8 @@ services:
   # ローカル開発・検証用構成（本番配備ではイメージを @sha256 ダイジェスト固定し、
   # 開発用プロビジョニングや sample-metrics を除外する）
   grafana:
-    image: grafana/grafana-oss:12.4.15
+    # 検証・サポート対象: 13.3.1 (React 19, 既定) または 12.4.15 (React 18)
+    image: grafana/grafana-oss:${GRAFANA_VERSION:-13.3.1}
     ports:
       - "127.0.0.1:3000:3000"
     environment:
@@ -24,7 +25,8 @@ services:
       - ./grafana/provisioning/datasources:/etc/grafana/provisioning/datasources:ro
       # 注意: provisioning/plugins/llm-studio-dev.yaml は開発・モック検証専用。本番閉域環境ではマウントしない。
       - ./grafana/provisioning/plugins:/etc/grafana/provisioning/plugins:ro
-      # 実 LLM 接続テスト時はオフライン搬入した grafana-llm-app v1.0.8 を以下へマウントする:
+      # 実 LLM 接続テスト時はオフライン搬入した grafana-llm-app を以下へマウントする:
+      # (Grafana 13.3.1 の場合は v1.2.0、Grafana 12.4.15 の場合は v1.0.8)
       # - ./offline-plugins/grafana-llm-app:/var/lib/grafana/plugins/grafana-llm-app:ro
     depends_on:
       - prometheus

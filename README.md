@@ -5,9 +5,9 @@ Grafana 内で自然言語からメトリクス根拠付きのダッシュボー
 
 ## 設計原則と対象範囲（MVP）
 
-- **対象バージョン固定**: **Grafana OSS `12.4.15`**（依存関係を含め固定。v11 以降の全バージョン動作は主張しません）
+- **対象バージョン固定**: **Grafana OSS `13.3.1`（React 19 系）** および **Grafana OSS `12.4.15`（React 18 系）**（`grafanaDependency: ">=12.4.0 <14.0.0"`。v11 以前や未検証の v14 以降は対象外）
 - **完全オフライン・閉域動作**: 実行時に Grafana Cloud、Grafana Assistant、外部 LLM API、外部 CDN を一切使用しません。
-- **LLM 経路の一本化**: `Frontend -> Custom App Go Backend -> Grafana plugin resource API -> grafana-llm-app (v1.0.8) -> ローカル vLLM`
+- **LLM 経路の一本化**: `Frontend -> Custom App Go Backend -> Grafana plugin resource API -> grafana-llm-app (13.x: v1.2.0 / 12.4.x: v1.0.8) -> ローカル vLLM`
   - Custom App からローカル LLM への直結経路や汎用 LLM プロキシは持ちません。
   - Go Backend は公式 `github.com/grafana/grafana-llm-app/llmclient` (`v0.20.0`) を使用します。
   - 開発用 `llmMode=mock` は `allowMockInDev=true` の明示指定が必要であり、本番モード (`grafana-llm-app`) 失敗時に暗黙フォールバックしません。
@@ -61,6 +61,7 @@ CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o dist/gpx_yuuki_llmstudio_app_l
 ```bash
 make build
 cp deploy/.env.example deploy/.env
+# 既定で Grafana OSS 13.3.1 (React 19) を起動。12.4.15 (React 18) を検証する場合は GRAFANA_VERSION=12.4.15 を指定
 docker compose -f deploy/docker-compose.yml up -d
 ```
 
@@ -68,11 +69,11 @@ docker compose -f deploy/docker-compose.yml up -d
 2. 左メニューから **LLM Dashboard Studio** (`/a/yuuki-llmstudio-app`) を開く。
 3. データソース `Prometheus Main (prom-main)`、スコープ `service = checkout-api` でメトリクスを取得し、自然言語生成 → 検証・プレビュー → 部分修正 → 新規保存 / JSON エクスポートを確認する。
 
-> 実 LLM (vLLM) へ接続する場合は、閉域搬入した `grafana-llm-app v1.0.8` をマウント・設定し、App Config で `llmMode` を `grafana-llm-app` へ切り替え、Viewer ロールのサービスアカウントトークンを `secureJsonData` に登録してください。
+> 実 LLM (vLLM) へ接続する場合は、閉域搬入した `grafana-llm-app`（Grafana 13.3.1 は `v1.2.0`、12.4.15 は `v1.0.8`）をマウント・設定し、App Config で `llmMode` を `grafana-llm-app` へ切り替え、Viewer ロールのサービスアカウントトークンを `secureJsonData` に登録してください。
 
 ## 既知の制限
 
 1. 単一 Backend プロセス内のメモリ上でジョブを管理するため、Grafana 再起動でドラフトジョブは失効します（マルチレプリカ間の継続処理は MVP 対象外）。
-2. `grafana-llm-app v1.0.8` (`go-openai v1.41.2`) の仕様により、`response_format.json_schema.schema` の数値範囲・文字数制限・`pattern` や `extra_body` はプロキシ時に欠落します。構造・`additionalProperties:false`・文字列 `enum` は vLLM 制約生成で強制し、残余の境界・PromQL AST・カタログ照合は Go Backend の決定的検査で担保します。
+2. `grafana-llm-app` (`v1.0.8` / `v1.2.0`) の仕様により、`response_format.json_schema.schema` の数値範囲・文字数制限・`pattern` や `extra_body` はプロキシ時に欠落します。構造・`additionalProperties:false`・文字列 `enum` は vLLM 制約生成で強制し、残余の境界・PromQL AST・カタログ照合は Go Backend の決定的検査で担保します。
 3. 静的 PromQL 検査だけでは系列数やクエリ負荷を完全には予測できません。Prometheus / VictoriaMetrics 側のクエリタイムアウト・同時実行数・最大系列数上限の設定が必須です。
-4. 実 GPU / vLLM ノードおよび実稼働 Grafana コンテナ上での統合 E2E は本開発環境では未実行です（Go/TS 単体テスト、Scenes/Foundation パリティテスト、`grafana-llm-app` 契約テストのみローカル検証済み）。
+4. 実 GPU / vLLM ノードおよび実稼働 Grafana (`13.3.1` / `12.4.15`) コンテナ上での統合 E2E は本開発環境では未実行です（Go/TS 単体テスト、Scenes/Foundation パリティテスト、`grafana-llm-app` 契約テスト、公式 `@grafana/react-detect` スキャンのみローカル検証済み）。

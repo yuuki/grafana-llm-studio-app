@@ -1,7 +1,7 @@
 # ADR-001: LLM 接続の `grafana-llm-app` 一本化と Structured Output 契約制約
 
 - ステータス: 採用（2026-11-22）
-- 対象バージョン: `grafana-llm-app v1.0.8`, `llmclient v0.20.0`, `go-openai v1.41.1 / v1.41.2`, `vLLM >= v0.12.0`
+- 対象バージョン: `Grafana OSS v12.4.15 / v13.3.1`, `grafana-llm-app v1.0.8 (12.4.x) / v1.2.0 (13.x)`, `llmclient v0.20.0`, `go-openai v1.41.1 / v1.41.2 / v1.42.0`, `vLLM >= v0.12.0`
 
 ## コンテキスト
 ローカル推論基盤 (vLLM) への接続先 URL、資格情報、モデル名マッピングをカスタム App 側へ分散させると、資格情報管理とガバナンスが二重化する。また、通信障害リトライと意味的な修復ループが入れ子になると推論負荷が増幅する。

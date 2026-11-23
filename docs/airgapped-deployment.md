@@ -9,12 +9,14 @@
 
 ```bash
 # 例: バージョン固定イメージの取得とエクスポート
-docker pull grafana/grafana-oss:12.4.15
+# Grafana 13 系を使う場合（推奨・React 19）: grafana/grafana-oss:13.3.1
+# Grafana 12.4 系を使う場合（React 18）: grafana/grafana-oss:12.4.15
+docker pull grafana/grafana-oss:13.3.1
 docker pull prom/prometheus:v3.5.0
 # vLLM イメージは選定モデル対応バージョンを明示固定する（例: vllm/vllm-openai:<pinned-tag>）
 
 docker save \
-  grafana/grafana-oss:12.4.15 \
+  grafana/grafana-oss:13.3.1 \
   prom/prometheus:v3.5.0 \
   -o airgap-images.tar
 sha256sum airgap-images.tar > airgap-images.tar.sha256
@@ -34,9 +36,10 @@ sha256sum airgap-images.tar > airgap-images.tar.sha256
    tar -czf yuuki-llmstudio-app-0.1.0.tar.gz -C dist .
    sha256sum yuuki-llmstudio-app-0.1.0.tar.gz > yuuki-llmstudio-app-0.1.0.tar.gz.sha256
    ```
-2. **公式 `grafana-llm-app` (`v1.0.8`)**:
-   - Grafana Plugin Catalog または GitHub Release (`v1.0.8`) の署名済み zip アーカイブをダウンロードし、SHA-256 を検証・記録して搬入する。
+2. **公式 `grafana-llm-app`（Grafana 13.x: `v1.2.0` / Grafana 12.4.x: `v1.0.8`）**:
+   - Grafana 13.3.1 へ配備する場合は **`v1.2.0`**（`grafanaDependency: ">=13.0.0-0"`）、Grafana 12.4.15 へ配備する場合は **`v1.0.8`**（`grafanaDependency: ">=9.5.2"`）の署名済み zip アーカイブをダウンロードし、SHA-256 を検証・記録して搬入する。
    - **実行時の `GF_INSTALL_PLUGINS` による自動ダウンロードは閉域では使用しない。**
+   - Grafana 13.0 以降では `grafana-cli` / `grafana-server` コマンドが削除され、`grafana cli` / `grafana server` に統一されている点、および初回起動時にダッシュボード・フォルダが Unified Storage へ自動移行される点に注意する（アップグレード前の DB バックアップ必須）。
 
 ### 1.3 LLM モデルと Tokenizer の Revision 固定搬入
 - Hugging Face の特定コミット SHA（`main` ブランチ名ではなく 40 桁コミットハッシュ）を指定して重み・`config.json`・`tokenizer.json`・`tokenizer_config.json`・chat template / encoding ファイルを一式ダウンロードする。

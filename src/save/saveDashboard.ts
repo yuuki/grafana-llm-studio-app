@@ -60,7 +60,7 @@ export function generateDashboardUid(): string {
 }
 
 /**
- * Derives the Grafana v12.4.15 API namespace for the active organization.
+ * Derives the Grafana v12.4.15 / v13.3.1 API namespace for the active organization.
  * Prefers Grafana's config.namespace when present (M-10).
  */
 export function getOrgNamespace(orgId?: number): string {
@@ -71,37 +71,75 @@ export function getOrgNamespace(orgId?: number): string {
   return id === 1 ? 'default' : `org-${id}`;
 }
 
-/**
- * Lists folders visible to the logged-in user via Grafana's Folder API.
- * Uses showErrorAlert: false so Viewer accounts without folders:read do not see spurious error toasts (M-10).
- */
-export async function listWritableFolders(): Promise<GrafanaFolderOption[]> {
-  const res = await lastValueFrom(
-    getBackendSrv().fetch<Array<{ uid: string; title: string }>>({
-      url: '/api/folders',
-      method: 'GET',
-      params: {
-        limit: 100,
-        permission: 'Edit',
-      },
-      showErrorAlert: false,
-    })
-  );
-  const folders = res.data;
-  const list: GrafanaFolderOption[] = [{ uid: '', title: 'General (Root)' }];
-  if (Array.isArray(folders)) {
-    for (const f of folders) {
-      if (f.uid && f.title) {
-        list.push({ uid: f.uid, title: f.title });
-      }
-    }
-  }
-  return list;
+interface FolderV1Beta1ListResponse {
+  items?: Array<{
+    metadata?: { name?: string };
+    spec?: { title?: string };
+  }>;
 }
 
 /**
- * Create-only Dashboard saver pinned to Grafana OSS 12.4.15 Kubernetes-style Dashboard API:
+ * Lists folders visible to the logged-in user via Grafana's Folder API.
+ * Uses `/api/folders?permission=Edit` (active in Grafana 12.4.x and 13.x) for write-permission filtering,
+ * and falls back to `/apis/folder.grafana.app/v1beta1/namespaces/{namespace}/folders` if legacy `/api`
+ * endpoints are disabled (404/410). Save authorization is always enforced server-side on POST.
+ * Uses showErrorAlert: false so Viewer accounts without folders:read do not see spurious error toasts (M-10).
+ */
+export async function listWritableFolders(): Promise<GrafanaFolderOption[]> {
+  const list: GrafanaFolderOption[] = [{ uid: '', title: 'General (Root)' }];
+  try {
+    const res = await lastValueFrom(
+      getBackendSrv().fetch<Array<{ uid: string; title: string }>>({
+        url: '/api/folders',
+        method: 'GET',
+        params: {
+          limit: 100,
+          permission: 'Edit',
+        },
+        showErrorAlert: false,
+      })
+    );
+    const folders = res.data;
+    if (Array.isArray(folders)) {
+      for (const f of folders) {
+        if (f.uid && f.title) {
+          list.push({ uid: f.uid, title: f.title });
+        }
+      }
+    }
+    return list;
+  } catch (err: unknown) {
+    const status = (err as { status?: number })?.status;
+    if (status !== 404 && status !== 410) {
+      throw err;
+    }
+    const namespace = getOrgNamespace();
+    const fallback = await lastValueFrom(
+      getBackendSrv().fetch<FolderV1Beta1ListResponse>({
+        url: `/apis/folder.grafana.app/v1beta1/namespaces/${encodeURIComponent(namespace)}/folders`,
+        method: 'GET',
+        params: { limit: 100 },
+        showErrorAlert: false,
+      })
+    );
+    const items = fallback.data?.items;
+    if (Array.isArray(items)) {
+      for (const item of items) {
+        const uid = item.metadata?.name;
+        const title = item.spec?.title;
+        if (uid && title) {
+          list.push({ uid, title });
+        }
+      }
+    }
+    return list;
+  }
+}
+
+/**
+ * Create-only Dashboard saver compatible with Grafana OSS 12.4.15 and 13.3.1 Kubernetes-style Dashboard API:
  *   POST /apis/dashboard.grafana.app/v1beta1/namespaces/{namespace}/dashboards
+ * (In Grafana 13.x, `v1beta1` is a schema-identical alias of `v1`.)
  *
  * Guarantees:
  * - Uses the logged-in user's Grafana session (never an app backend service account).

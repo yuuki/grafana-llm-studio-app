@@ -1,7 +1,7 @@
 import { Observable, of, throwError } from 'rxjs';
 import { DashboardIR } from '../ir/types';
 import { normalizeDashboardIR } from '../spec/normalize';
-import { DashboardSaver, SaveDashboardError } from './saveDashboard';
+import { DashboardSaver, listWritableFolders, SaveDashboardError } from './saveDashboard';
 
 const mockFetch = jest.fn();
 
@@ -144,5 +144,33 @@ describe('Create-only DashboardSaver (Grafana 12.4.15 v1beta1)', () => {
     resolveFirst();
     await first;
     expect(mockFetch).toHaveBeenCalledTimes(1);
+  });
+
+  test('listWritableFolders falls back to folder.grafana.app/v1beta1 when legacy /api/folders returns 404 (Grafana 13+)', async () => {
+    mockConfig.namespace = 'org-7';
+    mockFetch
+      .mockReturnValueOnce(throwError(() => ({ status: 404, data: { message: 'Not Found' } })))
+      .mockReturnValueOnce(
+        of({
+          data: {
+            items: [
+              { metadata: { name: 'folder-sre' }, spec: { title: 'SRE Team' } },
+              { metadata: { name: 'folder-app' }, spec: { title: 'App Team' } },
+            ],
+          },
+        })
+      );
+
+    const folders = await listWritableFolders();
+    expect(folders).toEqual([
+      { uid: '', title: 'General (Root)' },
+      { uid: 'folder-sre', title: 'SRE Team' },
+      { uid: 'folder-app', title: 'App Team' },
+    ]);
+    expect(mockFetch).toHaveBeenCalledTimes(2);
+    expect(mockFetch.mock.calls[0][0].url).toBe('/api/folders');
+    expect(mockFetch.mock.calls[1][0].url).toBe(
+      '/apis/folder.grafana.app/v1beta1/namespaces/org-7/folders'
+    );
   });
 });
