@@ -1,19 +1,19 @@
-# 閉域網（エアギャップ）搬入・配備・運用手順
+# Air-Gapped Deployment & Operations Guide
 
-本手順は、実行時にインターネット接続・外部 CDN・Grafana Cloud・外部 LLM API を一切使用せずに `yuuki-llmstudio-app` を閉域網へ配備するための標準手順である。
+This guide describes how to package, transfer, deploy, and operate `yuuki-llmstudio-app` in an air-gapped (offline) environment with zero runtime access to the internet, external CDNs, Grafana Cloud, or external LLM APIs.
 
-## 1. 事前準備（インターネット接続のあるステージング環境での収集）
+## 1. Staging Preparation (Internet-Connected Staging Host)
 
-### 1.1 コンテナイメージの固定・保存
-タグではなく可能な限りダイジェスト (`@sha256:...`) を記録した上で `docker save` で tarball 化する。
+### 1.1 Pin and Export Container Images
+Record immutable image digests (`@sha256:...`) wherever possible before exporting with `docker save`.
 
 ```bash
-# 例: バージョン固定イメージの取得とエクスポート
-# Grafana 13 系を使う場合（推奨・React 19）: grafana/grafana-oss:13.3.1
-# Grafana 12.4 系を使う場合（React 18）: grafana/grafana-oss:12.4.15
+# Pull pinned versions:
+# For Grafana 13.x (recommended, React 19): grafana/grafana-oss:13.3.1
+# For Grafana 12.4.x (React 18):            grafana/grafana-oss:12.4.15
 docker pull grafana/grafana-oss:13.3.1
 docker pull prom/prometheus:v3.5.0
-# vLLM イメージは選定モデル対応バージョンを明示固定する（例: vllm/vllm-openai:<pinned-tag>）
+# Pin the vLLM image tag/digest validated for your target model (e.g., vllm/vllm-openai:<pinned-tag>)
 
 docker save \
   grafana/grafana-oss:13.3.1 \
@@ -22,55 +22,45 @@ docker save \
 sha256sum airgap-images.tar > airgap-images.tar.sha256
 ```
 
-### 1.2 プラグイン資材と依存パッケージのオフラインバンドル
-1. **Custom App Plugin (`yuuki-llmstudio-app`)**:
+### 1.2 Bundle Plugins and Offline Dependencies
+1. **Custom App Plugin (`yuuki-llmstudio-app`):**
    ```bash
-   # 依存のオフラインキャッシュ作成（閉域内で再ビルドする場合）
+   # Optional: create offline caches if rebuilding inside the air-gapped network
    go mod vendor
    npm ci --prefer-offline
 
-   # ビルド済み成果物（dist/）の作成
+   # Build distributable plugin bundle (dist/)
    npm run verify:schemas
    npm run build
    CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -mod=vendor -o dist/gpx_yuuki_llmstudio_app_linux_amd64 ./pkg
    tar -czf yuuki-llmstudio-app-0.1.0.tar.gz -C dist .
    sha256sum yuuki-llmstudio-app-0.1.0.tar.gz > yuuki-llmstudio-app-0.1.0.tar.gz.sha256
    ```
-2. **公式 `grafana-llm-app`（Grafana 13.x: `v1.2.0` / Grafana 12.4.x: `v1.0.8`）**:
-   - Grafana 13.3.1 へ配備する場合は **`v1.2.0`**（`grafanaDependency: ">=13.0.0-0"`）、Grafana 12.4.15 へ配備する場合は **`v1.0.8`**（`grafanaDependency: ">=9.5.2"`）の署名済み zip アーカイブをダウンロードし、SHA-256 を検証・記録して搬入する。
-   - **実行時の `GF_INSTALL_PLUGINS` による自動ダウンロードは閉域では使用しない。**
-   - Grafana 13.0 以降では `grafana-cli` / `grafana-server` コマンドが削除され、`grafana cli` / `grafana server` に統一されている点、および初回起動時にダッシュボード・フォルダが Unified Storage へ自動移行される点に注意する（アップグレード前の DB バックアップ必須）。
+2. **Official `grafana-llm-app` (Grafana 13.x: `v1.2.0` / Grafana 12.4.x: `v1.0.8`):**
+   - Download the signed release archive for **`v1.2.0`** (`grafanaDependency: ">=13.0.0-0"`) on Grafana 13.3.1, or **`v1.0.8`** (`grafanaDependency: ">=9.5.2"`) on Grafana 12.4.15, verify its SHA-256 checksum, and transfer it offline.
+   - **Never rely on runtime `GF_INSTALL_PLUGINS` downloads in air-gapped environments.**
+   - **Grafana 13 upgrade notes:** Starting in Grafana 13.0, `grafana-cli` and `grafana-server` are removed in favor of `grafana cli` and `grafana server`. Dashboards and folders are also automatically migrated to Unified Storage on first startup—always back up the Grafana database before upgrading from 12.x to 13.x.
 
-### 1.3 LLM モデルと Tokenizer の Revision 固定搬入
-- Hugging Face の特定コミット SHA（`main` ブランチ名ではなく 40 桁コミットハッシュ）を指定して重み・`config.json`・`tokenizer.json`・`tokenizer_config.json`・chat template / encoding ファイルを一式ダウンロードする。
-- 全 `.safetensors` および設定ファイルの SHA-256 チェックサムマニフェストを生成し、閉域側で照合してから vLLM の読み取り専用ボリュームへマウントする。
-- vLLM 起動時はローカルディレクトリパスのみを指定し、`HF_HUB_OFFLINE=1` および `TRANSFORMERS_OFFLINE=1` を必ず設定する。
+### 1.3 Pin Model Weights and Tokenizer Revisions
+- Download model weights, `config.json`, `tokenizer.json`, `tokenizer_config.json`, and any chat template / custom encoding files pinned to an exact 40-character Hugging Face commit SHA (never a floating branch name such as `main`).
+- Generate a SHA-256 checksum manifest across all `.safetensors` and configuration files, verify checksums inside the air-gapped environment, and mount the model directory read-only into vLLM.
+- Always launch vLLM against the local filesystem path with `HF_HUB_OFFLINE=1` and `TRANSFORMERS_OFFLINE=1`.
 
-## 2. 閉域網での配備設定
+## 2. Air-Gapped Deployment Configuration
 
-### 2.1 未署名 Custom App Plugin の許可（対象 ID 明示）
-`grafana.ini` または環境変数で、**対象プラグイン ID のみを明示許可**する（ワイルドカードは使わない）。
+### 2.1 Explicit Unsigned Plugin Allowlist & Offline Grafana Hardening
+Allow **only** `yuuki-llmstudio-app` in `grafana.ini` or environment variables (never use wildcards):
 
 ```ini
 [plugins]
 allow_loading_unsigned_plugins = yuuki-llmstudio-app
-```
+public_key_retrieval_disabled = true
+plugin_admin_enabled = false
 
-環境変数の場合:
-```bash
-GF_PLUGINS_ALLOW_LOADING_UNSIGNED_PLUGINS=yuuki-llmstudio-app
-```
-
-外部通信・テレメトリ・公開鍵オンライン取得・プラグインカタログ・外部スナップショットもすべて無効化する:
-```ini
 [analytics]
 reporting_enabled = false
 check_for_updates = false
 check_for_plugin_updates = false
-
-[plugins]
-public_key_retrieval_disabled = true
-plugin_admin_enabled = false
 
 [news]
 news_feed_enabled = false
@@ -82,55 +72,56 @@ disable_gravatar = true
 external_enabled = false
 ```
 
-対応する環境変数一覧:
+Equivalent environment variables:
 ```bash
+GF_PLUGINS_ALLOW_LOADING_UNSIGNED_PLUGINS=yuuki-llmstudio-app
+GF_PLUGINS_PUBLIC_KEY_RETRIEVAL_DISABLED=true
+GF_PLUGINS_PLUGIN_ADMIN_ENABLED=false
 GF_ANALYTICS_REPORTING_ENABLED=false
 GF_ANALYTICS_CHECK_FOR_UPDATES=false
 GF_ANALYTICS_CHECK_FOR_PLUGIN_UPDATES=false
-GF_PLUGINS_PUBLIC_KEY_RETRIEVAL_DISABLED=true
-GF_PLUGINS_PLUGIN_ADMIN_ENABLED=false
 GF_NEWS_NEWS_FEED_ENABLED=false
 GF_SECURITY_DISABLE_GRAVATAR=true
 GF_SNAPSHOTS_EXTERNAL_ENABLED=false
 ```
 
-> **注意**: 開発用プロビジョニング定義 (`deploy/grafana/provisioning/plugins/llm-studio-dev.yaml`) および `sample-metrics` はローカル検証専用であり、本番閉域環境には配備しない。コンテナイメージは `image@sha256:...` のダイジェスト固定で配備する。
+> **Note:** `deploy/grafana/provisioning/plugins/llm-studio-dev.yaml` and the `sample-metrics` service are for local development/testing only. Do **not** deploy them to production air-gapped environments, and pin container images by `@sha256:...` digest.
 
-### 2.2 `grafana-llm-app` のローカル vLLM 接続設定
-- Provider: `Custom OpenAI-compatible` (`provider: "custom"`)
-- URL: 閉域内 vLLM エンドポイント（例: `https://vllm.internal:8000`、API path `/v1`）
-- 通信保護: 閉域内であっても vLLM 前段または vLLM 本体に TLS と `--api-key`（Bearer 認証）を設定し、`grafana-llm-app` 側の `secureJsonData` に登録する。
-- Model Mapping:
-  - `base` -> vLLM の `--served-model-name`（例: `glm-5.3-flash-local`）
-  - `large` -> 高精度モデル名（単一モデル運用の場合は同一名）
-- **モデル固有の vLLM 起動設定例**:
+### 2.2 Configuring `grafana-llm-app` for Local vLLM
+- **Provider:** `Custom OpenAI-compatible` (`provider: "custom"`)
+- **URL:** Internal vLLM endpoint (e.g., `https://vllm.internal:8000`, API path `/v1`)
+- **Transport Security:** Even inside an air-gapped network, protect vLLM with TLS and `--api-key` (Bearer auth) or front-end mTLS, storing the API key in `grafana-llm-app`'s `secureJsonData`.
+- **Model Mapping:**
+  - `base` -> vLLM `--served-model-name` (e.g., `glm-5.3-flash-local`)
+  - `large` -> higher-accuracy served model name (or the same name in single-model deployments)
+- **Recommended vLLM Startup Flags:**
   - `HF_HUB_OFFLINE=1`, `TRANSFORMERS_OFFLINE=1`
-  - コンテナイメージはダイジェスト (`vllm/vllm-openai@sha256:...`) で固定
+  - Digest-pinned image (`vllm/vllm-openai@sha256:...`)
   - `--served-model-name <fixed-name>`
-  - `--api-key <internal-secret>`（または前段リバースプロキシでの mTLS / Bearer 検証）
-  - `--max-num-seqs <env-limit>`（推論サーバー全体の同時実行保護）
-  - Structured Outputs バックエンド明示（例: `--structured-outputs-config.backend auto`）
-  - 推論モデル（GLM / DeepSeek / Kimi 系等）を利用する場合は `--reasoning-parser <model-parser>` を明示し、`message.content` に思考過程が混入しないよう分離する。
-  - GLM-5.3 系のように chat template 既定値調整が必要な場合は、vLLM 側の `--default-chat-template-kwargs` 等で `clear_thinking` を配備設定として固定する（`grafana-llm-app` が `extra_body` を中継しないため）。
+  - `--api-key <internal-secret>` (or reverse-proxy mTLS / Bearer enforcement)
+  - `--max-num-seqs <env-limit>` (protects global inference server concurrency)
+  - Explicit Structured Outputs backend (e.g., `--structured-outputs-config.backend auto`)
+  - For reasoning models (GLM / DeepSeek / Kimi families), set `--reasoning-parser <model-parser>` so reasoning tokens are separated from `message.content`.
+  - Where chat template defaults require tuning (such as `clear_thinking` on GLM-5.3), pin them in vLLM deployment flags (e.g., `--default-chat-template-kwargs`), because `grafana-llm-app` does not relay `extra_body`.
 
-### 2.3 LLM 専用サービスアカウント権限（Grafana OSS 12.4.15）
-1. Grafana OSS において `yuuki-llmstudio-app` の App Config に設定するサービスアカウントを作成し、基本ロールに **`Viewer`** を割り当てる（OSS で `plugins.app:access` を含む最小基本ロール。`Editor` / `Admin` は絶対に付与しない）。
-2. App Config の `grafanaUrl` は、SSRF およびトークン漏洩防止のため、Go Backend 側で **loopback (`localhost` / `127.0.0.1` / `::1`) または Grafana 自身の `AppURL` と同一オリジン** に制限され、HTTP リダイレクトも禁止されている。
-3. トークンは `secureJsonData` (`llmServiceAccountToken`) に保存し、環境変数ファイルや Git リポジトリに平文でコミットしない。
-4. **LLM 基盤全体の利用制限**: アプリ内予算制御（`maxConcurrentJobs`, `maxRepairAttempts`, `maxOutputTokens`）は本プラグイン経由の制御に留まる。同一 `grafana-llm-app` を他プラグインや別経路から利用する場合、リバースプロキシ（Nginx / Envoy）または vLLM 側で IP/Token ごとのレート制限・同時実行数制限・タイムアウトを併用する。
+### 2.3 Dedicated LLM Service Account Permissions (Grafana OSS 12.4.15 / 13.3.1)
+1. Create a Grafana service account dedicated to `yuuki-llmstudio-app` and assign the minimum OSS basic role **`Viewer`** (the lowest built-in role containing `plugins.app:access`; never grant `Editor` or `Admin`).
+2. To prevent SSRF and token exfiltration, the Go backend restricts `grafanaUrl` in App Config to **loopback (`localhost` / `127.0.0.1` / `::1`) or the same origin as Grafana's `AppURL`**, and disables HTTP redirects.
+3. Store the token only in `secureJsonData` (`llmServiceAccountToken`); never commit it to Git or plaintext `.env` files.
+4. **Cluster-Wide LLM Rate Limiting:** In-plugin budgets (`maxConcurrentJobs`, `maxRepairAttempts`, `maxOutputTokens`) govern only requests originating from `yuuki-llmstudio-app`. If `grafana-llm-app` or vLLM is shared across multiple plugins or teams, enforce per-client rate limits, concurrency caps, and timeouts at the reverse proxy (Nginx / Envoy) or vLLM layer as well.
 
-## 3. Prometheus / VictoriaMetrics 上流クエリ上限（DoS 防御の最終境界）
+## 3. Upstream Prometheus / VictoriaMetrics Query Limits (Final DoS Boundary)
 
-ブラウザ側の制限（直近 5m・`maxDataPoints=10`・並列 2・10s タイムアウト）は**操作ミス防止であり、DoS 防御の最終境界ではない**。必ずデータソースまたは既存の入口側で以下を設定する。
+Browser-side dry-run caps (`now-5m`, `maxDataPoints=10`, concurrency `<= 2`, `10s` timeout) are **UX guardrails against accidental mistakes, not a DoS security boundary**. Always enforce hard query limits upstream.
 
-### Prometheus の起動フラグ例
+### Example Prometheus Flags
 ```text
 --query.timeout=15s
 --query.max-concurrency=10
 --query.max-samples=10000000
 ```
 
-### VictoriaMetrics (`vmsingle` / `vmselect`) の起動フラグ例
+### Example VictoriaMetrics (`vmsingle` / `vmselect`) Flags
 ```text
 -search.maxQueryDuration=15s
 -search.maxConcurrentRequests=10
@@ -139,6 +130,6 @@ GF_SNAPSHOTS_EXTERNAL_ENABLED=false
 -search.maxUniqueTimeseries=30000
 ```
 
-### リバースプロキシ（Grafana 前段・vLLM 前段）のタイムアウト設定
-- 非ストリーミング生成では、LLM 生成完了まで最大 `llmTimeoutSeconds` (既定 45s) 程度待機するため、Grafana 前段リバースプロキシの `proxy_read_timeout` は `jobDeadlineSeconds`（既定 90s）以上に設定する。
-- 将来 SSE ストリーミングを導入する場合は、`proxy_buffering off;` および `proxy_http_version 1.1;` を設定し、`CallResource` の flush・切断検知を実環境で事前検証する。
+### Reverse Proxy Timeout Settings (Fronting Grafana & vLLM)
+- In non-streaming MVP mode, an LLM request waits up to `llmTimeoutSeconds` (default `45s`). Configure `proxy_read_timeout` on reverse proxies fronting Grafana to at least `jobDeadlineSeconds` (default `90s`).
+- If SSE progress streaming is added in a future release, configure `proxy_buffering off;` and `proxy_http_version 1.1;`, and verify `CallResource` flush and client-disconnect behavior in your target environment first.

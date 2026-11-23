@@ -1,28 +1,28 @@
-# ADR-001: LLM 接続の `grafana-llm-app` 一本化と Structured Output 契約制約
+# ADR-001: Unified LLM Routing via `grafana-llm-app` & Structured Output Constraints
 
-- ステータス: 採用（2026-11-22）
-- 対象バージョン: `Grafana OSS v12.4.15 / v13.3.1`, `grafana-llm-app v1.0.8 (12.4.x) / v1.2.0 (13.x)`, `llmclient v0.20.0`, `go-openai v1.41.1 / v1.41.2 / v1.42.0`, `vLLM >= v0.12.0`
+- **Status:** Accepted (2026-11-22)
+- **Target Versions:** `Grafana OSS v12.4.15 / v13.3.1`, `grafana-llm-app v1.0.8 (12.4.x) / v1.2.0 (13.x)`, `llmclient v0.20.0`, `go-openai v1.41.1 / v1.41.2 / v1.42.0`, `vLLM >= v0.12.0`
 
-## コンテキスト
-ローカル推論基盤 (vLLM) への接続先 URL、資格情報、モデル名マッピングをカスタム App 側へ分散させると、資格情報管理とガバナンスが二重化する。また、通信障害リトライと意味的な修復ループが入れ子になると推論負荷が増幅する。
+## Context
+Scattering local inference server (vLLM) URLs, provider credentials, and model mappings inside custom App plugins duplicates credential management and governance. In addition, nesting transport-level retries with semantic repair loops amplifies inference load during partial outages.
 
-## 決定
-1. LLM 経路は **`Frontend -> Custom App Go Backend -> Grafana plugin resource API -> grafana-llm-app -> local vLLM`** に一本化し、App から vLLM への直結経路や汎用 LLM プロキシを追加しない。
-2. Go Backend は公式 `github.com/grafana/grafana-llm-app/llmclient` (`v0.20.0`) を使用し、ブラウザ側の `@grafana/llm` は採用しない（プロンプト構築・IR 検査・予算管理を Backend 側で統制するため）。
-3. 通信障害リトライ（一時的ネットワーク障害・HTTP 502/503/504 のみ最大 1 回）と、構文エラーの意味的修復（ジョブ全体で最大 2 回）を分離する。
+## Decision
+1. All LLM traffic is unified along a single path: **`Frontend -> Custom App Go Backend -> Grafana plugin resource API -> grafana-llm-app -> local vLLM`**. No direct vLLM connection or duplicate generic LLM proxy is added to this plugin.
+2. The Go backend uses the official `github.com/grafana/grafana-llm-app/llmclient` (`v0.20.0`) rather than browser-side `@grafana/llm`, so prompt construction, deterministic IR validation, and job budgets remain centrally controlled in the backend.
+3. Transport retries (max 1 retry for transient network failures or HTTP `502`/`503`/`504`) are strictly separated from semantic syntax repairs (max 2 attempts per job).
 
-## 実証された技術的制約と最小の対策（ソース確認・契約テストに基づく）
-`grafana-llm-app v1.0.8` (`packages/grafana-llm-app/pkg/plugin/llm_provider.go`, `openai_provider.go`) のソースコードと `pkg/llm/contract_test.go` により、以下の具体的制約を確認した：
+## Verified Technical Constraints & Minimal Mitigations
+Based on direct source inspection of `grafana-llm-app` (`packages/grafana-llm-app/pkg/plugin/llm_provider.go`, `openai_provider.go`) and contract tests (`pkg/llm/contract_test.go`), the following concrete constraints were identified and mitigated:
 
-1. **数値 `enum` による HTTP 400**:
-   - **再現条件**: `response_format.json_schema.schema` に数値型 `enum`（例: `"enum": [0, 1]`）を含めて `grafana-llm-app v1.0.8` へ送信すると、`go-openai/jsonschema.Definition.Enum` が `[]string` 型のため `json.Unmarshal` が失敗し HTTP 400 を返す。
-   - **対策**: 正本 JSON Schema (`schemas/dashboard-ir.schema.json`, `schemas/dashboard-patch.schema.json`) で `enum` は文字列のみ使用し、整数境界は `minimum`/`maximum` で表現する。`scripts/verify-schema-sync.mjs` で継続検査する。
-2. **中継時の制約キーワード欠落および `strict: false` の採用**:
-   - **再現条件**: `go-openai/jsonschema.Definition` に定義されていない `minimum`/`maximum`/`minLength`/`maxLength`/`pattern`/`minItems`/`maxItems` や、OpenAI 非標準の `extra_body`/`chat_template_kwargs` は `grafana-llm-app` 中継時に破棄される。さらに、OpenAI `strict: true` モードは全プロパティの `required` 化と nullable union 型（`["string", "null"]`）を要求するが、`go-openai/jsonschema.Definition.Type` は単一文字列型のため表現できず、任意フィールド（`description`, `legendFormat`, `thresholds` 等）と併用すると vLLM/OpenAI 側でスキーマ拒否を引き起こす。
-   - **対策**: `ResponseFormat.JSONSchema.Strict` は `false` とし、`type`/`properties`/`required`/`items`/`additionalProperties: false`/文字列 `enum`（`datasourceRef: ["selected_prometheus"]` を含む）を vLLM の Guided Decoding へ渡した上で、長さ・範囲・正規表現・PromQL AST・カタログ照合・必須数値フィールド存在検査は Go Backend の決定的バリデータで必ず二重検証する。`clear_thinking` 等の推論エンジン固有設定は vLLM 配備設定側で固定する。
-   - **将来の最小上流修正案**: `grafana-llm-app` のプロキシ層で `response_format.json_schema.schema` を `json.RawMessage` として透過転送するパッチを検討する（本制約のために vLLM 直結へ切り替えることはしない）。
-3. **`grafana-llm-app v1.0.8` による上流 502/503/504 の HTTP 500 ラップと `go-openai` エラー解析順序**:
-   - **再現条件**: `grafana-llm-app v1.0.8` の `openai_provider.go` は、上流 vLLM から HTTP 502/503/504 等を受け取った際に HTTP 500 `{"error":"<upstream status/message>"}` でラップして返すことがある。さらに `go-openai v1.41.1` は非標準エラー JSON を `*openai.RequestError`（内部 `Err` に `HTTPStatusCode: 0` の `*openai.APIError` を格納）としてデコードする。
-   - **対策**: `pkg/llm/grafana_llm.go` の `isRetryableTransportError` で `*openai.RequestError` を `*openai.APIError` より先に判定し、HTTP 502/503/504 に加えて HTTP 500 本文に上流 502/503/504・gateway・unavailable・connection refused が含まれる一時障害のみ最大 1 回リトライする（HTTP 400/401/403/429 やコンテキストキャンセルは絶対にリトライしない）。`pkg/llm/contract_test.go` で契約テストを継続実行する。
-4. **開発用モックの扱い**:
-   - `llmMode=mock` は `allowMockInDev=true` を明示した開発・テスト環境専用とし、`llmMode=grafana-llm-app` の障害時に暗黙フォールバックしない。
+1. **Numeric `enum` Rejected with HTTP 400:**
+   - **Reproduction:** Sending a JSON Schema containing a numeric `enum` (e.g., `"enum": [0, 1]`) inside `response_format.json_schema.schema` to `grafana-llm-app` fails `json.Unmarshal` with HTTP `400` because `go-openai/jsonschema.Definition.Enum` is typed as `[]string`.
+   - **Mitigation:** Canonical schemas (`schemas/dashboard-ir.schema.json`, `schemas/dashboard-patch.schema.json`) use string-only `enum` values and express integer bounds via `minimum`/`maximum`. `scripts/verify-schema-sync.mjs` enforces this continuously.
+2. **Dropped Schema Keywords During Relay & Adoption of `strict: false`:**
+   - **Reproduction:** Keywords absent from `go-openai/jsonschema.Definition` (`minimum`, `maximum`, `minLength`, `maxLength`, `pattern`, `minItems`, `maxItems`) as well as non-standard OpenAI fields (`extra_body`, `chat_template_kwargs`) are dropped during relay by `grafana-llm-app`. Furthermore, OpenAI's `strict: true` mode requires all properties to be in `required` with nullable union types (`["string", "null"]`), which `go-openai/jsonschema.Definition.Type` (single string) cannot represent, causing schema rejection on optional fields (`description`, `legendFormat`, `thresholds`, etc.).
+   - **Mitigation:** Set `ResponseFormat.JSONSchema.Strict = false` so vLLM guided decoding enforces object structure, `required`, `additionalProperties: false`, and string enums (including `datasourceRef: ["selected_prometheus"]`), while the Go backend's deterministic validator re-enforces all length/range/regex bounds, required numeric field presence, PromQL AST/regex safety, and catalog membership. Engine-specific template flags (such as `clear_thinking`) are pinned in vLLM deployment configuration.
+   - **Minimal Future Upstream Fix:** Forward `response_format.json_schema.schema` as `json.RawMessage` in `grafana-llm-app`'s proxy layer (do **not** bypass `grafana-llm-app` directly to vLLM because of this constraint).
+3. **`grafana-llm-app` HTTP 500 Wrapping of Upstream 502/503/504 & `go-openai` Error Unwrap Order:**
+   - **Reproduction:** When upstream vLLM returns HTTP `502`/`503`/`504`, `grafana-llm-app`'s `openai_provider.go` may wrap the error as HTTP `500` `{"error":"<upstream status/message>"}`. `go-openai v1.41.1` decodes non-standard error JSON into `*openai.RequestError` whose wrapped `Err` contains an empty `*openai.APIError{HTTPStatusCode: 0}`.
+   - **Mitigation:** In `pkg/llm/grafana_llm.go` (`isRetryableTransportError`), inspect `*openai.RequestError` **before** `*openai.APIError`, retrying at most once for HTTP `502`/`503`/`504` or HTTP `500` bodies clearly wrapping upstream `502`/`503`/`504`/gateway/unavailable/connection-refused transient errors (never retrying `400`/`401`/`403`/`429` or context cancellation). Verified continuously by `pkg/llm/contract_test.go`.
+4. **Development Mock Mode Isolation:**
+   - `llmMode=mock` requires explicit `allowMockInDev=true` and is strictly for development/testing. Production `llmMode=grafana-llm-app` never silently falls back to mock mode on failure.
