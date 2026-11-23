@@ -10,15 +10,15 @@ This guide covers packaging, transferring, deploying, and operating `yuuki-llmst
 Record immutable image digests (`@sha256:...`) wherever possible before exporting with `docker save`.
 
 ```bash
-# Pull pinned versions:
-# For Grafana 13.x (recommended, React 19): grafana/grafana-oss:13.3.1
-# For Grafana 12.4.x (React 18):            grafana/grafana-oss:12.4.15
-docker pull grafana/grafana-oss:13.3.1
+# Pull pinned versions (Grafana OSS official image is grafana/grafana since 12.4.0):
+# For Grafana 13.x (recommended, React 19): grafana/grafana:13.3.1
+# For Grafana 12.4.x (React 18):            grafana/grafana:12.4.15
+docker pull grafana/grafana:13.3.1
 docker pull prom/prometheus:v3.5.0
 # Pin the vLLM image tag/digest validated for your target model (e.g., vllm/vllm-openai:<pinned-tag>)
 
 docker save \
-  grafana/grafana-oss:13.3.1 \
+  grafana/grafana:13.3.1 \
   prom/prometheus:v3.5.0 \
   -o airgap-images.tar
 sha256sum airgap-images.tar > airgap-images.tar.sha256

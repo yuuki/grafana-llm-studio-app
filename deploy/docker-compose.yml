@@ -3,7 +3,8 @@ services:
   # 開発用プロビジョニングや sample-metrics を除外する）
   grafana:
     # 検証・サポート対象: 13.3.1 (React 19, 既定) または 12.4.15 (React 18)
-    image: grafana/grafana-oss:${GRAFANA_VERSION:-13.3.1}
+    # 注: Grafana 12.4.0 以降 grafana/grafana-oss は更新終了のため、公式 OSS イメージ grafana/grafana を使用する
+    image: grafana/grafana:${GRAFANA_VERSION:-13.3.1}
     ports:
       - "127.0.0.1:3000:3000"
     environment:

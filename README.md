@@ -148,7 +148,7 @@ Configured via **Administration → Plugins → LLM Dashboard Studio** (`jsonDat
 ## Development & Verification
 
 ```bash
-# Run all checks: schema sync, typecheck, Jest tests, Go race tests, and builds
+# Run all checks: schema sync, typecheck, Jest tests, Go vet & race tests, builds, and bundle verification
 make verify
 ```
 
@@ -156,22 +156,41 @@ Individual commands:
 
 ```bash
 npm run verify:schemas   # Bidirectional enum & string-only schema sync (JSON Schema <-> TS <-> Go)
-npm run typecheck        # TypeScript strict type checking (tsc --noEmit)
+npm run typecheck        # TypeScript strict type checking (src + Playwright E2E)
 npm run test:ci          # Jest unit, Scenes/Foundation parity, saver, and UI lifecycle tests
 npm run build            # Production Webpack bundle (dist/module.js)
+npm run verify:bundle    # Verify dist/module.js externalizes react/jsx-runtime and contains zero SECRET_INTERNALS
 go vet ./pkg/...         # Go static analysis
-go test -race ./pkg/...  # Go unit, PromQL AST, job isolation, and grafana-llm-app contract tests
+go test -race -count=1 ./pkg/...  # Go unit, PromQL AST, job isolation, and grafana-llm-app contract tests
 make build-backend       # Linux amd64 Go plugin binary (dist/gpx_yuuki_llmstudio_app_linux_amd64)
+docker compose -f deploy/docker-compose.yml config --quiet
 ```
+
+### Live E2E Tests (Playwright + `@grafana/plugin-e2e`)
+
+Run end-to-end browser tests against live Grafana `13.3.1` (React 19) or `12.4.15` (React 18) containers:
+
+```bash
+make build
+npx playwright install chromium
+GRAFANA_VERSION=13.3.1 docker compose -f deploy/docker-compose.yml up -d
+node scripts/wait-for-stack.mjs
+npm run test:e2e
+docker compose -f deploy/docker-compose.yml down -v
+```
+
+GitHub Actions (`.github/workflows/ci.yml`) runs all verification checks plus the live E2E matrix on both **Grafana `13.3.1` (React 19)** and **Grafana `12.4.15` (React 18)**.
 
 ### Repository Structure
 
 ```text
 .
+├── .github/workflows/      # GitHub Actions CI (verify + live Grafana 13.3.1 & 12.4.15 E2E matrix)
 ├── pkg/                    # Go backend plugin (IR, PromQL AST validator, prompt builder, llmclient, job manager, plugin handlers)
 ├── src/                    # TypeScript/React frontend (Studio UI, AppConfig, metadata/BM25, dry-run validator, Scenes & Foundation adapters, saver)
+├── tests/e2e/              # Live Playwright / @grafana/plugin-e2e tests
 ├── schemas/                # Canonical Dashboard IR & Patch JSON Schemas and sample payloads
-├── scripts/                # Bidirectional schema sync verifier
+├── scripts/                # Schema sync verifier, bundle verifier, and E2E stack readiness helper
 ├── deploy/                 # Local Docker Compose stack (+ optional OpenAI override), Prometheus config, sample exporter, provisioning templates
 └── docs/                   # Architecture, compatibility matrix, air-gapped & OpenAI-compatible API guides, and ADRs
 ```
@@ -181,7 +200,7 @@ make build-backend       # Linux amd64 Go plugin binary (dist/gpx_yuuki_llmstudi
 - **Scope:** Single Grafana organization, Prometheus-compatible datasources only, `timeseries` and `stat` panels only, fixed grid layout, auto-refresh disabled, non-streaming LLM requests. (Loki, Tempo, ClickHouse, template variables, repeat panels, existing dashboard import, GitOps sync, and MCP/tool execution are out of scope for MVP.)
 - **In-Memory Job State:** Draft jobs are stored in a single Go backend process and reset on Grafana restart.
 - **`grafana-llm-app` JSON Schema Proxy Behavior:** `grafana-llm-app` (`v1.0.8` / `v1.2.0`) unmarshals `response_format.json_schema.schema` into `go-openai/jsonschema.Definition`, which strips numeric/length/regex keywords and `extra_body`. Structure, `additionalProperties: false`, and string enums are enforced via structured outputs (or system-prompt schema in `json_object` mode), while bounds, regexes, PromQL AST rules, and catalog membership are deterministically re-enforced in the Go backend.
-- **Verification Coverage:** Automated unit tests, Scenes/Foundation parity tests, `grafana-llm-app` HTTP contract tests, and `@grafana/react-detect` static checks are verified locally. Live browser E2E against running Grafana (`13.3.1` / `12.4.15`) containers and live LLM backends should be validated in your target environment before production rollout.
+- **Verification Coverage:** Automated unit tests, Scenes/Foundation parity tests, bundle externalization checks (`verify:bundle`), `grafana-llm-app` HTTP contract tests, and live Playwright / `@grafana/plugin-e2e` tests against running Grafana `13.3.1` (React 19) and `12.4.15` (React 18) containers (in mock mode with live Prometheus) run in GitHub Actions CI. Live LLM inference backends (vLLM or OpenAI-compatible APIs via `grafana-llm-app`) should still be validated in your target environment before production rollout.
 
 ## Documentation & ADRs
 
