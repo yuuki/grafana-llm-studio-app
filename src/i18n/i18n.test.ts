@@ -1,3 +1,5 @@
+import React from 'react';
+import { render, screen } from '@testing-library/react';
 import i18next from 'i18next';
 import {
   DEFAULT_LOCALE,
@@ -8,6 +10,7 @@ import {
   setStudioLocale,
   STUDIO_I18N_NS,
   t,
+  useStudioTranslation,
 } from './index';
 
 function flattenKeys(obj: Record<string, unknown>, prefix = ''): Record<string, string> {
@@ -118,5 +121,38 @@ describe('Studio i18n shared i18next integration & locale parity', () => {
     expect(t('studio.errors.validationFailed', { error: rawErr })).toBe(
       `Validation & preview failed: ${rawErr}`
     );
+  });
+
+  test('works cleanly with Grafana SystemJS Module Namespace Objects that omit EventEmitter prototype methods (.on/.off)', async () => {
+    const realInstance = i18next.createInstance();
+    await realInstance.init({
+      lng: 'ja-JP',
+      fallbackLng: 'en-US',
+      resources: {},
+      initAsync: false,
+      showSupportNotice: false,
+    });
+
+    // Simulate SystemJS `_export(getI18nInstance())`: only own enumerable properties are exposed.
+    const systemJsNamespace = Object.create(null) as Record<string, unknown>;
+    for (const key of Object.keys(realInstance)) {
+      systemJsNamespace[key] = (realInstance as unknown as Record<string, unknown>)[key];
+    }
+    expect(typeof systemJsNamespace.on).toBe('undefined');
+    expect(typeof systemJsNamespace.off).toBe('undefined');
+
+    const Probe: React.FC = () => {
+      const { locale, i18n } = useStudioTranslation(
+        systemJsNamespace as unknown as Parameters<typeof useStudioTranslation>[0]
+      );
+      return React.createElement(
+        'div',
+        { 'data-testid': 'probe' },
+        `${locale}:${String(i18n.t('studio.actions.generateDraft', { ns: STUDIO_I18N_NS, lng: locale }))}`
+      );
+    };
+
+    render(React.createElement(Probe));
+    expect(screen.getByTestId('probe').textContent).toBe('ja:ダッシュボード案を生成');
   });
 });

@@ -52,8 +52,14 @@ export function resolveStudioLocale(language?: string | null): SupportedLocale {
 }
 
 function registerBundles(instance: I18nInstance): void {
+  if (typeof instance.addResourceBundle !== 'function') {
+    return;
+  }
   for (const [lng, bundle] of REGISTERED_LANGUAGE_MAP) {
-    if (!instance.hasResourceBundle(lng, STUDIO_I18N_NS)) {
+    const alreadyLoaded =
+      typeof instance.hasResourceBundle === 'function' &&
+      instance.hasResourceBundle(lng, STUDIO_I18N_NS);
+    if (!alreadyLoaded) {
       instance.addResourceBundle(lng, STUDIO_I18N_NS, bundle, true, false);
     }
   }
@@ -65,7 +71,7 @@ function registerBundles(instance: I18nInstance): void {
  * In standalone / Jest environments where i18next is not yet initialized, we initialize synchronously with `en` default.
  */
 export function initStudioI18n(instance: I18nInstance = getSharedI18n()): I18nInstance {
-  if (!instance.isInitialized) {
+  if (!instance.isInitialized && typeof instance.init === 'function') {
     void instance.init({
       lng: DEFAULT_LOCALE,
       fallbackLng: DEFAULT_LOCALE,
@@ -124,9 +130,11 @@ export function t(key: TranslationKey, values?: Record<string, string | number>)
 
 /**
  * Lightweight React hook subscribing to shared i18next `languageChanged` events without bundling react-i18next.
+ * Note: Grafana's SystemJS loader exposes `i18next` via `_export(getI18nInstance())`, which only copies own
+ * enumerable properties and omits `EventEmitter.prototype.on` / `.off`. Guard subscription calls accordingly.
  */
-export function useStudioTranslation() {
-  const instance = initStudioI18n();
+export function useStudioTranslation(instanceOverride?: I18nInstance) {
+  const instance = initStudioI18n(instanceOverride);
   const [locale, setLocale] = useState<SupportedLocale>(() => getActiveLocale(instance));
 
   useEffect(() => {
@@ -134,9 +142,15 @@ export function useStudioTranslation() {
       setLocale(getActiveLocale(instance));
     };
     handleLanguageChanged();
-    instance.on('languageChanged', handleLanguageChanged);
+    const canSubscribe =
+      typeof instance.on === 'function' && typeof instance.off === 'function';
+    if (canSubscribe) {
+      instance.on('languageChanged', handleLanguageChanged);
+    }
     return () => {
-      instance.off('languageChanged', handleLanguageChanged);
+      if (canSubscribe) {
+        instance.off('languageChanged', handleLanguageChanged);
+      }
     };
   }, [instance]);
 
