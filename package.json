@@ -6,10 +6,12 @@
   "scripts": {
     "build": "webpack --mode production",
     "dev": "webpack --mode development --watch",
-    "typecheck": "tsc --noEmit",
+    "typecheck": "tsc --noEmit && tsc --noEmit -p tsconfig.e2e.json",
     "test": "jest --runInBand",
     "test:ci": "jest --ci --runInBand",
-    "verify:schemas": "node scripts/verify-schema-sync.mjs"
+    "test:e2e": "playwright test",
+    "verify:schemas": "node scripts/verify-schema-sync.mjs",
+    "verify:bundle": "node scripts/verify-bundle.mjs"
   },
   "dependencies": {
     "@emotion/css": "11.13.5",
@@ -27,6 +29,8 @@
   },
   "devDependencies": {
     "@grafana/e2e-selectors": "12.4.15",
+    "@grafana/plugin-e2e": "4.1.1",
+    "@playwright/test": "1.65.1",
     "@testing-library/jest-dom": "6.6.3",
     "@testing-library/react": "16.1.0",
     "@types/jest": "29.5.14",

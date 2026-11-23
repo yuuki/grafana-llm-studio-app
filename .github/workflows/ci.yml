@@ -1,0 +1,152 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    name: Verify (Schemas, Typecheck, Tests, Build, Go Race, Compose)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Install Node.js dependencies
+        run: npm ci
+
+      - name: Verify bidirectional JSON Schema sync
+        run: npm run verify:schemas
+
+      - name: TypeScript typecheck
+        run: npm run typecheck
+
+      - name: Run Jest unit & parity tests
+        run: npm run test:ci
+
+      - name: Build frontend plugin bundle
+        run: npm run build
+
+      - name: Verify frontend bundle externals & zero SECRET_INTERNALS
+        run: npm run verify:bundle
+
+      - name: Go vet
+        run: go vet ./pkg/...
+
+      - name: Go race tests
+        run: go test -race -count=1 ./pkg/...
+
+      - name: Build Linux amd64 Go plugin backend
+        run: make build-backend
+
+      - name: Validate Docker Compose configuration
+        run: docker compose -f deploy/docker-compose.yml config --quiet
+
+      - name: Upload built plugin dist artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: plugin-dist
+          path: dist/
+          retention-days: 1
+
+  e2e:
+    name: E2E (Grafana ${{ matrix.grafana_version }} / ${{ matrix.react_version }})
+    needs: verify
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - grafana_version: "13.3.1"
+            react_version: "React 19"
+          - grafana_version: "12.4.15"
+            react_version: "React 18"
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+
+      - name: Download built plugin dist artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: plugin-dist
+          path: dist/
+
+      - name: Ensure Go plugin binary is executable
+        run: chmod +x dist/gpx_yuuki_llmstudio_app_linux_amd64
+
+      - name: Install Node.js dependencies
+        run: npm ci
+
+      - name: Install Playwright Chromium
+        run: npx playwright install --with-deps chromium
+
+      - name: Start Grafana ${{ matrix.grafana_version }} & Prometheus stack
+        env:
+          GRAFANA_VERSION: ${{ matrix.grafana_version }}
+          GF_SECURITY_ADMIN_USER: admin
+          GF_SECURITY_ADMIN_PASSWORD: change-me-local-dev
+        run: docker compose -f deploy/docker-compose.yml up -d
+
+      - name: Wait for Grafana, plugin backend, and Prometheus range queries
+        env:
+          GRAFANA_URL: http://127.0.0.1:3000
+          GRAFANA_ADMIN_USER: admin
+          GRAFANA_ADMIN_PASSWORD: change-me-local-dev
+        run: node scripts/wait-for-stack.mjs
+
+      - name: Run Playwright / @grafana/plugin-e2e tests
+        env:
+          GRAFANA_VERSION: ${{ matrix.grafana_version }}
+          GRAFANA_URL: http://127.0.0.1:3000
+          GRAFANA_ADMIN_USER: admin
+          GRAFANA_ADMIN_PASSWORD: change-me-local-dev
+        run: npm run test:e2e
+
+      - name: Print Docker Compose logs on failure
+        if: failure()
+        run: docker compose -f deploy/docker-compose.yml logs --tail=200
+
+      - name: Upload Playwright report on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-report-grafana-${{ matrix.grafana_version }}
+          path: |
+            playwright-report/
+            test-results/
+          retention-days: 7
+
+      - name: Tear down Docker Compose stack
+        if: always()
+        run: docker compose -f deploy/docker-compose.yml down -v

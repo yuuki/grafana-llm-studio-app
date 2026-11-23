@@ -709,26 +709,32 @@ export const StudioPage: React.FC = () => {
     busyState === 'repairing';
 
   return (
-    <div style={{ display: 'flex', flexDirection: 'column', gap: 12, padding: 16 }}>
+    <div data-testid="studio-page" style={{ display: 'flex', flexDirection: 'column', gap: 12, padding: 16 }}>
       {publicCfg?.mockBanner && (
-        <Alert title="開発・テスト用モックLLMモード" severity="warning">
-          現在 llmMode=mock で動作しています。本番利用時は App Config で grafana-llm-app モードへ切り替えてください。
-        </Alert>
+        <div data-testid="studio-mock-banner">
+          <Alert title="開発・テスト用モックLLMモード" severity="warning">
+            現在 llmMode=mock で動作しています。本番利用時は App Config で grafana-llm-app モードへ切り替えてください。
+          </Alert>
+        </div>
       )}
 
       {uiError && (
-        <Alert title="エラー" severity="error" onRemove={() => setUiError(null)}>
-          {uiError}
-        </Alert>
+        <div data-testid="studio-error-alert">
+          <Alert title="エラー" severity="error" onRemove={() => setUiError(null)}>
+            {uiError}
+          </Alert>
+        </div>
       )}
 
       {savedResult && (
-        <Alert title="ダッシュボードを新規保存しました" severity="success">
-          UID: <code>{savedResult.uid}</code> (rev {savedResult.revision}) —{' '}
-          <a href={savedResult.url} target="_blank" rel="noreferrer">
-            保存したダッシュボードを開いてクエリ・単位・閾値・配置を確認
-          </a>
-        </Alert>
+        <div data-testid="studio-saved-alert">
+          <Alert title="ダッシュボードを新規保存しました" severity="success">
+            UID: <code data-testid="studio-saved-uid">{savedResult.uid}</code> (rev {savedResult.revision}) —{' '}
+            <a href={savedResult.url} target="_blank" rel="noreferrer">
+              保存したダッシュボードを開いてクエリ・単位・閾値・配置を確認
+            </a>
+          </Alert>
+        </div>
       )}
 
       <div style={{ display: 'grid', gridTemplateColumns: '420px 1fr', gap: 16, alignItems: 'start' }}>
@@ -790,7 +796,8 @@ export const StudioPage: React.FC = () => {
           )}
 
           <div style={{ fontSize: 12, color: '#9fa7b3' }}>
-            読込済みメトリクス候補（ブラウザメモリのみ）: <strong>{catalog.length}</strong> 件
+            読込済みメトリクス候補（ブラウザメモリのみ）:{' '}
+            <strong data-testid="studio-catalog-count">{catalog.length}</strong> 件
             {catalogTruncated ? '（上限で打ち切り）' : ''}
             {catalog.length > 0 && !isCatalogFresh ? '（スコープ変更済み・再取得が必要）' : ''}
           </div>
@@ -845,13 +852,18 @@ export const StudioPage: React.FC = () => {
           </div>
 
           {job && (
-            <div style={{ borderTop: '1px solid #2c3235', paddingTop: 10, display: 'flex', flexDirection: 'column', gap: 6 }}>
+            <div
+              data-testid="studio-job-status"
+              style={{ borderTop: '1px solid #2c3235', paddingTop: 10, display: 'flex', flexDirection: 'column', gap: 6 }}
+            >
               <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
                 <span>
                   状態: <Badge text={job.status} color={job.status === 'failed' ? 'red' : 'blue'} />
                 </span>
                 {job.currentIR && (
-                  <span style={{ fontSize: 12 }}>rev {job.currentIR.revision}</span>
+                  <span data-testid="studio-job-revision" style={{ fontSize: 12 }}>
+                    rev {job.currentIR.revision}
+                  </span>
                 )}
               </div>
               {job.summary && <div style={{ fontSize: 13 }}>{job.summary}</div>}
@@ -861,7 +873,7 @@ export const StudioPage: React.FC = () => {
                 </Alert>
               )}
               {job.lastDiff && job.lastDiff.length > 0 && (
-                <div style={{ fontSize: 12 }}>
+                <div data-testid="studio-job-diff" style={{ fontSize: 12 }}>
                   <strong>変更内容 (Diff):</strong>
                   <ul style={{ margin: '4px 0', paddingLeft: 18 }}>
                     {job.lastDiff.map((d, i) => (
@@ -880,10 +892,17 @@ export const StudioPage: React.FC = () => {
           )}
 
           {validationResults.length > 0 && (
-            <div style={{ borderTop: '1px solid #2c3235', paddingTop: 10, display: 'flex', flexDirection: 'column', gap: 6 }}>
+            <div
+              data-testid="studio-validation-results"
+              style={{ borderTop: '1px solid #2c3235', paddingTop: 10, display: 'flex', flexDirection: 'column', gap: 6 }}
+            >
               <strong>検証結果（Dry-Run: 直近5m / maxDataPoints=10）</strong>
               {validationResults.map((r) => (
-                <div key={r.panelId} style={{ fontSize: 12, display: 'flex', flexDirection: 'column', gap: 2 }}>
+                <div
+                  key={r.panelId}
+                  data-testid={`studio-validation-row-${r.panelId}`}
+                  style={{ fontSize: 12, display: 'flex', flexDirection: 'column', gap: 2 }}
+                >
                   <div style={{ display: 'flex', justifyContent: 'space-between' }}>
                     <code>{r.panelId}</code>
                     <Badge text={VALIDATION_LABEL[r.category]} color={VALIDATION_BADGE_COLOR[r.category]} />
@@ -975,7 +994,10 @@ export const StudioPage: React.FC = () => {
           </div>
 
           {/* Keep Scenes container mounted via CSS display so tab switching NEVER unmounts/re-activates SceneQueryRunner (H-8). */}
-          <div style={{ display: rightTab === 'preview' ? 'block' : 'none', minHeight: 460 }}>
+          <div
+            data-testid="studio-preview-pane"
+            style={{ display: rightTab === 'preview' ? 'block' : 'none', minHeight: 460 }}
+          >
             {previewScene ? (
               <previewScene.Component model={previewScene} />
             ) : (
@@ -988,13 +1010,19 @@ export const StudioPage: React.FC = () => {
           </div>
 
           {rightTab === 'ir' && (
-            <pre style={{ margin: 0, padding: 12, background: '#111217', borderRadius: 4, overflow: 'auto', maxHeight: 520, fontSize: 12 }}>
+            <pre
+              data-testid="studio-ir-json"
+              style={{ margin: 0, padding: 12, background: '#111217', borderRadius: 4, overflow: 'auto', maxHeight: 520, fontSize: 12 }}
+            >
               {job?.currentIR ? JSON.stringify(job.currentIR, null, 2) : '// まだ IR が生成されていません'}
             </pre>
           )}
 
           {rightTab === 'foundation' && (
-            <pre style={{ margin: 0, padding: 12, background: '#111217', borderRadius: 4, overflow: 'auto', maxHeight: 520, fontSize: 12 }}>
+            <pre
+              data-testid="studio-foundation-json"
+              style={{ margin: 0, padding: 12, background: '#111217', borderRadius: 4, overflow: 'auto', maxHeight: 520, fontSize: 12 }}
+            >
               {foundationJsonPreview || '// まだ Foundation SDK 出力がありません'}
             </pre>
           )}

@@ -7,3 +7,8 @@ deploy/grafana/provisioning/plugins/grafana-llm-app-openai.yaml
 *.tar
 *.tar.gz
 __pycache__/
+test-results/
+playwright-report/
+blob-report/
+playwright/.auth/
+playwright/.cache/
