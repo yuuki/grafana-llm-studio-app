@@ -290,4 +290,79 @@ describe('Dry-run validation concurrency and error classification', () => {
     expect(errRes[0].category).toBe('syntax_error');
     expect(errRes[0].errorText).toContain('[B] parse error');
   });
+
+  test('enforces permission/timeout precedence over syntax_error, handles metric names containing timeout/permission, and flags missing refId (H-5)', async () => {
+    // Metric names like http_timeout_total or auth_permission_checks_total in 400 parse errors MUST stay syntax_error
+    expect(
+      classifyDatasourceError(400, 'parse error at char 5: unexpected metric http_timeout_total')
+    ).toBe('syntax_error');
+    expect(
+      classifyDatasourceError(400, 'bad_data: parse error near auth_permission_checks_total')
+    ).toBe('syntax_error');
+
+    const twoQueryIR: DashboardIR = {
+      schemaVersion: '1.1',
+      revision: 1,
+      title: 'Error Precedence',
+      timeRange: { from: 'now-15m', to: 'now' },
+      panels: [
+        {
+          id: 'panel-multi',
+          type: 'timeseries',
+          title: 'Multi',
+          datasourceRef: 'selected_prometheus',
+          queries: [
+            { refId: 'A', expr: 'up' },
+            { refId: 'B', expr: 'up' },
+          ],
+          unit: 'short',
+          layout: { row: 0, col: 0, width: 'full' },
+        },
+      ],
+    };
+    const spec = normalizeDashboardIR(twoQueryIR, { uid: 'prom-main', type: 'prometheus' });
+
+    // 1. Non-throwing response with A=403 forbidden + B=400 parse error -> permission_error dominates (never triggers auto-repair)
+    mockFetch.mockReturnValueOnce(
+      of({
+        data: {
+          results: {
+            A: { status: 403, error: 'Forbidden' },
+            B: { status: 400, error: 'parse error: unexpected ")"' },
+          },
+        },
+      })
+    );
+    const res1 = await runDryRunValidation(spec, { maxConcurrency: 1 });
+    expect(res1[0].category).toBe('permission_error');
+
+    // 2. Throwing FetchError with A=400 parse error + B=403 forbidden -> permission_error still dominates
+    mockFetch.mockReturnValueOnce(
+      throwError(() => ({
+        status: 400,
+        data: {
+          results: {
+            A: { status: 400, error: 'parse error: unexpected ")"' },
+            B: { status: 403, error: 'Forbidden' },
+          },
+        },
+      }))
+    );
+    const res2 = await runDryRunValidation(spec, { maxConcurrency: 1 });
+    expect(res2[0].category).toBe('permission_error');
+
+    // 3. Missing refId B in response -> datasource_error instead of silent ok/empty_result
+    mockFetch.mockReturnValueOnce(
+      of({
+        data: {
+          results: {
+            A: { frames: [{ data: { values: [[1], [1]] } }] },
+          },
+        },
+      })
+    );
+    const res3 = await runDryRunValidation(spec, { maxConcurrency: 1 });
+    expect(res3[0].category).toBe('datasource_error');
+    expect(res3[0].errorText).toContain('[B]');
+  });
 });

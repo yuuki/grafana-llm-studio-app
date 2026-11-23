@@ -3,6 +3,7 @@ package ir
 import (
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 )
 
@@ -98,7 +99,6 @@ func ApplyPatch(current DashboardIR, patch DashboardPatch, opts ValidateOptions)
 			}
 			if upd.Query != nil {
 				if len(target.Queries) > 0 {
-					before := formatQueries(target.Queries)
 					newQ := QueryIR{Expr: upd.Query.Expr}
 					if upd.Query.RefID != nil {
 						newQ.RefID = *upd.Query.RefID
@@ -108,9 +108,14 @@ func ApplyPatch(current DashboardIR, patch DashboardPatch, opts ValidateOptions)
 					} else if len(target.Queries) == 1 {
 						newQ.LegendFormat = target.Queries[0].LegendFormat
 					}
-					after := formatQueries([]QueryIR{newQ})
-					if before != after {
-						diffs = append(diffs, DiffEntry{Op: "update_panel", PanelID: target.ID, Field: "query", Before: before, After: after})
+					if !queriesEqual(target.Queries, []QueryIR{newQ}) {
+						diffs = append(diffs, DiffEntry{
+							Op:      "update_panel",
+							PanelID: target.ID,
+							Field:   "query",
+							Before:  formatQueries(target.Queries),
+							After:   formatQueries([]QueryIR{newQ}),
+						})
 						target.Queries = nil
 						target.Query = newQ
 					}
@@ -123,17 +128,27 @@ func ApplyPatch(current DashboardIR, patch DashboardPatch, opts ValidateOptions)
 						diffs = append(diffs, DiffEntry{Op: "update_panel", PanelID: target.ID, Field: "query.legendFormat", Before: target.Query.LegendFormat, After: *upd.Query.LegendFormat})
 						target.Query.LegendFormat = *upd.Query.LegendFormat
 					}
-					if upd.Query.RefID != nil && *upd.Query.RefID != target.Query.RefID {
-						diffs = append(diffs, DiffEntry{Op: "update_panel", PanelID: target.ID, Field: "query.refId", Before: target.Query.RefID, After: *upd.Query.RefID})
+					if upd.Query.RefID != nil && effectiveRefID(*upd.Query.RefID, 0) != effectiveRefID(target.Query.RefID, 0) {
+						diffs = append(diffs, DiffEntry{
+							Op:      "update_panel",
+							PanelID: target.ID,
+							Field:   "query.refId",
+							Before:  effectiveRefID(target.Query.RefID, 0),
+							After:   effectiveRefID(*upd.Query.RefID, 0),
+						})
 						target.Query.RefID = *upd.Query.RefID
 					}
 				}
 			}
 			if upd.Queries != nil {
-				before := formatQueries(target.EffectiveQueries())
-				after := formatQueries(*upd.Queries)
-				if before != after {
-					diffs = append(diffs, DiffEntry{Op: "update_panel", PanelID: target.ID, Field: "queries", Before: before, After: after})
+				if !queriesEqual(target.EffectiveQueries(), *upd.Queries) {
+					diffs = append(diffs, DiffEntry{
+						Op:      "update_panel",
+						PanelID: target.ID,
+						Field:   "queries",
+						Before:  formatQueries(target.EffectiveQueries()),
+						After:   formatQueries(*upd.Queries),
+					})
 					cp := make([]QueryIR, len(*upd.Queries))
 					copy(cp, *upd.Queries)
 					target.Query = QueryIR{}
@@ -145,10 +160,14 @@ func ApplyPatch(current DashboardIR, patch DashboardPatch, opts ValidateOptions)
 				target.Unit = upd.Unit
 			}
 			if upd.Thresholds != nil {
-				before := formatThresholds(target.Thresholds)
-				after := formatThresholds(*upd.Thresholds)
-				if before != after {
-					diffs = append(diffs, DiffEntry{Op: "update_panel", PanelID: target.ID, Field: "thresholds", Before: before, After: after})
+				if !slices.Equal(target.Thresholds, *upd.Thresholds) {
+					diffs = append(diffs, DiffEntry{
+						Op:      "update_panel",
+						PanelID: target.ID,
+						Field:   "thresholds",
+						Before:  formatThresholds(target.Thresholds),
+						After:   formatThresholds(*upd.Thresholds),
+					})
 					cp := make([]ThresholdIR, len(*upd.Thresholds))
 					copy(cp, *upd.Thresholds)
 					target.Thresholds = cp
@@ -292,6 +311,14 @@ func ApplyPatch(current DashboardIR, patch DashboardPatch, opts ValidateOptions)
 			if upd.Type != "" && upd.Type != target.Type {
 				diffs = append(diffs, DiffEntry{Op: "update_variable", Field: "variables." + name + ".type", Before: target.Type, After: upd.Type})
 				target.Type = upd.Type
+				// Clear fields exclusive to the previous variable type so schema-compliant type switches validate cleanly.
+				if upd.Type == "custom" {
+					target.DatasourceRef = ""
+					target.LabelName = ""
+					target.MetricName = ""
+				} else if upd.Type == "query" {
+					target.Options = nil
+				}
 			}
 			if upd.Label != nil && *upd.Label != target.Label {
 				diffs = append(diffs, DiffEntry{Op: "update_variable", Field: "variables." + name + ".label", Before: target.Label, After: *upd.Label})
@@ -310,10 +337,13 @@ func ApplyPatch(current DashboardIR, patch DashboardPatch, opts ValidateOptions)
 				target.MetricName = *upd.MetricName
 			}
 			if upd.Options != nil {
-				before := strings.Join(target.Options, ",")
-				after := strings.Join(*upd.Options, ",")
-				if before != after {
-					diffs = append(diffs, DiffEntry{Op: "update_variable", Field: "variables." + name + ".options", Before: before, After: after})
+				if !slices.Equal(target.Options, *upd.Options) {
+					diffs = append(diffs, DiffEntry{
+						Op:     "update_variable",
+						Field:  "variables." + name + ".options",
+						Before: strings.Join(target.Options, ","),
+						After:  strings.Join(*upd.Options, ","),
+					})
 					cp := make([]string, len(*upd.Options))
 					copy(cp, *upd.Options)
 					target.Options = cp
@@ -368,11 +398,35 @@ func usesV11Features(doc DashboardIR) bool {
 		return true
 	}
 	for _, p := range doc.Panels {
-		if len(p.Queries) > 0 || (p.Type != "timeseries" && p.Type != "stat") {
+		if len(p.Queries) > 0 || p.Query.RefID != "" || (p.Type != "timeseries" && p.Type != "stat") {
 			return true
 		}
 	}
 	return false
+}
+
+func effectiveRefID(refID string, idx int) string {
+	if refID != "" {
+		return refID
+	}
+	if idx >= 0 && idx < len(defaultQueryRefIDs) {
+		return defaultQueryRefIDs[idx]
+	}
+	return ""
+}
+
+func queriesEqual(a, b []QueryIR) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if effectiveRefID(a[i].RefID, i) != effectiveRefID(b[i].RefID, i) ||
+			a[i].Expr != b[i].Expr ||
+			a[i].LegendFormat != b[i].LegendFormat {
+			return false
+		}
+	}
+	return true
 }
 
 func findPanelIndex(panels []PanelIR, id string) int {
@@ -404,10 +458,7 @@ func formatThresholds(ts []ThresholdIR) string {
 func formatQueries(qs []QueryIR) string {
 	parts := make([]string, len(qs))
 	for i, q := range qs {
-		ref := q.RefID
-		if ref == "" && i < len(defaultQueryRefIDs) {
-			ref = defaultQueryRefIDs[i]
-		}
+		ref := effectiveRefID(q.RefID, i)
 		if q.LegendFormat != "" {
 			parts[i] = fmt.Sprintf("%s:%s[%s]", ref, q.Expr, q.LegendFormat)
 		} else {

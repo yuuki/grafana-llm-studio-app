@@ -174,7 +174,7 @@ export function normalizeDashboardIR(
 
     const rawQueries = getPanelQueries(p);
     const targets: NormalizedQueryTarget[] = rawQueries.map((q, qi) => ({
-      refId: q.refId ?? ALLOWED_QUERY_REF_IDS[qi],
+      refId: q.refId || ALLOWED_QUERY_REF_IDS[qi],
       expr: q.expr.trim(),
       legendFormat: q.legendFormat,
       datasource: { ...dsRef },
@@ -254,9 +254,23 @@ function normalizeVariable(
   };
 }
 
+const SINGLE_PASS_VAR_TOKEN =
+  /\$\{([a-zA-Z_][a-zA-Z0-9_]*)(?::(regex|pipe))?\}|\$([a-zA-Z_][a-zA-Z0-9_]*)(?![a-zA-Z0-9_])/g;
+
+function escapePromQLString(value: string): string {
+  return value
+    .replace(/\\/g, '\\\\')
+    .replace(/"/g, '\\"')
+    .replace(/\n/g, '\\n')
+    .replace(/\r/g, '\\r');
+}
+
 /**
- * Interpolates declared dashboard template variable placeholders ($var, ${var}, ${var:regex}, ${var:pipe})
- * using their default values for non-Grafana dry-run validation queries (/api/ds/query).
+ * Single-pass interpolation of declared dashboard template variable placeholders
+ * ($var, ${var}, ${var:regex}, ${var:pipe}) using their default values for non-Grafana
+ * dry-run validation queries (/api/ds/query).
+ * Escapes values for PromQL double-quoted string literals (and RE2 + PromQL string for :regex)
+ * to prevent secondary interpolation and invalid PromQL escape sequences (e.g. `\.` -> `\\.`).
  */
 export function interpolatePromQLVariables(
   expr: string,
@@ -265,20 +279,31 @@ export function interpolatePromQLVariables(
   if (!variables.length || !expr.includes('$')) {
     return expr;
   }
-  let out = expr;
+  const valueMap = new Map<string, string>();
   for (const v of variables) {
     const val = v.defaultValue || v.options[0] || '';
-    if (!val) {
-      continue;
+    if (val) {
+      valueMap.set(v.name, val);
     }
-    const regexEscaped = val.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-    out = out.split(`\${${v.name}:regex}`).join(regexEscaped);
-    out = out.split(`\${${v.name}:pipe}`).join(val);
-    out = out.split(`\${${v.name}}`).join(val);
-    const bareRe = new RegExp(`\\$${v.name}(?![a-zA-Z0-9_])`, 'g');
-    out = out.replace(bareRe, () => val);
   }
-  return out;
+  if (valueMap.size === 0) {
+    return expr;
+  }
+  return expr.replace(
+    SINGLE_PASS_VAR_TOKEN,
+    (match, bracedName: string | undefined, format: string | undefined, bareName: string | undefined) => {
+      const name = bracedName ?? bareName ?? '';
+      const rawVal = valueMap.get(name);
+      if (rawVal === undefined) {
+        return match;
+      }
+      if (format === 'regex') {
+        const re2Escaped = rawVal.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+        return escapePromQLString(re2Escaped);
+      }
+      return escapePromQLString(rawVal);
+    }
+  );
 }
 
 /**

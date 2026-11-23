@@ -189,7 +189,7 @@ describe('Create-only DashboardSaver (Grafana 12.4.15 v1beta1)', () => {
     ).rejects.toMatchObject({ code: 'MISSING_RESOURCE_VERSION' });
     expect(mockFetch).not.toHaveBeenCalled();
 
-    // Valid revision-checked PUT succeeds and returns updated resourceVersion.
+    // Valid revision-checked PUT succeeds, preserves non-folder annotations/labels, and returns updated resourceVersion.
     mockFetch.mockReturnValueOnce(
       of({ data: { metadata: { name: 'existing-dash', resourceVersion: '18' } } })
     );
@@ -199,6 +199,11 @@ describe('Create-only DashboardSaver (Grafana 12.4.15 v1beta1)', () => {
       targetUid: 'existing-dash',
       expectedResourceVersion: '17',
       folderUid: 'team-folder',
+      preservedAnnotations: {
+        'grafana.app/managedBy': 'gitops',
+        'grafana.app/folder': 'should-not-overwrite',
+      },
+      preservedLabels: { team: 'payments' },
     });
     expect(updated.uid).toBe('existing-dash');
     expect(updated.mode).toBe('updated');
@@ -211,6 +216,11 @@ describe('Create-only DashboardSaver (Grafana 12.4.15 v1beta1)', () => {
     );
     expect(putCall.data.metadata.name).toBe('existing-dash');
     expect(putCall.data.metadata.resourceVersion).toBe('17');
+    expect(putCall.data.metadata.annotations).toEqual({
+      'grafana.app/managedBy': 'gitops',
+      'grafana.app/folder': 'team-folder',
+    });
+    expect(putCall.data.metadata.labels).toEqual({ team: 'payments' });
 
     // Concurrent external modification (HTTP 409/412) fails with REVISION_CONFLICT and NEVER retries without resourceVersion.
     mockFetch.mockReturnValueOnce(

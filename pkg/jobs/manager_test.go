@@ -459,3 +459,128 @@ func TestManager_SafeImportAndMultiQueryRepair(t *testing.T) {
 		t.Fatalf("unexpected repaired multi-query snapshot: %+v", repairedSnap.CurrentIR)
 	}
 }
+
+func TestManager_ImportIsolationAndGaugePreservation(t *testing.T) {
+	patchCalled := 0
+	stub := &stubLLM{
+		onGenerate: (&llm.MockClient{}).GenerateIR,
+		onPatch: func(_ context.Context, req llm.PatchRequest) ([]byte, llm.CompletionMeta, error) {
+			patchCalled++
+			// Attempt rate() on a gauge metric that was known as gauge during Import.
+			patch := ir.DashboardPatch{
+				SchemaVersion: ir.SchemaVersion,
+				BaseRevision:  req.CurrentIR.Revision,
+				Summary:       "Attempt invalid rate on gauge",
+				Operations: []ir.PatchOperation{
+					{
+						Op:      "update_panel",
+						PanelID: "panel-mem",
+						Panel: &ir.PanelUpdate{
+							Query: &ir.QueryUpdate{
+								Expr: `rate(process_resident_memory_bytes{service="checkout-api"}[5m])`,
+							},
+						},
+					},
+				},
+			}
+			b, _ := json.Marshal(patch)
+			return b, llm.CompletionMeta{FinishReason: "stop", ProviderMode: "stub"}, nil
+		},
+	}
+
+	mgr := jobs.NewManager(stub, jobs.Config{
+		AllowedDSUIDs:  []string{"prom-main"},
+		MaxJobs:        2,
+		MaxJobsPerUser: 2,
+	})
+	alice := jobs.Owner{OrgID: 1, UserLogin: "alice"}
+	mallory := jobs.Owner{OrgID: 1, UserLogin: "mallory"}
+
+	baseDraft := ir.DashboardIR{
+		SchemaVersion: ir.SchemaVersion,
+		Revision:      1,
+		Title:         "Memory Overview",
+		TimeRange:     ir.TimeRange{From: "now-15m", To: "now"},
+		Panels: []ir.PanelIR{
+			{
+				ID:            "panel-mem",
+				Type:          "stat",
+				Title:         "Memory",
+				DatasourceRef: ir.SelectedDatasourceRef,
+				Query:         ir.QueryIR{Expr: `avg(process_resident_memory_bytes{service="checkout-api"})`},
+				Unit:          "bytes",
+				Layout:        ir.LayoutHint{Row: 0, Col: 0, Width: "full"},
+			},
+		},
+	}
+
+	// Alice fills global capacity (MaxJobs=2).
+	a1, err := mgr.Import(alice, jobs.ImportInput{
+		DatasourceUID: "prom-main",
+		Scope:         &ir.ScopeFilter{LabelName: "service", LabelValue: "checkout-api"},
+		Draft:         baseDraft,
+		Catalog:       testCatalog(),
+	})
+	if err != nil {
+		t.Fatalf("alice import 1 failed: %v", err)
+	}
+	if _, err := mgr.Import(alice, jobs.ImportInput{
+		DatasourceUID: "prom-main",
+		Scope:         &ir.ScopeFilter{LabelName: "service", LabelValue: "checkout-api"},
+		Draft:         baseDraft,
+		Catalog:       testCatalog(),
+	}); err != nil {
+		t.Fatalf("alice import 2 failed: %v", err)
+	}
+
+	// M-4: Mallory's Import MUST NOT evict Alice's non-expired jobs; must return ErrConcurrencyLimited.
+	if _, err := mgr.Import(mallory, jobs.ImportInput{
+		DatasourceUID: "prom-main",
+		Draft:         baseDraft,
+	}); !errors.Is(err, jobs.ErrConcurrencyLimited) {
+		t.Fatalf("expected ErrConcurrencyLimited preventing cross-user eviction DoS, got %v", err)
+	}
+	if _, err := mgr.Get(alice, a1.JobID); err != nil {
+		t.Fatalf("alice's job should still exist after mallory's rejected import: %v", err)
+	}
+
+	// L-5: Patch with non-existent targetPanelId fails BEFORE calling LLM.
+	if _, err := mgr.Patch(context.Background(), alice, a1.JobID, jobs.PatchInput{
+		BaseRevision:  1,
+		TargetPanelID: "panel-does-not-exist",
+		EditIntent:    "update",
+		Catalog:       testCatalog(),
+	}); !errors.Is(err, ir.ErrPanelNotFound) {
+		t.Fatalf("expected ErrPanelNotFound before LLM call, got %v", err)
+	}
+	if patchCalled != 0 {
+		t.Fatalf("expected LLM not to be called for unknown targetPanelId, calls=%d", patchCalled)
+	}
+
+	// H-5: Client spoofing process_resident_memory_bytes type as "counter" on Patch is blocked by knownGauges.
+	spoofedCatalog := []ir.MetricCatalogItem{
+		{Name: "process_resident_memory_bytes", Type: "counter"},
+	}
+	if _, err := mgr.Patch(context.Background(), alice, a1.JobID, jobs.PatchInput{
+		BaseRevision: 1,
+		EditIntent:   "rate on memory",
+		Catalog:      spoofedCatalog,
+	}); err == nil {
+		t.Fatal("expected rate() on known gauge metric to be rejected despite client spoofing type=counter")
+	}
+
+	// L-5: Repair with empty catalog fails BEFORE consuming repair budget.
+	if _, err := mgr.Repair(context.Background(), alice, a1.JobID, jobs.RepairInput{
+		BaseRevision: 1,
+		Results: []ir.PanelValidationResult{
+			{PanelID: "panel-mem", QueryHash: ir.PanelQueryHash(a1.CurrentIR.Panels[0]), Category: ir.ValidationSyntaxError},
+		},
+		Catalog: nil,
+	}); err == nil {
+		t.Fatal("expected Repair with empty catalog to fail")
+	}
+	afterEmpty, _ := mgr.Get(alice, a1.JobID)
+	if afterEmpty.RepairAttemptsUsed != 0 {
+		t.Fatalf("expected repair budget untouched on empty catalog, got %d", afterEmpty.RepairAttemptsUsed)
+	}
+}

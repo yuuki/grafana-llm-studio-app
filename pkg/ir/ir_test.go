@@ -356,4 +356,80 @@ func TestIRv11_FixturePanelsMultiQueryVariablesAndPatches(t *testing.T) {
 			t.Fatalf("unexpected variables after update/remove: %+v", updNext.Variables)
 		}
 	})
+
+	t.Run("adversarial IR/Patch checks: empty queries, variable injection, legend var tokens, strict patch required fields, type switch cleanup", func(t *testing.T) {
+		// M-1: query + empty queries: [] must be rejected.
+		bothWithEmpty := []byte(`{"schemaVersion":"1.1","revision":1,"title":"Bad","timeRange":{"from":"now-15m","to":"now"},"panels":[{"id":"panel-a","type":"timeseries","title":"A","datasourceRef":"selected_prometheus","query":{"expr":"up"},"queries":[],"unit":"short","layout":{"row":0,"col":0,"width":"full"}}]}`)
+		if _, err := ir.DecodeStrictIR(bothWithEmpty); err == nil {
+			t.Fatal("expected DecodeStrictIR to reject query + empty queries: []")
+		}
+
+		// C-3 & M-6: Variable defaultValue/options with quotes, commas, or $var tokens rejected; query var requires non-empty defaultValue.
+		badQuote := doc.Clone()
+		badQuote.Variables[0].DefaultValue = `checkout-api",status=~".*`
+		if err := ir.ValidateIR(badQuote, ir.ValidateOptions{MaxPanels: 6}); err == nil {
+			t.Fatal("expected quote-injected variable defaultValue to be rejected")
+		}
+
+		emptyQueryDef := doc.Clone()
+		emptyQueryDef.Variables[0].DefaultValue = ""
+		if err := ir.ValidateIR(emptyQueryDef, ir.ValidateOptions{MaxPanels: 6}); err == nil {
+			t.Fatal("expected query variable with empty defaultValue to be rejected")
+		}
+
+		commaOpt := doc.Clone()
+		commaOpt.Variables[1].Options = []string{"5..,evil"}
+		commaOpt.Variables[1].DefaultValue = "5..,evil"
+		if err := ir.ValidateIR(commaOpt, ir.ValidateOptions{MaxPanels: 6}); err == nil {
+			t.Fatal("expected custom variable option containing comma to be rejected")
+		}
+
+		// L-3: Any __* variable name rejected.
+		doubleUnder := doc.Clone()
+		doubleUnder.Variables[0].Name = "__custom_secret"
+		if err := ir.ValidateIR(doubleUnder, ir.ValidateOptions{MaxPanels: 6}); err == nil {
+			t.Fatal("expected __-prefixed variable name to be rejected")
+		}
+
+		// H-1: legendFormat with template variable token rejected.
+		badLegend := doc.Clone()
+		badLegend.Panels[1].Query.LegendFormat = "{{status}} $service"
+		if err := ir.ValidateIR(badLegend, ir.ValidateOptions{MaxPanels: 6}); err == nil {
+			t.Fatal("expected legendFormat containing $var token to be rejected")
+		}
+
+		// H-4: DecodeStrictPatch rejects missing baseRevision or missing layout.col or missing threshold.value.
+		if _, err := ir.DecodeStrictPatch([]byte(`{"schemaVersion":"1.1","summary":"no baseRev","operations":[{"op":"remove_variable","variableName":"service"}]}`)); err == nil {
+			t.Fatal("expected DecodeStrictPatch to reject missing baseRevision")
+		}
+		if _, err := ir.DecodeStrictPatch([]byte(`{"schemaVersion":"1.1","baseRevision":1,"summary":"missing th val","operations":[{"op":"update_panel","panelId":"panel-error-gauge","panel":{"thresholds":[{"color":"red"}]}}]}`)); err == nil {
+			t.Fatal("expected DecodeStrictPatch to reject threshold missing value")
+		}
+
+		// M-3: update_variable switching type query -> custom clears datasourceRef/labelName/metricName cleanly.
+		newOpts := []string{"checkout-api"}
+		newDef := "checkout-api"
+		switched, _, err := ir.ApplyPatch(doc, ir.DashboardPatch{
+			SchemaVersion: ir.SchemaVersion,
+			BaseRevision:  doc.Revision,
+			Summary:       "Switch service variable from query to custom",
+			Operations: []ir.PatchOperation{
+				{
+					Op:           "update_variable",
+					VariableName: "service",
+					Variable: &ir.VariableUpdate{
+						Type:         "custom",
+						Options:      &newOpts,
+						DefaultValue: &newDef,
+					},
+				},
+			},
+		}, ir.ValidateOptions{MaxPanels: 6})
+		if err != nil {
+			t.Fatalf("expected type-switching update_variable to succeed after clearing stale query fields, got %v", err)
+		}
+		if switched.Variables[0].Type != "custom" || switched.Variables[0].DatasourceRef != "" || switched.Variables[0].LabelName != "" {
+			t.Fatalf("stale query fields not cleared on type switch: %+v", switched.Variables[0])
+		}
+	})
 }

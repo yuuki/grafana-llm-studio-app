@@ -247,6 +247,14 @@ func (a *App) handleGenerate(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, snap)
 }
 
+type importHTTPRequest struct {
+	DatasourceUID string                 `json:"datasourceUid"`
+	Scope         *ir.ScopeFilter        `json:"scope,omitempty"`
+	Draft         json.RawMessage        `json:"draft"`
+	ImportSource  *ir.ImportSource       `json:"importSource,omitempty"`
+	Catalog       []ir.MetricCatalogItem `json:"catalog,omitempty"`
+}
+
 func (a *App) handleImport(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
@@ -262,13 +270,24 @@ func (a *App) handleImport(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var in jobs.ImportInput
-	if err := decodeBoundedJSON(r.Body, &in); err != nil {
+	var req importHTTPRequest
+	if err := decodeBoundedJSON(r.Body, &req); err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	draft, err := ir.DecodeStrictIR(req.Draft)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, fmt.Sprintf("invalid draft IR: %v", err))
+		return
+	}
 
-	snap, err := a.jobManager.Import(owner, in)
+	snap, err := a.jobManager.Import(owner, jobs.ImportInput{
+		DatasourceUID: req.DatasourceUID,
+		Scope:         req.Scope,
+		Draft:         draft,
+		ImportSource:  req.ImportSource,
+		Catalog:       req.Catalog,
+	})
 	if err != nil {
 		writeJobError(w, err, snap)
 		return

@@ -65,12 +65,15 @@ export function buildFoundationDashboard(
 }
 
 function buildFoundationVariable(v: NormalizedVariableSpec) {
+  const currentVal = v.multi ? [v.defaultValue] : v.defaultValue;
+
   if (v.type === 'query') {
     const qb = new dashboard.QueryVariableBuilder(v.name)
       .label(v.label)
       .query(v.query)
       .multi(v.multi)
       .includeAll(v.includeAll)
+      .allowCustomValue(false)
       .refresh(dashboard.VariableRefresh.OnDashboardLoad)
       .sort(dashboard.VariableSort.AlphabeticalAsc)
       .hide(dashboard.VariableHide.DontHide);
@@ -82,31 +85,35 @@ function buildFoundationVariable(v: NormalizedVariableSpec) {
     }
     if (v.defaultValue) {
       qb.current({
-        text: v.defaultValue,
-        value: v.defaultValue,
+        text: currentVal,
+        value: currentVal,
       });
     }
     return qb;
   }
 
+  const customOptions: dashboard.VariableOption[] = [
+    ...(v.includeAll ? [{ text: 'All', value: '$__all', selected: false }] : []),
+    ...v.options.map((opt) => ({
+      text: opt,
+      value: opt,
+      selected: opt === v.defaultValue,
+    })),
+  ];
+
   const cb = new dashboard.CustomVariableBuilder(v.name)
     .label(v.label)
     .values(v.query)
-    .options(
-      v.options.map((opt) => ({
-        text: opt,
-        value: opt,
-        selected: opt === v.defaultValue,
-      }))
-    )
+    .options(customOptions)
     .multi(v.multi)
     .includeAll(v.includeAll)
+    .allowCustomValue(false)
     .hide(dashboard.VariableHide.DontHide);
 
   if (v.defaultValue) {
     cb.current({
-      text: v.defaultValue,
-      value: v.defaultValue,
+      text: currentVal,
+      value: currentVal,
     });
   }
   return cb;

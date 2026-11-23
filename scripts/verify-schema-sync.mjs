@@ -18,8 +18,18 @@ const patchSchema = JSON.parse(
 const tsTypes = fs.readFileSync(path.join(root, 'src/ir/types.ts'), 'utf8');
 const goValidate = fs.readFileSync(path.join(root, 'pkg/ir/validate.go'), 'utf8');
 
-function assertStringOnlyEnums(node, trail = '$') {
+function assertGoOpenAICompatible(node, trail = '$') {
   if (!node || typeof node !== 'object') return;
+  if ('oneOf' in node || 'anyOf' in node) {
+    throw new Error(
+      `Unsupported keyword oneOf/anyOf at ${trail} breaks grafana-llm-app (go-openai jsonschema.Definition)`
+    );
+  }
+  if (Array.isArray(node.type)) {
+    throw new Error(
+      `Array type ${JSON.stringify(node.type)} at ${trail} breaks grafana-llm-app (go-openai jsonschema.Definition.Type is DataType string)`
+    );
+  }
   if (Array.isArray(node.enum)) {
     for (const v of node.enum) {
       if (typeof v !== 'string') {
@@ -31,7 +41,7 @@ function assertStringOnlyEnums(node, trail = '$') {
   }
   for (const [k, v] of Object.entries(node)) {
     if (v && typeof v === 'object') {
-      assertStringOnlyEnums(v, `${trail}.${k}`);
+      assertGoOpenAICompatible(v, `${trail}.${k}`);
     }
   }
 }
@@ -64,8 +74,8 @@ function assertExactSetEqual(label, expected, actual, targetName) {
   }
 }
 
-assertStringOnlyEnums(irSchema, 'dashboard-ir');
-assertStringOnlyEnums(patchSchema, 'dashboard-patch');
+assertGoOpenAICompatible(irSchema, 'dashboard-ir');
+assertGoOpenAICompatible(patchSchema, 'dashboard-patch');
 
 const irPanelProps = irSchema.properties.panels.items.properties;
 const irVarProps = irSchema.properties.variables.items.properties;
@@ -145,11 +155,19 @@ for (const c of checks) {
   assertExactSetEqual(c.label, c.irEnum, extractGoMapKeys(goValidate, c.goMap), 'pkg/ir/validate.go');
 }
 
+// Verify fixed enum anchors for datasourceRef and timeRange.to across IR and Patch schemas.
+assertExactSetEqual('timeRange.to', ['now'], irSchema.properties.timeRange.properties.to.enum, 'dashboard-ir.schema.json');
+assertExactSetEqual('timeRange.to', ['now'], patchOpProps.timeRange.properties.to.enum, 'dashboard-patch.schema.json');
+assertExactSetEqual('panel.datasourceRef', ['selected_prometheus'], irPanelProps.datasourceRef.enum, 'dashboard-ir.schema.json');
+assertExactSetEqual('panel.datasourceRef', ['selected_prometheus'], patchPanelProps.datasourceRef.enum, 'dashboard-patch.schema.json');
+assertExactSetEqual('variable.datasourceRef', ['selected_prometheus'], irVarProps.datasourceRef.enum, 'dashboard-ir.schema.json');
+assertExactSetEqual('variable.datasourceRef', ['selected_prometheus'], patchVarProps.datasourceRef.enum, 'dashboard-patch.schema.json');
+
 // Verify patch.operations.op enum sync across dashboard-patch.schema.json, TS, and Go.
 const patchOpEnum = patchOpProps.op.enum;
 assertExactSetEqual('patch.operations.op', patchOpEnum, extractTsConstArray(tsTypes, 'ALLOWED_PATCH_OPS'), 'src/ir/types.ts');
 assertExactSetEqual('patch.operations.op', patchOpEnum, extractGoMapKeys(goValidate, 'allowedPatchOps'), 'pkg/ir/validate.go');
 
 console.log(
-  `Bidirectional schema sync OK: ${checks.map((c) => `${c.label}(${c.irEnum.length})`).join(', ')}, patch.operations.op(${patchOpEnum.length}); string-only enums verified.`
+  `Bidirectional schema sync OK: ${checks.map((c) => `${c.label}(${c.irEnum.length})`).join(', ')}, patch.operations.op(${patchOpEnum.length}), datasourceRef/timeRange.to; go-openai compatibility verified.`
 );

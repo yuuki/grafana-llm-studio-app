@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"regexp"
 	"regexp/syntax"
+	"sort"
 	"strings"
 	"time"
 	"unicode"
@@ -25,13 +26,16 @@ var (
 
 	validPromLabelName = regexp.MustCompile(`^[a-zA-Z_][a-zA-Z0-9_]*$`)
 
-	// containsVarSyntax detects Grafana variable interpolation tokens ($name or ${...})
+	// containsVarSyntax detects Grafana variable interpolation tokens ($name, ${...}, or legacy [[...]])
 	// while ignoring regex end-of-line anchors like ^$ or /api$.
-	containsVarSyntax = regexp.MustCompile(`\$(?:\{|[a-zA-Z_])`)
+	containsVarSyntax = regexp.MustCompile(`(?:\$(?:\{|[a-zA-Z_])|\[\[[a-zA-Z_])`)
 
 	// exactVarRef matches ONLY a standalone Grafana template variable reference:
 	//   $var, ${var}, ${var:regex}, or ${var:pipe}
 	exactVarRef = regexp.MustCompile(`^(?:\$([a-zA-Z_][a-zA-Z0-9_]*)|\$\{([a-zA-Z_][a-zA-Z0-9_]*)(?::(regex|pipe))?\})$`)
+
+	// singlePassVarToken finds standalone Grafana template variable tokens in one pass for interpolation.
+	singlePassVarToken = regexp.MustCompile(`\$\{([a-zA-Z_][a-zA-Z0-9_]*)(?::(regex|pipe))?\}|\$([a-zA-Z_][a-zA-Z0-9_]*)`)
 
 	forbiddenFunctions = map[string]bool{
 		"label_replace": true,
@@ -127,6 +131,15 @@ func ValidateExprWithVariables(
 	if err := ValidateScopeFilter(scope); err != nil {
 		return ValidationResult{}, err
 	}
+	var normalizedScope *ir.ScopeFilter
+	if scope != nil {
+		sName := strings.TrimSpace(scope.LabelName)
+		sVal := strings.TrimSpace(scope.LabelValue)
+		if sName != "" && sVal != "" {
+			normalizedScope = &ir.ScopeFilter{LabelName: sName, LabelValue: sVal}
+		}
+	}
+
 	trimmed := strings.TrimSpace(expr)
 	if trimmed == "" {
 		return ValidationResult{}, fmt.Errorf("%w: empty PromQL expression", ErrPolicyViolation)
@@ -174,6 +187,12 @@ func ValidateExprWithVariables(
 		}
 
 		switch n := node.(type) {
+		case *parser.StringLiteral:
+			if containsVarSyntax.MatchString(n.Val) {
+				setErr(fmt.Errorf("%w: template variable tokens are forbidden in PromQL string literals (%q)", ErrPolicyViolation, n.Val))
+				return nil
+			}
+
 		case *parser.AggregateExpr:
 			if n.Op == parser.COUNT_VALUES {
 				setErr(fmt.Errorf("%w: count_values aggregation is disabled to prevent cardinality explosion", ErrPolicyViolation))
@@ -289,7 +308,7 @@ func ValidateExprWithVariables(
 				inCatalog = true
 			}
 
-			scopeMatched := scope == nil || strings.TrimSpace(scope.LabelName) == "" || strings.TrimSpace(scope.LabelValue) == ""
+			scopeMatched := normalizedScope == nil
 			allowedLabelSet := make(map[string]bool, len(catalogItem.Labels))
 			for _, lbl := range catalogItem.Labels {
 				allowedLabelSet[lbl] = true
@@ -322,7 +341,7 @@ func ValidateExprWithVariables(
 						seenVars[v.Name] = true
 						res.ReferencedVariables = append(res.ReferencedVariables, v.Name)
 					}
-					if !scopeMatched && matcherSatisfiesScopeWithVariable(m, v, scope) {
+					if !scopeMatched && matcherSatisfiesScopeWithVariable(m, v, normalizedScope) {
 						scopeMatched = true
 					}
 				} else {
@@ -332,7 +351,7 @@ func ValidateExprWithVariables(
 							return nil
 						}
 					}
-					if !scopeMatched && m.Name == scope.LabelName && m.Type == labels.MatchEqual && m.Value == scope.LabelValue {
+					if !scopeMatched && m.Name == normalizedScope.LabelName && m.Type == labels.MatchEqual && m.Value == normalizedScope.LabelValue {
 						scopeMatched = true
 					}
 				}
@@ -343,7 +362,7 @@ func ValidateExprWithVariables(
 			}
 
 			if !scopeMatched {
-				setErr(fmt.Errorf("%w: selector for %q must retain %s=%q (or an anchored $%s variable)", ErrScopeFilterMissing, metricName, scope.LabelName, scope.LabelValue, scope.LabelName))
+				setErr(fmt.Errorf("%w: selector for %q must retain %s=%q (or an anchored single-value $%s variable)", ErrScopeFilterMissing, metricName, normalizedScope.LabelName, normalizedScope.LabelValue, normalizedScope.LabelName))
 				return nil
 			}
 		}
@@ -393,12 +412,19 @@ func validateVariableMatcher(
 		}
 	}
 
-	// For custom variables interpolated raw into =~, verify every custom option against regex safety rules
-	// so custom options cannot smuggle catch-all patterns like ".*".
-	if m.Type == labels.MatchRegexp && v.Type == "custom" && format == "" {
-		for _, opt := range v.Options {
-			if err := validateRegexMatcher(m.Name, labels.MatchRegexp, opt, policy.MaxRegexLength, policy.MaxRegexRepeat); err != nil {
-				return ir.VariableIR{}, fmt.Errorf("%w: custom variable $%s option %q violates regex policy: %v", ErrPolicyViolation, varName, opt, err)
+	if m.Type == labels.MatchRegexp {
+		if v.Type == "query" && format != "regex" {
+			// Query variables pull live label values (and defaultValue) which may contain regex metacharacters
+			// or wildcards; require explicit :regex escaping so raw values cannot smuggle catch-all regexes.
+			return ir.VariableIR{}, fmt.Errorf("%w: query variable $%s in =~ matcher must use ${%s:regex} format", ErrPolicyViolation, varName, varName)
+		}
+		if v.Type == "custom" && format != "regex" {
+			// Both raw $var/${var} and ${var:pipe} substitute unescaped custom options into =~;
+			// validate every option against regex safety rules to block catch-all patterns like ".*".
+			for _, opt := range v.Options {
+				if err := validateRegexMatcher(m.Name, labels.MatchRegexp, opt, policy.MaxRegexLength, policy.MaxRegexRepeat); err != nil {
+					return ir.VariableIR{}, fmt.Errorf("%w: custom variable $%s option %q violates regex policy: %v", ErrPolicyViolation, varName, opt, err)
+				}
 			}
 		}
 	}
@@ -410,8 +436,12 @@ func matcherSatisfiesScopeWithVariable(m *labels.Matcher, v ir.VariableIR, scope
 	if scope == nil || m.Name != scope.LabelName {
 		return false
 	}
-	// A variable that allows "All" cannot satisfy a mandatory tenant/service scope boundary.
-	if v.IncludeAll {
+	// Mandatory scope enforcement requires strict equality (=) on a single-value (non-multi, non-includeAll)
+	// variable anchored to the exact required scope value.
+	if m.Type != labels.MatchEqual {
+		return false
+	}
+	if v.IncludeAll || v.Multi {
 		return false
 	}
 	if v.DefaultValue != scope.LabelValue {
@@ -421,11 +451,7 @@ func matcherSatisfiesScopeWithVariable(m *labels.Matcher, v ir.VariableIR, scope
 		return v.LabelName == scope.LabelName
 	}
 	if v.Type == "custom" {
-		for _, opt := range v.Options {
-			if opt == scope.LabelValue {
-				return true
-			}
-		}
+		return len(v.Options) == 1 && v.Options[0] == scope.LabelValue
 	}
 	return false
 }
@@ -443,19 +469,41 @@ func ValidateDashboardIR(
 		return nil, err
 	}
 
+	var warnings []string
+
 	if promPolicy.RequireCatalogMatch && len(doc.Variables) > 0 {
-		catalogSet := make(map[string]bool, len(catalog))
+		catalogByName := make(map[string]ir.MetricCatalogItem, len(catalog))
 		for _, item := range catalog {
-			catalogSet[item.Name] = true
+			if _, exists := catalogByName[item.Name]; !exists {
+				catalogByName[item.Name] = item
+			}
 		}
 		for _, v := range doc.Variables {
-			if v.Type == "query" && v.MetricName != "" && !catalogSet[v.MetricName] {
+			if v.Type != "query" {
+				continue
+			}
+			if strings.TrimSpace(v.MetricName) == "" {
+				return nil, fmt.Errorf("variable %q: %w: query variable requires metricName in scoped catalog", v.Name, ErrPolicyViolation)
+			}
+			item, ok := catalogByName[v.MetricName]
+			if !ok {
 				return nil, fmt.Errorf("variable %q: %w: %q", v.Name, ErrMetricNotInCatalog, v.MetricName)
+			}
+			if len(item.Labels) > 0 {
+				foundLbl := false
+				for _, lbl := range item.Labels {
+					if lbl == v.LabelName {
+						foundLbl = true
+						break
+					}
+				}
+				if !foundLbl {
+					warnings = append(warnings, fmt.Sprintf("variable %s: label %q not listed in sampled labels for %q", v.Name, v.LabelName, v.MetricName))
+				}
 			}
 		}
 	}
 
-	var warnings []string
 	for _, p := range doc.Panels {
 		queries := p.EffectiveQueries()
 		for qi, q := range queries {
@@ -477,30 +525,67 @@ func ValidateDashboardIR(
 	return warnings, nil
 }
 
-// InterpolateVariables replaces declared template variable placeholders ($var, ${var}, ${var:regex}, ${var:pipe})
-// with their default values for non-Grafana raw Prometheus execution (e.g., benchmarks).
+// escapePromQLString escapes a value for safe embedding inside a PromQL double-quoted string literal.
+func escapePromQLString(val string) string {
+	var b strings.Builder
+	b.Grow(len(val))
+	for _, r := range val {
+		switch r {
+		case '\\':
+			b.WriteString(`\\`)
+		case '"':
+			b.WriteString(`\"`)
+		case '\n':
+			b.WriteString(`\n`)
+		case '\r':
+			b.WriteString(`\r`)
+		default:
+			b.WriteRune(r)
+		}
+	}
+	return b.String()
+}
+
+// InterpolateVariables performs single-pass, injection-safe substitution of declared template variable
+// placeholders ($var, ${var}, ${var:regex}, ${var:pipe}) with their default values for raw Prometheus execution.
+// Substituted values are PromQL-string-escaped and never re-scanned.
 func InterpolateVariables(expr string, variables []ir.VariableIR) string {
 	if len(variables) == 0 || !strings.Contains(expr, "$") {
 		return expr
 	}
-	out := expr
+	values := make(map[string]string, len(variables))
 	for _, v := range variables {
 		val := v.DefaultValue
 		if val == "" && v.Type == "custom" && len(v.Options) > 0 {
 			val = v.Options[0]
 		}
-		if val == "" {
-			continue
+		if val != "" {
+			values[v.Name] = val
 		}
-		escaped := regexp.QuoteMeta(val)
-		out = strings.ReplaceAll(out, "${"+v.Name+":regex}", escaped)
-		out = strings.ReplaceAll(out, "${"+v.Name+":pipe}", val)
-		out = strings.ReplaceAll(out, "${"+v.Name+"}", val)
-		// Replace $name only when not followed by identifier continuation char.
-		re := regexp.MustCompile(`\$` + regexp.QuoteMeta(v.Name) + `\b`)
-		out = re.ReplaceAllString(out, val)
 	}
-	return out
+	if len(values) == 0 {
+		return expr
+	}
+	return singlePassVarToken.ReplaceAllStringFunc(expr, func(match string) string {
+		sub := singlePassVarToken.FindStringSubmatch(match)
+		if sub == nil {
+			return match
+		}
+		varName := sub[1]
+		format := sub[2]
+		if varName == "" {
+			varName = sub[3]
+		}
+		val, ok := values[varName]
+		if !ok {
+			return match
+		}
+		if format == "regex" {
+			// Apply RE2 meta escaping first, then PromQL double-quoted string escaping (so '.' -> '\\.').
+			return escapePromQLString(regexp.QuoteMeta(val))
+		}
+		return escapePromQLString(val)
+	})
 }
 
 func collectMetricNamesInNode(node parser.Node) []string {
@@ -579,7 +664,7 @@ func inspectRegexAST(re *syntax.Regexp, labelName string, inQuantifier bool, max
 			}
 		}
 		unbounded := re.Op == syntax.OpStar || re.Op == syntax.OpPlus || (re.Op == syntax.OpRepeat && re.Max < 0)
-		if unbounded && len(re.Sub) > 0 && isUniversalCharClass(re.Sub[0]) {
+		if unbounded && len(re.Sub) > 0 && (isUniversalCharClass(re.Sub[0]) || isUniversalCharClass(re.Sub[0].Simplify())) {
 			return fmt.Errorf("%w: unbounded wildcard quantifier in regex on label %q is forbidden", ErrPolicyViolation, labelName)
 		}
 	}
@@ -604,14 +689,63 @@ func isUniversalCharClass(re *syntax.Regexp) bool {
 			return isUniversalCharClass(re.Sub[0])
 		}
 	case syntax.OpCharClass:
-		// Detects [\s\S], [\d\D], [\w\W], [^\x00] style universal classes covering nearly all runes.
-		total := 0
-		for i := 0; i+1 < len(re.Rune); i += 2 {
-			total += int(re.Rune[i+1]-re.Rune[i]) + 1
+		return countRuneSpan(re.Rune) >= 0x100000
+	case syntax.OpAlternate:
+		// Detect (.|x)+ as well as (\s|\S)+ / (\d|\D)+ universal alternations.
+		var merged []rune
+		for _, sub := range re.Sub {
+			if isUniversalCharClass(sub) {
+				return true
+			}
+			if sub.Op == syntax.OpCapture && len(sub.Sub) == 1 {
+				sub = sub.Sub[0]
+			}
+			if sub.Op == syntax.OpCharClass {
+				merged = append(merged, sub.Rune...)
+			}
 		}
-		if total >= 0x100000 {
+		if len(merged) >= 2 && countMergedRuneSpan(merged) >= 0x100000 {
 			return true
 		}
 	}
 	return false
+}
+
+func countRuneSpan(ranges []rune) int {
+	total := 0
+	for i := 0; i+1 < len(ranges); i += 2 {
+		total += int(ranges[i+1]-ranges[i]) + 1
+	}
+	return total
+}
+
+func countMergedRuneSpan(ranges []rune) int {
+	type interval struct{ lo, hi rune }
+	intervals := make([]interval, 0, len(ranges)/2)
+	for i := 0; i+1 < len(ranges); i += 2 {
+		intervals = append(intervals, interval{lo: ranges[i], hi: ranges[i+1]})
+	}
+	if len(intervals) == 0 {
+		return 0
+	}
+	sort.Slice(intervals, func(i, j int) bool {
+		if intervals[i].lo != intervals[j].lo {
+			return intervals[i].lo < intervals[j].lo
+		}
+		return intervals[i].hi < intervals[j].hi
+	})
+	total := 0
+	curLo, curHi := intervals[0].lo, intervals[0].hi
+	for _, iv := range intervals[1:] {
+		if iv.lo <= curHi+1 {
+			if iv.hi > curHi {
+				curHi = iv.hi
+			}
+		} else {
+			total += int(curHi-curLo) + 1
+			curLo, curHi = iv.lo, iv.hi
+		}
+	}
+	total += int(curHi-curLo) + 1
+	return total
 }

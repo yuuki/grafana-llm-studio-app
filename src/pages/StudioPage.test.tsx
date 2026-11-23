@@ -447,5 +447,118 @@ describe('StudioPage Scenes lifecycle, Dry-Run gating, and partial re-validation
         previewedRevision: 1,
       })
     );
+    // Opt-in checkbox resets to false after save so next save defaults safely to create-as-copy.
+    expect((screen.getByTestId('studio-optin-update-checkbox') as HTMLInputElement).checked).toBe(false);
+  });
+
+  test('variable-only patch invalidates dry-run cache even when panel queryHash is unchanged (H-8)', async () => {
+    const varExpr = 'sum(rate(http_requests_total{service="$service"}[5m]))';
+    const varHash = await computeQueryHash(varExpr);
+
+    mockGenerateDraft.mockResolvedValueOnce({
+      jobId: 'job-var-cache',
+      status: 'awaiting_preview',
+      datasourceUid: 'prom-main',
+      currentIR: {
+        schemaVersion: '1.1',
+        revision: 1,
+        title: 'Var Draft',
+        timeRange: { from: 'now-15m', to: 'now' },
+        variables: [
+          {
+            name: 'service',
+            type: 'query',
+            datasourceRef: 'selected_prometheus',
+            labelName: 'service',
+            metricName: 'http_requests_total',
+            defaultValue: 'checkout-api',
+          },
+        ],
+        panels: [
+          {
+            id: 'panel-req',
+            type: 'timeseries',
+            title: 'Requests',
+            datasourceRef: 'selected_prometheus',
+            query: { expr: varExpr },
+            unit: 'reqps',
+            layout: { row: 0, col: 0, width: 'full' },
+          },
+        ],
+      },
+      repairAttemptsUsed: 0,
+      maxRepairAttempts: 2,
+      canUndo: false,
+      updatedAt: '2026-11-23T00:00:00Z',
+    });
+    mockRunDryRunValidation
+      .mockResolvedValueOnce([
+        { panelId: 'panel-req', queryHash: varHash, category: 'ok', seriesCount: 1, durationMs: 5 },
+      ])
+      .mockResolvedValueOnce([
+        { panelId: 'panel-req', queryHash: varHash, category: 'ok', seriesCount: 1, durationMs: 5 },
+      ]);
+    mockPatchDraft.mockResolvedValueOnce({
+      jobId: 'job-var-cache',
+      status: 'awaiting_preview',
+      datasourceUid: 'prom-main',
+      currentIR: {
+        schemaVersion: '1.1',
+        revision: 2,
+        title: 'Var Draft',
+        timeRange: { from: 'now-15m', to: 'now' },
+        variables: [
+          {
+            name: 'service',
+            type: 'query',
+            datasourceRef: 'selected_prometheus',
+            labelName: 'service',
+            metricName: 'http_requests_total',
+            defaultValue: 'payments-api',
+          },
+        ],
+        panels: [
+          {
+            id: 'panel-req',
+            type: 'timeseries',
+            title: 'Requests',
+            datasourceRef: 'selected_prometheus',
+            query: { expr: varExpr },
+            unit: 'reqps',
+            layout: { row: 0, col: 0, width: 'full' },
+          },
+        ],
+      },
+      repairAttemptsUsed: 0,
+      maxRepairAttempts: 2,
+      canUndo: true,
+      updatedAt: '2026-11-23T00:00:05Z',
+    });
+
+    render(<StudioPage />);
+    await waitFor(() => expect(screen.getByText('開発・テスト用モックLLMモード')).toBeTruthy());
+
+    fireEvent.change(screen.getByPlaceholderText('checkout-api'), { target: { value: 'checkout-api' } });
+    fireEvent.click(screen.getByText('スコープのメトリクスを取得'));
+    await waitFor(() => expect(screen.getByTestId('studio-catalog-count').textContent).toBe('2'));
+
+    fireEvent.click(screen.getByText('ダッシュボード案を生成'));
+    await waitFor(() => expect(screen.getByTestId('studio-job-revision').textContent).toBe('rev 1'));
+
+    fireEvent.click(screen.getByText('検証・プレビューを実行'));
+    await waitFor(() => expect(mockRunDryRunValidation).toHaveBeenCalledTimes(1));
+
+    // Patch changes ONLY variable defaultValue; panel queryHash stays identical
+    fireEvent.click(screen.getByText('部分修正を適用'));
+    await waitFor(() => expect(screen.getByTestId('studio-job-revision').textContent).toBe('rev 2'));
+
+    // Re-validate MUST re-run dry-run for panel-req because variablesFingerprint changed!
+    fireEvent.click(screen.getByText('検証・プレビューを実行'));
+    await waitFor(() => expect(mockRunDryRunValidation).toHaveBeenCalledTimes(2));
+    expect(mockRunDryRunValidation).toHaveBeenNthCalledWith(
+      2,
+      expect.anything(),
+      expect.objectContaining({ onlyPanelIds: ['panel-req'] })
+    );
   });
 });

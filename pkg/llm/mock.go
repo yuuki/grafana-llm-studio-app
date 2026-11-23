@@ -47,21 +47,30 @@ func (m *MockClient) GenerateIR(ctx context.Context, req GenerateRequest) ([]byt
 	wantMultiQuery := containsAny(lowerIntent, "multi", "p50", "p99", "マルチクエリ", "比較")
 
 	var variables []ir.VariableIR
-	if wantVariable && req.Scope != nil && validMockLabelName.MatchString(req.Scope.LabelName) && strings.TrimSpace(req.Scope.LabelValue) != "" {
+	if wantVariable &&
+		req.Scope != nil &&
+		validMockLabelName.MatchString(req.Scope.LabelName) &&
+		!ir.IsReservedVariableName(req.Scope.LabelName) &&
+		len(req.Scope.LabelName) <= ir.MaxVariableNameLen &&
+		strings.TrimSpace(req.Scope.LabelValue) != "" {
 		metricHint := ""
 		if hasReq {
 			metricHint = reqMetric.Name
+		} else if len(req.Catalog) > 0 {
+			metricHint = req.Catalog[0].Name
 		}
-		variables = append(variables, ir.VariableIR{
-			Name:          req.Scope.LabelName,
-			Label:         strings.ToUpper(req.Scope.LabelName[:1]) + req.Scope.LabelName[1:],
-			Type:          "query",
-			DatasourceRef: ir.SelectedDatasourceRef,
-			LabelName:     req.Scope.LabelName,
-			MetricName:    metricHint,
-			DefaultValue:  req.Scope.LabelValue,
-		})
-		selector = fmt.Sprintf(`{%s="$%s"}`, req.Scope.LabelName, req.Scope.LabelName)
+		if metricHint != "" {
+			variables = append(variables, ir.VariableIR{
+				Name:          req.Scope.LabelName,
+				Label:         strings.ToUpper(req.Scope.LabelName[:1]) + req.Scope.LabelName[1:],
+				Type:          "query",
+				DatasourceRef: ir.SelectedDatasourceRef,
+				LabelName:     req.Scope.LabelName,
+				MetricName:    metricHint,
+				DefaultValue:  req.Scope.LabelValue,
+			})
+			selector = fmt.Sprintf(`{%s="$%s"}`, req.Scope.LabelName, req.Scope.LabelName)
+		}
 	}
 
 	if len(req.Catalog) == 0 {
@@ -350,6 +359,28 @@ func (m *MockClient) RepairPanels(ctx context.Context, req RepairRequest) ([]byt
 
 	var ops []ir.PatchOperation
 	for _, t := range req.Targets {
+		if len(t.Queries) > 0 {
+			repairedQueries := make([]ir.QueryIR, len(t.Queries))
+			for i, q := range t.Queries {
+				repaired := strings.TrimSuffix(strings.TrimSpace(q.Expr), "))")
+				if i == 0 && hasReq {
+					repaired = fmt.Sprintf("sum by (status) (rate(%s%s[5m]))", reqMetric.Name, selector)
+				}
+				repairedQueries[i] = ir.QueryIR{
+					RefID:        q.RefID,
+					Expr:         repaired,
+					LegendFormat: q.LegendFormat,
+				}
+			}
+			ops = append(ops, ir.PatchOperation{
+				Op:      "update_panel",
+				PanelID: t.PanelID,
+				Panel: &ir.PanelUpdate{
+					Queries: &repairedQueries,
+				},
+			})
+			continue
+		}
 		repaired := strings.TrimSuffix(strings.TrimSpace(t.Expr), "))")
 		if hasReq {
 			repaired = fmt.Sprintf("sum by (status) (rate(%s%s[5m]))", reqMetric.Name, selector)

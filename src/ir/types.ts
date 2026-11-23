@@ -236,7 +236,128 @@ const RESERVED_VAR_NAMES = new Set([
   '__org',
   '__user',
   'timeFilter',
+  'timeFrom',
+  'timeTo',
 ]);
+
+const HTML_EVENT_HANDLER_REGEX = /\bon[a-z]+\s*=/i;
+const LEGEND_VAR_TOKEN_REGEX = /(?:\$(?:\{|[a-zA-Z_])|\[\[[a-zA-Z_])/;
+const FORBIDDEN_ACTIVE_FRAGMENTS = [
+  '<script',
+  '</script',
+  '<iframe',
+  '<svg',
+  '<img',
+  '<object',
+  '<embed',
+  'javascript:',
+  'vbscript:',
+  'data:text/html',
+];
+
+export function isReservedVariableName(name: string): boolean {
+  return name.startsWith('__') || RESERVED_VAR_NAMES.has(name);
+}
+
+function countRunes(value: string): number {
+  return Array.from(value).length;
+}
+
+function checkForbiddenRunes(field: string, value: string): string | null {
+  for (let i = 0; i < value.length; i++) {
+    const code = value.charCodeAt(i);
+    if (code < 0x20 || (code >= 0x7f && code <= 0x9f)) {
+      return `${field} contains forbidden control character`;
+    }
+    if (
+      code === 0x200e ||
+      code === 0x200f ||
+      (code >= 0x202a && code <= 0x202e) ||
+      (code >= 0x2066 && code <= 0x2069)
+    ) {
+      return `${field} contains forbidden bidirectional control character`;
+    }
+  }
+  return null;
+}
+
+function validatePlainTextClient(
+  field: string,
+  value: string,
+  minRunes: number,
+  maxRunes: number
+): string | null {
+  const runeErr = checkForbiddenRunes(field, value);
+  if (runeErr) {
+    return runeErr;
+  }
+  const trimmed = value.trim();
+  const n = countRunes(trimmed);
+  if (n < minRunes || n > maxRunes) {
+    return `${field} length must be between ${minRunes} and ${maxRunes} characters`;
+  }
+  if (trimmed.includes('<') || trimmed.includes('>')) {
+    return `${field} must be plain text without HTML angle brackets`;
+  }
+  const lower = trimmed.toLowerCase();
+  for (const frag of FORBIDDEN_ACTIVE_FRAGMENTS) {
+    if (lower.includes(frag)) {
+      return `${field} contains forbidden markup or script fragment`;
+    }
+  }
+  if (HTML_EVENT_HANDLER_REGEX.test(trimmed)) {
+    return `${field} contains forbidden inline event handler`;
+  }
+  return null;
+}
+
+function validateExprTextClient(field: string, value: string, maxRunes: number): string | null {
+  const runeErr = checkForbiddenRunes(field, value);
+  if (runeErr) {
+    return runeErr;
+  }
+  const trimmed = value.trim();
+  const n = countRunes(trimmed);
+  if (n < 1 || n > maxRunes) {
+    return `${field} length must be between 1 and ${maxRunes} characters`;
+  }
+  const lower = trimmed.toLowerCase();
+  for (const frag of FORBIDDEN_ACTIVE_FRAGMENTS) {
+    if (lower.includes(frag)) {
+      return `${field} contains forbidden markup or script fragment`;
+    }
+  }
+  if (HTML_EVENT_HANDLER_REGEX.test(trimmed)) {
+    return `${field} contains forbidden inline event handler`;
+  }
+  return null;
+}
+
+export function validateVariableValueClient(
+  field: string,
+  value: string,
+  minRunes: number,
+  maxRunes: number,
+  isCustomOption: boolean
+): string | null {
+  const textErr = validatePlainTextClient(field, value, minRunes, maxRunes);
+  if (textErr) {
+    return textErr;
+  }
+  if (
+    value.includes('"') ||
+    value.includes('\\') ||
+    value.includes('`') ||
+    value.includes('$') ||
+    value.includes('[[')
+  ) {
+    return `${field} contains forbidden quote, escape, or template variable token`;
+  }
+  if (isCustomOption && (value.includes(',') || value.includes(' : '))) {
+    return `${field} cannot contain comma or key-value separator`;
+  }
+  return null;
+}
 
 /**
  * Returns the ordered list of PromQL queries defined on a panel (supports both v1.0 `query` and v1.1 `queries`).
@@ -257,7 +378,7 @@ export function getPanelQueries(panel: PanelIR): QueryIR[] {
  */
 export function validateIRClient(doc: DashboardIR, maxPanels = 6): string[] {
   const issues: string[] = [];
-  if (!doc || typeof doc !== 'object') {
+  if (!doc || typeof doc !== 'object' || Array.isArray(doc)) {
     return ['DashboardIR must be an object'];
   }
   if (!ALLOWED_SCHEMA_VERSIONS.includes(doc.schemaVersion)) {
@@ -266,8 +387,23 @@ export function validateIRClient(doc: DashboardIR, maxPanels = 6): string[] {
   if (!Number.isInteger(doc.revision) || doc.revision < 1 || doc.revision > 10000) {
     issues.push(`Invalid revision: ${doc.revision}`);
   }
-  if (!doc.title || doc.title.trim().length === 0 || doc.title.length > 120) {
-    issues.push('Dashboard title must be 1..120 characters');
+  if (typeof doc.title !== 'string') {
+    issues.push('Dashboard title must be a string');
+  } else {
+    const titleErr = validatePlainTextClient('title', doc.title, 1, 120);
+    if (titleErr) {
+      issues.push(titleErr);
+    }
+  }
+  if (doc.description !== undefined) {
+    if (typeof doc.description !== 'string') {
+      issues.push('Dashboard description must be a string');
+    } else if (doc.description !== '') {
+      const descErr = validatePlainTextClient('description', doc.description, 0, 400);
+      if (descErr) {
+        issues.push(descErr);
+      }
+    }
   }
   if (!doc.timeRange || !ALLOWED_TIME_FROM.includes(doc.timeRange.from) || doc.timeRange.to !== 'now') {
     issues.push(`Unsupported timeRange: ${doc.timeRange?.from}..${doc.timeRange?.to}`);
@@ -282,10 +418,29 @@ export function validateIRClient(doc: DashboardIR, maxPanels = 6): string[] {
       }
       const seenVars = new Set<string>();
       for (const v of doc.variables) {
-        if (!VAR_NAME_REGEX.test(v.name) || RESERVED_VAR_NAMES.has(v.name) || seenVars.has(v.name)) {
-          issues.push(`Invalid, reserved, or duplicate variable name: ${v.name}`);
+        if (!v || typeof v !== 'object' || Array.isArray(v)) {
+          issues.push('Each variable must be an object');
+          continue;
+        }
+        if (
+          typeof v.name !== 'string' ||
+          !VAR_NAME_REGEX.test(v.name) ||
+          isReservedVariableName(v.name) ||
+          seenVars.has(v.name)
+        ) {
+          issues.push(`Invalid, reserved, or duplicate variable name: ${String(v.name)}`);
         }
         seenVars.add(v.name);
+        if (v.label !== undefined) {
+          if (typeof v.label !== 'string') {
+            issues.push(`Variable ${v.name} label must be a string`);
+          } else if (v.label !== '') {
+            const labelErr = validatePlainTextClient(`variables.${v.name}.label`, v.label, 0, 64);
+            if (labelErr) {
+              issues.push(labelErr);
+            }
+          }
+        }
         if (!ALLOWED_VARIABLE_TYPES.includes(v.type)) {
           issues.push(`Unsupported variable type on ${v.name}: ${v.type}`);
           continue;
@@ -294,23 +449,85 @@ export function validateIRClient(doc: DashboardIR, maxPanels = 6): string[] {
           if (v.datasourceRef !== SELECTED_DATASOURCE_REF) {
             issues.push(`Forbidden datasourceRef on query variable ${v.name}: ${v.datasourceRef}`);
           }
-          if (!v.labelName || !LABEL_NAME_REGEX.test(v.labelName) || v.labelName === '__name__') {
+          if (
+            typeof v.labelName !== 'string' ||
+            !LABEL_NAME_REGEX.test(v.labelName) ||
+            v.labelName === '__name__'
+          ) {
             issues.push(`Invalid labelName on query variable ${v.name}`);
           }
-          if (v.metricName && !METRIC_NAME_REGEX.test(v.metricName)) {
-            issues.push(`Invalid metricName on query variable ${v.name}`);
+          if (v.metricName !== undefined && v.metricName !== '') {
+            if (typeof v.metricName !== 'string' || !METRIC_NAME_REGEX.test(v.metricName)) {
+              issues.push(`Invalid metricName on query variable ${v.name}`);
+            }
           }
           if (v.options && v.options.length > 0) {
             issues.push(`Query variable ${v.name} must not define custom options`);
+          }
+          if (typeof v.defaultValue !== 'string') {
+            issues.push(`Query variable ${v.name} must define a non-empty defaultValue`);
+          } else {
+            const defErr = validateVariableValueClient(
+              `variables.${v.name}.defaultValue`,
+              v.defaultValue,
+              1,
+              128,
+              false
+            );
+            if (defErr) {
+              issues.push(defErr);
+            }
           }
         } else if (v.type === 'custom') {
           if (v.datasourceRef) {
             issues.push(`Custom variable ${v.name} must not define datasourceRef`);
           }
+          if (v.labelName || v.metricName) {
+            issues.push(`Custom variable ${v.name} must not define labelName or metricName`);
+          }
           if (!Array.isArray(v.options) || v.options.length < 1 || v.options.length > MAX_VARIABLE_OPTIONS) {
             issues.push(`Custom variable ${v.name} must define 1..${MAX_VARIABLE_OPTIONS} options`);
-          } else if (v.defaultValue && !v.options.includes(v.defaultValue)) {
-            issues.push(`Custom variable ${v.name} defaultValue must be in options`);
+          } else {
+            const seenOpts = new Set<string>();
+            for (let oi = 0; oi < v.options.length; oi++) {
+              const opt = v.options[oi];
+              if (typeof opt !== 'string') {
+                issues.push(`Custom variable ${v.name} option[${oi}] must be a string`);
+                continue;
+              }
+              const optErr = validateVariableValueClient(
+                `variables.${v.name}.options[${oi}]`,
+                opt,
+                1,
+                64,
+                true
+              );
+              if (optErr) {
+                issues.push(optErr);
+              }
+              if (seenOpts.has(opt)) {
+                issues.push(`Custom variable ${v.name} has duplicate option ${opt}`);
+              }
+              seenOpts.add(opt);
+            }
+            if (v.defaultValue !== undefined && v.defaultValue !== '') {
+              if (typeof v.defaultValue !== 'string') {
+                issues.push(`Custom variable ${v.name} defaultValue must be a string`);
+              } else {
+                const defErr = validateVariableValueClient(
+                  `variables.${v.name}.defaultValue`,
+                  v.defaultValue,
+                  1,
+                  128,
+                  false
+                );
+                if (defErr) {
+                  issues.push(defErr);
+                } else if (!v.options.includes(v.defaultValue)) {
+                  issues.push(`Custom variable ${v.name} defaultValue must be in options`);
+                }
+              }
+            }
           }
         }
       }
@@ -324,25 +541,47 @@ export function validateIRClient(doc: DashboardIR, maxPanels = 6): string[] {
 
   const seenIds = new Set<string>();
   const occupiedCells = new Set<string>();
-  for (const p of doc.panels ?? []) {
-    if (!PANEL_ID_REGEX.test(p.id) || seenIds.has(p.id)) {
-      issues.push(`Invalid or duplicate panel id: ${p.id}`);
+  for (const p of Array.isArray(doc.panels) ? doc.panels : []) {
+    if (!p || typeof p !== 'object' || Array.isArray(p)) {
+      issues.push('Each panel must be an object');
+      continue;
+    }
+    if (typeof p.id !== 'string' || !PANEL_ID_REGEX.test(p.id) || seenIds.has(p.id)) {
+      issues.push(`Invalid or duplicate panel id: ${String(p.id)}`);
     }
     seenIds.add(p.id);
     if (!ALLOWED_PANEL_TYPES.includes(p.type)) {
       issues.push(`Unsupported panel type: ${p.type}`);
     }
-    if (!p.title || p.title.trim().length === 0 || p.title.length > 80) {
+    if (typeof p.title !== 'string') {
       issues.push(`Invalid panel title on ${p.id}`);
+    } else {
+      const pTitleErr = validatePlainTextClient(`panels.${p.id}.title`, p.title, 1, 80);
+      if (pTitleErr) {
+        issues.push(pTitleErr);
+      }
+    }
+    if (p.description !== undefined) {
+      if (typeof p.description !== 'string') {
+        issues.push(`Invalid panel description on ${p.id}`);
+      } else if (p.description !== '') {
+        const pDescErr = validatePlainTextClient(`panels.${p.id}.description`, p.description, 0, 240);
+        if (pDescErr) {
+          issues.push(pDescErr);
+        }
+      }
     }
     if (p.datasourceRef !== SELECTED_DATASOURCE_REF) {
       issues.push(`Forbidden datasourceRef on ${p.id}: ${p.datasourceRef}`);
     }
 
-    const hasSingle = Boolean(p.query);
+    const hasSingle = p.query !== undefined;
+    const hasQueriesField = p.queries !== undefined;
     const hasMulti = Array.isArray(p.queries) && p.queries.length > 0;
-    if (hasSingle && hasMulti) {
+    if (hasSingle && hasQueriesField) {
       issues.push(`Panel ${p.id} cannot specify both query and queries`);
+    } else if (hasQueriesField && (!Array.isArray(p.queries) || p.queries.length === 0)) {
+      issues.push(`Panel ${p.id} queries must contain 1..${MAX_QUERIES_PER_PANEL} items`);
     } else if (!hasSingle && !hasMulti) {
       issues.push(`Panel ${p.id} must specify query or 1..${MAX_QUERIES_PER_PANEL} queries`);
     } else {
@@ -352,12 +591,38 @@ export function validateIRClient(doc: DashboardIR, maxPanels = 6): string[] {
       }
       const seenRefIds = new Set<string>();
       qs.forEach((q, qi) => {
-        if (!q?.expr || q.expr.trim().length === 0 || q.expr.length > 512) {
-          issues.push(`Invalid query expr on ${p.id}[${qi}]`);
+        if (!q || typeof q !== 'object' || Array.isArray(q)) {
+          issues.push(`Invalid query object on ${p.id}[${qi}]`);
+          return;
         }
-        const refId = q?.refId ?? ALLOWED_QUERY_REF_IDS[qi];
+        if (typeof q.expr !== 'string') {
+          issues.push(`Invalid query expr on ${p.id}[${qi}]`);
+        } else {
+          const exprErr = validateExprTextClient(`panels.${p.id}.queries[${qi}].expr`, q.expr, 512);
+          if (exprErr) {
+            issues.push(exprErr);
+          }
+        }
+        if (q.legendFormat !== undefined) {
+          if (typeof q.legendFormat !== 'string') {
+            issues.push(`Invalid legendFormat on ${p.id}[${qi}]`);
+          } else if (q.legendFormat !== '') {
+            const lfErr = validatePlainTextClient(
+              `panels.${p.id}.queries[${qi}].legendFormat`,
+              q.legendFormat,
+              0,
+              80
+            );
+            if (lfErr) {
+              issues.push(lfErr);
+            } else if (LEGEND_VAR_TOKEN_REGEX.test(q.legendFormat)) {
+              issues.push(`legendFormat on ${p.id}[${qi}] must not contain template variable tokens`);
+            }
+          }
+        }
+        const refId = q.refId || ALLOWED_QUERY_REF_IDS[qi];
         if (!refId || !ALLOWED_QUERY_REF_IDS.includes(refId)) {
-          issues.push(`Invalid query refId on ${p.id}[${qi}]: ${q?.refId}`);
+          issues.push(`Invalid query refId on ${p.id}[${qi}]: ${q.refId}`);
         } else if (seenRefIds.has(refId)) {
           issues.push(`Duplicate query refId on ${p.id}: ${refId}`);
         } else {
@@ -369,25 +634,33 @@ export function validateIRClient(doc: DashboardIR, maxPanels = 6): string[] {
     if (!ALLOWED_UNITS.includes(p.unit)) {
       issues.push(`Unsupported unit on ${p.id}: ${p.unit}`);
     }
-    if (p.thresholds) {
-      if (p.thresholds.length > 4) {
-        issues.push(`Too many thresholds on ${p.id}`);
-      }
-      let prev = -Infinity;
-      for (const th of p.thresholds) {
-        if (!Number.isFinite(th.value) || th.value < -1e9 || th.value > 1e9) {
-          issues.push(`Threshold value out of range on ${p.id}`);
+    if (p.thresholds !== undefined) {
+      if (!Array.isArray(p.thresholds)) {
+        issues.push(`Thresholds must be an array on ${p.id}`);
+      } else {
+        if (p.thresholds.length > 4) {
+          issues.push(`Too many thresholds on ${p.id}`);
         }
-        if (th.value < prev) {
-          issues.push(`Thresholds must be ascending on ${p.id}`);
-        }
-        prev = th.value;
-        if (!ALLOWED_THRESHOLD_COLORS.includes(th.color)) {
-          issues.push(`Unsupported threshold color on ${p.id}: ${th.color}`);
+        let prev = -Infinity;
+        for (const th of p.thresholds) {
+          if (!th || typeof th !== 'object' || typeof th.value !== 'number') {
+            issues.push(`Invalid threshold entry on ${p.id}`);
+            continue;
+          }
+          if (!Number.isFinite(th.value) || th.value < -1e9 || th.value > 1e9) {
+            issues.push(`Threshold value out of range on ${p.id}`);
+          }
+          if (th.value < prev) {
+            issues.push(`Thresholds must be ascending on ${p.id}`);
+          }
+          prev = th.value;
+          if (!ALLOWED_THRESHOLD_COLORS.includes(th.color)) {
+            issues.push(`Unsupported threshold color on ${p.id}: ${th.color}`);
+          }
         }
       }
     }
-    if (!p.layout || !Number.isInteger(p.layout.row) || p.layout.row < 0 || p.layout.row > 5) {
+    if (!p.layout || typeof p.layout !== 'object' || !Number.isInteger(p.layout.row) || p.layout.row < 0 || p.layout.row > 5) {
       issues.push(`Invalid layout.row on ${p.id}`);
     } else if (p.layout.col !== 0 && p.layout.col !== 1) {
       issues.push(`Invalid layout.col on ${p.id}`);
@@ -467,20 +740,27 @@ const SHA256_K = new Uint32Array([
 function utf8Bytes(str: string): Uint8Array {
   const out: number[] = [];
   for (let i = 0; i < str.length; i++) {
-    let code = str.charCodeAt(i);
+    const code = str.charCodeAt(i);
     if (code < 0x80) {
       out.push(code);
     } else if (code < 0x800) {
       out.push(0xc0 | (code >> 6), 0x80 | (code & 0x3f));
     } else if (code >= 0xd800 && code <= 0xdbff && i + 1 < str.length) {
-      const next = str.charCodeAt(++i);
-      const cp = 0x10000 + (((code & 0x3ff) << 10) | (next & 0x3ff));
-      out.push(
-        0xf0 | (cp >> 18),
-        0x80 | ((cp >> 12) & 0x3f),
-        0x80 | ((cp >> 6) & 0x3f),
-        0x80 | (cp & 0x3f)
-      );
+      const next = str.charCodeAt(i + 1);
+      if (next >= 0xdc00 && next <= 0xdfff) {
+        i++;
+        const cp = 0x10000 + (((code & 0x3ff) << 10) | (next & 0x3ff));
+        out.push(
+          0xf0 | (cp >> 18),
+          0x80 | ((cp >> 12) & 0x3f),
+          0x80 | ((cp >> 6) & 0x3f),
+          0x80 | (cp & 0x3f)
+        );
+      } else {
+        out.push(0xef, 0xbf, 0xbd);
+      }
+    } else if (code >= 0xd800 && code <= 0xdfff) {
+      out.push(0xef, 0xbf, 0xbd);
     } else {
       out.push(0xe0 | (code >> 12), 0x80 | ((code >> 6) & 0x3f), 0x80 | (code & 0x3f));
     }

@@ -171,8 +171,8 @@ func BuildGenerateMessages(userIntent string, scope *ir.ScopeFilter, catalog []i
 		"2. Set datasourceRef strictly to \"selected_prometheus\" on every panel and query variable.",
 		"3. Allowed panel types: \"timeseries\", \"stat\", \"table\", \"gauge\", \"bargauge\", \"piechart\", \"state-timeline\". No HTML/JS.",
 		"4. Each panel must define EITHER \"query\" (single query) OR \"queries\" (1 to 3 queries with unique refIds A/B/C), never both.",
-		"5. Optional \"variables\" (max 4) may define scoped \"query\" (labelName + optional catalog metricName) or \"custom\" variables. Only declared variables may be referenced in label matchers ($name or ${name:regex}).",
-		"6. If requiredScope is provided, retain that exact label matcher (labelName=\"labelValue\") on every PromQL vector selector, or reference a declared non-includeAll variable anchored to that exact labelName and defaultValue.",
+		"5. Optional \"variables\" (max 4) may define scoped \"query\" (labelName + required catalog metricName + defaultValue) or \"custom\" variables. Only declared variables may be referenced in label matchers ($name or ${name:regex}; query vars in =~ must use ${name:regex}).",
+		"6. If requiredScope is provided, retain that exact label matcher (labelName=\"labelValue\") on every PromQL vector selector, or use = with a declared single-value (non-multi, non-includeAll) variable anchored to that exact labelName and defaultValue.",
 		"7. Keep PromQL safe: range selectors <= 1h, no catch-all regex like \".*\", no group_left/group_right joins, no negative offset, no @ modifier.",
 		"8. Default timeRange to {\"from\":\"now-15m\",\"to\":\"now\"}.",
 	}, "\n")
@@ -270,6 +270,9 @@ func BuildRepairMessages(
 		"requiredScope": safeScope,
 		"failingPanels": sanitizedTargets,
 		"metricCatalog": bounded,
+	}
+	if len(current.Variables) > 0 {
+		payload["variables"] = current.Variables
 	}
 	payloadBytes, err := marshalBoundedPayload(payload)
 	if err != nil {

@@ -53,10 +53,10 @@ interface GrafanaDSQueryResponse {
 const CATEGORY_SEVERITY: Record<ValidationCategory, number> = {
   ok: 0,
   empty_result: 1,
-  datasource_error: 2,
-  timeout: 3,
-  permission_error: 4,
-  syntax_error: 5,
+  syntax_error: 2,
+  datasource_error: 3,
+  timeout: 4,
+  permission_error: 5,
 };
 
 /**
@@ -228,6 +228,11 @@ async function validateSinglePanel(
     for (const refId of refIds) {
       const refRes = responseData?.results?.[refId];
       if (!refRes) {
+        if (CATEGORY_SEVERITY.datasource_error > CATEGORY_SEVERITY[worstCategory]) {
+          worstCategory = 'datasource_error';
+        }
+        const prefix = refIds.length > 1 ? `[${refId}] ` : '';
+        errorParts.push(`${prefix}Datasource returned no result entry for refId ${refId}`);
         continue;
       }
       if (refRes.error) {
@@ -287,8 +292,7 @@ async function validateSinglePanel(
         durationMs,
       };
     }
-    const { status, message } = extractErrorInfo(err, refIds);
-    const category = classifyDatasourceError(status, message);
+    const { category, message } = extractAndClassifyError(err, refIds);
 
     return {
       panelId: panel.id,
@@ -308,42 +312,66 @@ export function classifyDatasourceError(
   message = ''
 ): ValidationCategory {
   const lower = message.toLowerCase();
-  if (
-    status === 401 ||
-    status === 403 ||
-    lower.includes('forbidden') ||
-    lower.includes('unauthorized') ||
-    lower.includes('access denied') ||
-    lower.includes('permission')
-  ) {
-    return 'permission_error';
-  }
-  if (
-    status === 408 ||
-    status === 504 ||
-    lower.includes('timeout') ||
-    lower.includes('deadline exceeded')
-  ) {
-    return 'timeout';
-  }
-  if (
-    status === 400 ||
-    status === 422 ||
+  const isSyntaxMsg =
     lower.includes('parse error') ||
     lower.includes('bad_data') ||
     lower.includes('unexpected') ||
     lower.includes('invalid parameter') ||
-    lower.includes('unknown function')
+    lower.includes('unknown function');
+
+  // 1. Trust explicit HTTP status codes first so metric names (e.g. http_timeout_total,
+  //    auth_permission_checks_total) inside 400 parse errors are never misclassified.
+  if (status === 401 || status === 403) {
+    return 'permission_error';
+  }
+  if (status === 408 || status === 504) {
+    return 'timeout';
+  }
+  if (status === 400 || status === 422) {
+    if (isSyntaxMsg) {
+      return 'syntax_error';
+    }
+    if (
+      lower.includes('forbidden') ||
+      lower.includes('unauthorized') ||
+      lower.includes('access denied')
+    ) {
+      return 'permission_error';
+    }
+    if (lower.includes('deadline exceeded') || lower.includes('query timed out')) {
+      return 'timeout';
+    }
+    return 'syntax_error';
+  }
+  if (status !== undefined && status >= 500) {
+    if (lower.includes('timeout') || lower.includes('deadline exceeded')) {
+      return 'timeout';
+    }
+    return 'datasource_error';
+  }
+
+  // 2. Fallback heuristic when status is omitted or 200 with embedded error text.
+  if (
+    lower.includes('forbidden') ||
+    lower.includes('unauthorized') ||
+    lower.includes('access denied') ||
+    lower.includes('permission denied')
   ) {
+    return 'permission_error';
+  }
+  if (lower.includes('timeout') || lower.includes('deadline exceeded')) {
+    return 'timeout';
+  }
+  if (isSyntaxMsg) {
     return 'syntax_error';
   }
   return 'datasource_error';
 }
 
-function extractErrorInfo(
+function extractAndClassifyError(
   err: unknown,
   refIds: string[]
-): { status?: number; message: string } {
+): { category: ValidationCategory; message: string } {
   if (typeof err === 'object' && err !== null) {
     const e = err as {
       status?: number;
@@ -355,32 +383,42 @@ function extractErrorInfo(
         results?: Record<string, { status?: number; error?: string }>;
       };
     };
-    // Prioritize inner /api/ds/query results[refId] error and status across all targets (H-10).
+    // Classify each inner /api/ds/query results[refId] individually using the same
+    // severity precedence as the non-throwing response path (permission > timeout > datasource > syntax).
     const innerMessages: string[] = [];
-    let innerStatus: number | undefined;
+    let worstCategory: ValidationCategory = 'ok';
     for (const refId of refIds) {
       const inner = e.data?.results?.[refId];
       if (inner?.error) {
-        if (innerStatus === undefined && inner.status !== undefined) {
-          innerStatus = inner.status;
+        const errStr = String(inner.error);
+        const cat = classifyDatasourceError(inner.status ?? e.status, errStr);
+        if (CATEGORY_SEVERITY[cat] > CATEGORY_SEVERITY[worstCategory]) {
+          worstCategory = cat;
         }
         const prefix = refIds.length > 1 ? `[${refId}] ` : '';
-        innerMessages.push(`${prefix}${String(inner.error)}`);
+        innerMessages.push(`${prefix}${errStr}`);
       }
     }
     if (innerMessages.length > 0) {
       return {
-        status: innerStatus ?? e.status,
+        category: worstCategory,
         message: innerMessages.join('; '),
       };
     }
     const msg =
-      e.data?.message ||
-      e.data?.error ||
-      e.message ||
-      e.statusText ||
+      (typeof e.data?.message === 'string' && e.data.message) ||
+      (typeof e.data?.error === 'string' && e.data.error) ||
+      (typeof e.message === 'string' && e.message) ||
+      (typeof e.statusText === 'string' && e.statusText) ||
       'Datasource query failed';
-    return { status: e.status, message: String(msg) };
+    return {
+      category: classifyDatasourceError(e.status, msg),
+      message: msg,
+    };
   }
-  return { message: String(err) };
+  const msg = String(err);
+  return {
+    category: classifyDatasourceError(undefined, msg),
+    message: msg,
+  };
 }

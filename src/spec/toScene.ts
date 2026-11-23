@@ -72,15 +72,22 @@ export function buildPreviewScene(
   return new EmbeddedScene(sceneState);
 }
 
+type PieChartPieType = NonNullable<
+  ReturnType<ReturnType<typeof PanelBuilders.piechart>['build']>['state']['options']['pieType']
+>;
+
 function buildSceneVariable(v: NormalizedVariableSpec): SceneVariable {
+  const initialVal = v.multi ? (v.defaultValue ? [v.defaultValue] : []) : v.defaultValue;
+  const initialText = v.multi ? (v.defaultValue ? [v.defaultValue] : []) : v.defaultValue;
+
   if (v.type === 'query') {
     return new QueryVariable({
       name: v.name,
       label: v.label,
       datasource: v.datasource ?? null,
       query: v.query,
-      value: v.defaultValue,
-      text: v.defaultValue,
+      value: initialVal,
+      text: initialText,
       isMulti: v.multi,
       includeAll: v.includeAll,
       refresh: VariableRefresh.onDashboardLoad,
@@ -94,8 +101,8 @@ function buildSceneVariable(v: NormalizedVariableSpec): SceneVariable {
     name: v.name,
     label: v.label,
     query: v.query,
-    value: v.defaultValue,
-    text: v.defaultValue,
+    value: initialVal,
+    text: initialText,
     isMulti: v.multi,
     includeAll: v.includeAll,
     hide: VariableHide.dontHide,
@@ -207,7 +214,7 @@ function buildGridItem(panel: NormalizedPanelSpec, maxDataPoints: number): Scene
         .setData(queryRunner)
         .setUnit(panel.unit)
         .setThresholds(thresholdsConfig)
-        .setOption('pieType', 'pie' as never)
+        .setOption('pieType', 'pie' as PieChartPieType)
         .setOption('reduceOptions', {
           calcs: ['lastNotNull'],
           values: false,

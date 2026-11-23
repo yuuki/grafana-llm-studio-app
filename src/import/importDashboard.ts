@@ -1,5 +1,4 @@
-import { getBackendSrv } from '@grafana/runtime';
-import { lastValueFrom } from 'rxjs';
+import { BackendSrvRequest, getBackendSrv } from '@grafana/runtime';
 import {
   ALLOWED_PANEL_TYPES,
   ALLOWED_QUERY_REF_IDS,
@@ -11,6 +10,7 @@ import {
   DashboardIR,
   ImportSource,
   IR_SCHEMA_VERSION,
+  isReservedVariableName,
   MAX_QUERIES_PER_PANEL,
   MAX_VARIABLE_OPTIONS,
   MAX_VARIABLES,
@@ -20,6 +20,7 @@ import {
   SELECTED_DATASOURCE_REF,
   ThresholdColor,
   ThresholdIR,
+  validateVariableValueClient,
   VariableIR,
 } from '../ir/types';
 import { getOrgNamespace } from '../save/saveDashboard';
@@ -34,6 +35,8 @@ export interface ExistingDashboardSummary {
 export interface FetchedExistingDashboard {
   rawDashboard: Record<string, unknown>;
   source: ImportSource;
+  preservedAnnotations?: Record<string, string>;
+  preservedLabels?: Record<string, string>;
 }
 
 export interface SkippedImportItem {
@@ -65,7 +68,8 @@ interface RawDashboardV1Beta1 {
   metadata?: {
     name?: string;
     resourceVersion?: string;
-    annotations?: Record<string, string>;
+    annotations?: Record<string, unknown>;
+    labels?: Record<string, unknown>;
   };
   spec?: Record<string, unknown>;
 }
@@ -80,43 +84,122 @@ interface RawLegacyDashboardEnvelope {
 const VALID_VAR_NAME = /^[a-zA-Z_][a-zA-Z0-9_]{0,31}$/;
 const VALID_LABEL_NAME = /^[a-zA-Z_][a-zA-Z0-9_]{0,63}$/;
 const VALID_METRIC_NAME = /^[a-zA-Z_:][a-zA-Z0-9_:]{0,127}$/;
-const LABEL_VALUES_WITH_METRIC = /^label_values\(\s*([a-zA-Z_:][a-zA-Z0-9_:]*)(?:\{[^}]*\})?\s*,\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*\)$/;
+// Explicitly reject filtered label_values(metric{...}, label) so import never silently widens variable scope.
+const LABEL_VALUES_WITH_METRIC =
+  /^label_values\(\s*([a-zA-Z_:][a-zA-Z0-9_:]*)\s*,\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*\)$/;
 const LABEL_VALUES_ONLY = /^label_values\(\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*\)$/;
-
-const RESERVED_VAR_NAMES = new Set([
-  '__name__',
-  '__from',
-  '__to',
-  '__interval',
-  '__interval_ms',
-  '__rate_interval',
-  '__range',
-  '__range_s',
-  '__range_ms',
-  '__dashboard',
-  '__org',
-  '__user',
-  'timeFilter',
-]);
+const LEGEND_VAR_TOKEN_REGEX = /(?:\$(?:\{|[a-zA-Z_])|\[\[[a-zA-Z_])/;
+const EXPR_VAR_REF_REGEX =
+  /\$\{([a-zA-Z_][a-zA-Z0-9_]*)(?::[^}]*)?\}|\$([a-zA-Z_][a-zA-Z0-9_]*)|\[\[([a-zA-Z_][a-zA-Z0-9_]*)(?::[^\]]*)?\]\]/g;
+const FORBIDDEN_EXPR_MARKUP =
+  /(?:<script|<\/script|<iframe|<svg|<img|<object|<embed|javascript:|vbscript:|data:text\/html|\bon[a-z]+\s*=)/i;
 
 const ALLOWED_PANEL_TYPE_SET = new Set<string>(ALLOWED_PANEL_TYPES);
 const ALLOWED_UNIT_SET = new Set<string>(ALLOWED_UNITS);
 const ALLOWED_COLOR_SET = new Set<string>(ALLOWED_THRESHOLD_COLORS);
 const ALLOWED_TIME_FROM_SET = new Set<string>(ALLOWED_TIME_FROM);
+const ALLOWED_PROM_DS_TYPES = new Set<string>([
+  'prometheus',
+  'victoriametrics-metrics-datasource',
+  'victoriametrics-datasource',
+]);
+
+function fetchWithOptionalAbort<T>(req: BackendSrvRequest, signal?: AbortSignal): Promise<{ data: T }> {
+  return new Promise<{ data: T }>((resolve, reject) => {
+    if (signal?.aborted) {
+      reject(new DOMException('Request aborted', 'AbortError'));
+      return;
+    }
+    let settled = false;
+    let sub: { unsubscribe: () => void } | undefined;
+    const cleanup = () => {
+      signal?.removeEventListener('abort', onAbort);
+    };
+    const onAbort = () => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      sub?.unsubscribe();
+      cleanup();
+      reject(new DOMException('Request aborted', 'AbortError'));
+    };
+    signal?.addEventListener('abort', onAbort, { once: true });
+
+    sub = getBackendSrv()
+      .fetch<T>(req)
+      .subscribe({
+        next: (res) => {
+          if (settled) {
+            return;
+          }
+          settled = true;
+          cleanup();
+          resolve(res);
+        },
+        error: (err) => {
+          if (settled) {
+            return;
+          }
+          settled = true;
+          cleanup();
+          reject(err);
+        },
+        complete: () => {
+          if (!settled) {
+            settled = true;
+            cleanup();
+            reject(new Error('Empty response from Grafana API'));
+          }
+        },
+      });
+  });
+}
+
+function extractStringRecord(
+  input: unknown,
+  excludeKeys?: Set<string>
+): Record<string, string> | undefined {
+  if (!input || typeof input !== 'object' || Array.isArray(input)) {
+    return undefined;
+  }
+  const out: Record<string, string> = {};
+  let count = 0;
+  for (const [k, v] of Object.entries(input as Record<string, unknown>)) {
+    if (excludeKeys?.has(k)) {
+      continue;
+    }
+    if (typeof v === 'string') {
+      out[k] = v;
+      count++;
+    }
+  }
+  return count > 0 ? out : undefined;
+}
+
+function sanitizeVersion(raw: unknown): number | undefined {
+  if (typeof raw === 'number' && Number.isInteger(raw) && raw >= 0 && raw <= 1000000) {
+    return raw;
+  }
+  return undefined;
+}
 
 /**
  * Lists existing Grafana dashboards visible to the logged-in user via /api/search.
  */
-export async function listExistingDashboards(limit = 50): Promise<ExistingDashboardSummary[]> {
-  const res = await lastValueFrom(
-    getBackendSrv().fetch<
-      Array<{
-        uid?: string;
-        title?: string;
-        folderUid?: string;
-        folderTitle?: string;
-      }>
-    >({
+export async function listExistingDashboards(
+  limit = 50,
+  signal?: AbortSignal
+): Promise<ExistingDashboardSummary[]> {
+  const res = await fetchWithOptionalAbort<
+    Array<{
+      uid?: string;
+      title?: string;
+      folderUid?: string;
+      folderTitle?: string;
+    }>
+  >(
+    {
       url: '/api/search',
       method: 'GET',
       params: {
@@ -124,7 +207,8 @@ export async function listExistingDashboards(limit = 50): Promise<ExistingDashbo
         limit: Math.max(1, Math.min(limit, 100)),
       },
       showErrorAlert: false,
-    })
+    },
+    signal
   );
   if (!Array.isArray(res.data)) {
     return [];
@@ -141,11 +225,15 @@ export async function listExistingDashboards(limit = 50): Promise<ExistingDashbo
 
 /**
  * Fetches an existing Grafana dashboard by UID using the logged-in user's session.
- * Prefers Grafana's Kubernetes-style v1beta1 API so `metadata.resourceVersion` is captured
- * for optional opt-in optimistic-concurrency updates; falls back to `/api/dashboards/uid/{uid}`
- * (without resourceVersion, restricting save mode to create-as-copy).
+ * Prefers Grafana's Kubernetes-style v1beta1 API so `metadata.resourceVersion`, labels, and
+ * non-folder annotations are captured for optional opt-in optimistic-concurrency updates;
+ * falls back to `/api/dashboards/uid/{uid}` ONLY on HTTP 404/410/501 (without resourceVersion,
+ * restricting save mode to create-as-copy).
  */
-export async function fetchExistingDashboardByUid(uid: string): Promise<FetchedExistingDashboard> {
+export async function fetchExistingDashboardByUid(
+  uid: string,
+  signal?: AbortSignal
+): Promise<FetchedExistingDashboard> {
   const cleanUid = uid.trim();
   if (!cleanUid) {
     throw new Error('Dashboard UID is required');
@@ -153,53 +241,82 @@ export async function fetchExistingDashboardByUid(uid: string): Promise<FetchedE
 
   const namespace = getOrgNamespace();
   try {
-    const res = await lastValueFrom(
-      getBackendSrv().fetch<RawDashboardV1Beta1>({
+    const res = await fetchWithOptionalAbort<RawDashboardV1Beta1>(
+      {
         url: `/apis/dashboard.grafana.app/v1beta1/namespaces/${encodeURIComponent(namespace)}/dashboards/${encodeURIComponent(cleanUid)}`,
         method: 'GET',
         showErrorAlert: false,
-      })
+      },
+      signal
     );
     const spec = res.data?.spec;
-    if (spec && typeof spec === 'object') {
+    if (spec && typeof spec === 'object' && !Array.isArray(spec)) {
+      const rawAnnotations = res.data?.metadata?.annotations;
+      const folderAnn =
+        rawAnnotations && typeof rawAnnotations['grafana.app/folder'] === 'string'
+          ? sanitizePlainText(rawAnnotations['grafana.app/folder'], 64)
+          : '';
+      const rawName =
+        typeof res.data?.metadata?.name === 'string' && res.data.metadata.name.trim()
+          ? res.data.metadata.name.trim()
+          : cleanUid;
+      const rawRV =
+        typeof res.data?.metadata?.resourceVersion === 'string' &&
+        res.data.metadata.resourceVersion.trim()
+          ? res.data.metadata.resourceVersion.trim()
+          : undefined;
       return {
         rawDashboard: spec,
         source: {
-          uid: res.data?.metadata?.name || cleanUid,
-          resourceVersion: res.data?.metadata?.resourceVersion || undefined,
-          folderUid: res.data?.metadata?.annotations?.['grafana.app/folder'] || '',
+          uid: rawName,
+          resourceVersion: rawRV,
+          folderUid: folderAnn,
           title: typeof spec.title === 'string' ? sanitizePlainText(spec.title, 120) : undefined,
-          version: typeof spec.version === 'number' ? spec.version : undefined,
+          version: sanitizeVersion(spec.version),
         },
+        preservedAnnotations: extractStringRecord(
+          rawAnnotations,
+          new Set(['grafana.app/folder'])
+        ),
+        preservedLabels: extractStringRecord(res.data?.metadata?.labels),
       };
     }
+    throw new Error(`Dashboard ${cleanUid} returned invalid spec`);
   } catch (err: unknown) {
+    if (signal?.aborted) {
+      throw err;
+    }
     const status = (err as { status?: number })?.status;
-    if (status === 401 || status === 403) {
+    if (status !== 404 && status !== 410 && status !== 501) {
       throw err;
     }
   }
 
-  const legacy = await lastValueFrom(
-    getBackendSrv().fetch<RawLegacyDashboardEnvelope>({
+  const legacy = await fetchWithOptionalAbort<RawLegacyDashboardEnvelope>(
+    {
       url: `/api/dashboards/uid/${encodeURIComponent(cleanUid)}`,
       method: 'GET',
       showErrorAlert: false,
-    })
+    },
+    signal
   );
   const rawDash = legacy.data?.dashboard;
-  if (!rawDash || typeof rawDash !== 'object') {
+  if (!rawDash || typeof rawDash !== 'object' || Array.isArray(rawDash)) {
     throw new Error(`Dashboard ${cleanUid} returned no spec`);
   }
+  const legacyFolderUid =
+    typeof legacy.data?.meta?.folderUid === 'string'
+      ? sanitizePlainText(legacy.data.meta.folderUid, 64)
+      : '';
   return {
     rawDashboard: rawDash,
     source: {
-      uid: typeof rawDash.uid === 'string' && rawDash.uid ? rawDash.uid : cleanUid,
+      uid: typeof rawDash.uid === 'string' && rawDash.uid.trim() ? rawDash.uid.trim() : cleanUid,
       // Legacy /api/dashboards/uid does not provide Kubernetes resourceVersion;
       // leave empty so opt-in revision-checked PUT is safely unavailable.
-      folderUid: legacy.data?.meta?.folderUid || '',
+      folderUid: legacyFolderUid,
       title: typeof rawDash.title === 'string' ? sanitizePlainText(rawDash.title, 120) : undefined,
-      version: typeof rawDash.version === 'number' ? rawDash.version : undefined,
+      version: sanitizeVersion(rawDash.version),
     },
   };
 }
@@ -207,8 +324,8 @@ export async function fetchExistingDashboardByUid(uid: string): Promise<FetchedE
 /**
  * Deterministically converts an untrusted Grafana Dashboard JSON object into a
  * constrained Dashboard IR v1.1 draft + explicit conversion report.
- * - Strips HTML/JS/control/Bidi chars from all text fields.
- * - Filters to allowlisted visualization types and selected Prometheus datasource targets only.
+ * - Strips HTML/JS/control/Bidi chars from all text fields via fixed-point sanitization.
+ * - Filters to allowlisted visualization types and selected Prometheus datasource targets only (fail-closed).
  * - Rebinds datasource references strictly to `selected_prometheus`.
  * - Caps panels (<= maxPanels), queries per panel (<= 3), thresholds (<= 4), and variables (<= 4).
  * - Packs gridPos cleanly onto the non-overlapping 2-column IR grid.
@@ -217,7 +334,7 @@ export function convertGrafanaDashboardToIR(
   rawInput: unknown,
   options: ImportConversionOptions
 ): ImportConversionResult {
-  if (!rawInput || typeof rawInput !== 'object') {
+  if (!rawInput || typeof rawInput !== 'object' || Array.isArray(rawInput)) {
     throw new Error('Dashboard JSON must be an object');
   }
   const raw = rawInput as Record<string, unknown>;
@@ -226,15 +343,19 @@ export function convertGrafanaDashboardToIR(
   const skippedPanels: SkippedImportItem[] = [];
   const skippedVariables: SkippedImportItem[] = [];
 
-  const title = sanitizePlainText(typeof raw.title === 'string' ? raw.title : '', 120) || 'Imported Dashboard';
-  const description = sanitizePlainText(typeof raw.description === 'string' ? raw.description : '', 400);
+  const title =
+    sanitizePlainText(typeof raw.title === 'string' ? raw.title : '', 120) || 'Imported Dashboard';
+  const description = sanitizePlainText(
+    typeof raw.description === 'string' ? raw.description : '',
+    400
+  );
 
   const rawTime = raw.time as { from?: unknown; to?: unknown } | undefined;
   let timeFrom: AllowedTimeFrom = 'now-15m';
   if (typeof rawTime?.from === 'string' && ALLOWED_TIME_FROM_SET.has(rawTime.from)) {
     timeFrom = rawTime.from as AllowedTimeFrom;
   } else if (typeof rawTime?.from === 'string' && rawTime.from !== '') {
-    warnings.push(`Unsupported time.from "${rawTime.from}" normalized to "now-15m"`);
+    warnings.push(`Unsupported time.from "${sanitizePlainText(rawTime.from, 40)}" normalized to "now-15m"`);
   }
 
   // 1. Safely import up to 4 scoped template variables.
@@ -244,7 +365,7 @@ export function convertGrafanaDashboardToIR(
   const seenVarNames = new Set<string>();
 
   for (const item of rawVarList) {
-    if (!item || typeof item !== 'object') {
+    if (!item || typeof item !== 'object' || Array.isArray(item)) {
       continue;
     }
     const v = item as Record<string, unknown>;
@@ -259,7 +380,11 @@ export function convertGrafanaDashboardToIR(
       });
       continue;
     }
-    if (!VALID_VAR_NAME.test(rawName) || RESERVED_VAR_NAMES.has(rawName) || seenVarNames.has(rawName)) {
+    if (
+      !VALID_VAR_NAME.test(rawName) ||
+      isReservedVariableName(rawName) ||
+      seenVarNames.has(rawName)
+    ) {
       skippedVariables.push({
         title: rawName || '(unnamed)',
         type: rawType,
@@ -287,7 +412,22 @@ export function convertGrafanaDashboardToIR(
         skippedVariables.push({
           title: rawName,
           type: rawType,
-          reason: 'only Prometheus label_values(...) query variables are supported in IR v1.1',
+          reason:
+            'only unfiltered Prometheus label_values(metric, label) or label_values(label) query variables are supported in IR v1.1',
+        });
+        continue;
+      }
+      const candidateDefault = currentVal || extractFirstConcreteOption(v.options);
+      const safeDefault = sanitizePlainText(candidateDefault, 128);
+      if (
+        !safeDefault ||
+        validateVariableValueClient(`variables.${rawName}.defaultValue`, safeDefault, 1, 128, false) !==
+          null
+      ) {
+        skippedVariables.push({
+          title: rawName,
+          type: rawType,
+          reason: 'query variable has no concrete safe defaultValue required by IR v1.1',
         });
         continue;
       }
@@ -296,9 +436,9 @@ export function convertGrafanaDashboardToIR(
         type: 'query',
         datasourceRef: SELECTED_DATASOURCE_REF,
         labelName: parsed.labelName,
+        defaultValue: safeDefault,
         ...(label ? { label } : {}),
         ...(parsed.metricName ? { metricName: parsed.metricName } : {}),
-        ...(currentVal ? { defaultValue: sanitizePlainText(currentVal, 128) } : {}),
         ...(multi ? { multi: true } : {}),
         ...(includeAll ? { includeAll: true } : {}),
       };
@@ -310,16 +450,19 @@ export function convertGrafanaDashboardToIR(
         skippedVariables.push({
           title: rawName,
           type: rawType,
-          reason: 'no valid custom options found',
+          reason: 'no valid safe custom options found',
         });
         continue;
       }
       const boundedOpts = opts.slice(0, MAX_VARIABLE_OPTIONS);
       if (opts.length > MAX_VARIABLE_OPTIONS) {
-        warnings.push(`Variable $${rawName}: truncated custom options from ${opts.length} to ${MAX_VARIABLE_OPTIONS}`);
+        warnings.push(
+          `Variable $${rawName}: truncated custom options from ${opts.length} to ${MAX_VARIABLE_OPTIONS}`
+        );
       }
+      const cleanCurrent = sanitizePlainText(currentVal, 64);
       const defVal =
-        currentVal && boundedOpts.includes(currentVal) ? currentVal : boundedOpts[0];
+        cleanCurrent && boundedOpts.includes(cleanCurrent) ? cleanCurrent : boundedOpts[0];
       const varIR: VariableIR = {
         name: rawName,
         type: 'custom',
@@ -335,7 +478,7 @@ export function convertGrafanaDashboardToIR(
       skippedVariables.push({
         title: rawName,
         type: rawType,
-        reason: `variable type "${rawType}" is not supported in IR v1.1`,
+        reason: `variable type "${sanitizePlainText(rawType, 40)}" is not supported in IR v1.1`,
       });
     }
   }
@@ -369,7 +512,7 @@ export function convertGrafanaDashboardToIR(
       skippedPanels.push({
         title: safeTitle,
         type: pType,
-        reason: `panel type "${pType}" is not supported in IR v1.1`,
+        reason: `panel type "${sanitizePlainText(pType, 40)}" is not supported in IR v1.1`,
       });
       continue;
     }
@@ -382,47 +525,59 @@ export function convertGrafanaDashboardToIR(
       continue;
     }
 
-    const panelDsCompatible = isDatasourceCompatible(rp.datasource, options);
     const rawTargets = Array.isArray(rp.targets) ? rp.targets : [];
     const importedQueries: QueryIR[] = [];
     let skippedTargetsCount = 0;
+    let skippedUndeclaredVarCount = 0;
 
     for (const rt of rawTargets) {
-      if (!rt || typeof rt !== 'object') {
+      if (!rt || typeof rt !== 'object' || Array.isArray(rt)) {
         continue;
       }
       const target = rt as Record<string, unknown>;
       if (target.hide === true) {
         continue;
       }
-      const targetDs = target.datasource !== undefined ? target.datasource : rp.datasource;
-      if (!panelDsCompatible && target.datasource === undefined) {
-        skippedTargetsCount++;
-        continue;
-      }
+      const hasTargetDs =
+        target.datasource !== undefined && target.datasource !== null && target.datasource !== '';
+      const targetDs = hasTargetDs ? target.datasource : rp.datasource;
       if (!isDatasourceCompatible(targetDs, options)) {
         skippedTargetsCount++;
         continue;
       }
-      const rawExpr = typeof target.expr === 'string' ? target.expr.trim() : '';
-      if (!rawExpr) {
+      if (typeof target.expr !== 'string' || target.expr.trim() === '') {
         continue;
       }
-      if (rawExpr.length > 512) {
-        warnings.push(`Panel "${safeTitle}": skipped query exceeding 512 chars`);
+      const cleanExpr = sanitizeExprText(target.expr, 512);
+      if (!cleanExpr) {
+        warnings.push(`Panel "${safeTitle}": skipped query exceeding 512 chars or containing forbidden chars/markup`);
+        continue;
+      }
+      const undeclaredVar = findUndeclaredOrLegacyVarRef(cleanExpr, seenVarNames);
+      if (undeclaredVar) {
+        skippedUndeclaredVarCount++;
+        warnings.push(
+          `Panel "${safeTitle}": skipped query referencing undeclared/unsupported variable "${undeclaredVar}"`
+        );
         continue;
       }
       if (importedQueries.length >= MAX_QUERIES_PER_PANEL) {
         warnings.push(`Panel "${safeTitle}": truncated to max ${MAX_QUERIES_PER_PANEL} queries`);
         break;
       }
-      const legend = sanitizePlainText(
+      let legend = sanitizePlainText(
         typeof target.legendFormat === 'string' ? target.legendFormat : '',
         80
       );
+      if (legend && LEGEND_VAR_TOKEN_REGEX.test(legend)) {
+        warnings.push(
+          `Panel "${safeTitle}": omitted legendFormat containing template variable token`
+        );
+        legend = '';
+      }
       importedQueries.push({
         refId: ALLOWED_QUERY_REF_IDS[importedQueries.length],
-        expr: rawExpr,
+        expr: cleanExpr,
         ...(legend ? { legendFormat: legend } : {}),
       });
     }
@@ -433,10 +588,14 @@ export function convertGrafanaDashboardToIR(
       );
     }
     if (importedQueries.length === 0) {
+      const reason =
+        skippedUndeclaredVarCount > 0
+          ? 'queries referenced undeclared or unsupported template variables'
+          : 'no compatible Prometheus PromQL queries found for selected datasource';
       skippedPanels.push({
         title: safeTitle,
         type: pType,
-        reason: 'no compatible Prometheus PromQL queries found for selected datasource',
+        reason,
       });
       continue;
     }
@@ -448,11 +607,16 @@ export function convertGrafanaDashboardToIR(
     if (rawUnit && ALLOWED_UNIT_SET.has(rawUnit)) {
       unit = rawUnit as AllowedUnit;
     } else if (rawUnit) {
-      warnings.push(`Panel "${safeTitle}": unsupported unit "${rawUnit}" mapped to "short"`);
+      warnings.push(
+        `Panel "${safeTitle}": unsupported unit "${sanitizePlainText(rawUnit, 40)}" mapped to "short"`
+      );
     }
 
     const thresholds = convertThresholds(fieldDefaults.thresholds);
-    const panelDesc = sanitizePlainText(typeof rp.description === 'string' ? rp.description : '', 240);
+    const panelDesc = sanitizePlainText(
+      typeof rp.description === 'string' ? rp.description : '',
+      240
+    );
     const panelId = makeUniquePanelId(safeTitle, panels.length + 1, usedPanelIds);
     const gridPos = rp.gridPos as { w?: number } | undefined;
     const widthHint: 'half' | 'full' = (Number(gridPos?.w) || 12) > 12 ? 'full' : 'half';
@@ -465,7 +629,14 @@ export function convertGrafanaDashboardToIR(
       ...(panelDesc ? { description: panelDesc } : {}),
       datasourceRef: SELECTED_DATASOURCE_REF,
       ...(importedQueries.length === 1
-        ? { query: { expr: importedQueries[0].expr, ...(importedQueries[0].legendFormat ? { legendFormat: importedQueries[0].legendFormat } : {}) } }
+        ? {
+            query: {
+              expr: importedQueries[0].expr,
+              ...(importedQueries[0].legendFormat
+                ? { legendFormat: importedQueries[0].legendFormat }
+                : {}),
+            },
+          }
         : { queries: importedQueries }),
       unit,
       ...(thresholds.length > 0 ? { thresholds } : {}),
@@ -511,13 +682,13 @@ export function convertGrafanaDashboardToIR(
 function flattenRawPanels(rawPanels: unknown[]): Array<Record<string, unknown>> {
   const out: Array<Record<string, unknown>> = [];
   for (const item of rawPanels) {
-    if (!item || typeof item !== 'object') {
+    if (!item || typeof item !== 'object' || Array.isArray(item)) {
       continue;
     }
     const p = item as Record<string, unknown>;
     if (p.type === 'row' && Array.isArray(p.panels)) {
       for (const child of p.panels) {
-        if (child && typeof child === 'object') {
+        if (child && typeof child === 'object' && !Array.isArray(child)) {
           out.push(child as Record<string, unknown>);
         }
       }
@@ -528,33 +699,39 @@ function flattenRawPanels(rawPanels: unknown[]): Array<Record<string, unknown>> 
   return out;
 }
 
+/**
+ * Fail-closed datasource compatibility check:
+ * Requires an explicit reference matching the user-selected Prometheus/VictoriaMetrics datasource.
+ * Never permits null/empty/{} or "-- Grafana --" to smuggle foreign targets.
+ */
 function isDatasourceCompatible(
   ds: unknown,
   options: ImportConversionOptions
 ): boolean {
   if (ds === undefined || ds === null || ds === '') {
-    return true;
+    return false;
   }
   if (typeof ds === 'string') {
     const trimmed = ds.trim();
+    if (!trimmed || trimmed === '-- Grafana --' || trimmed === '-- Mixed --') {
+      return false;
+    }
     return (
-      trimmed === '' ||
-      trimmed === '-- Grafana --' ||
       trimmed === options.selectedDatasourceUid ||
       (Boolean(options.selectedDatasourceName) && trimmed === options.selectedDatasourceName)
     );
   }
-  if (typeof ds === 'object') {
+  if (typeof ds === 'object' && !Array.isArray(ds)) {
     const obj = ds as { uid?: unknown; type?: unknown };
     const uid = typeof obj.uid === 'string' ? obj.uid.trim() : '';
     const type = typeof obj.type === 'string' ? obj.type.trim().toLowerCase() : '';
-    if (type && type !== 'prometheus' && !type.includes('victoriametrics')) {
+    if (!uid || uid !== options.selectedDatasourceUid) {
       return false;
     }
-    if (!uid) {
-      return true;
+    if (type && !ALLOWED_PROM_DS_TYPES.has(type)) {
+      return false;
     }
-    return uid === options.selectedDatasourceUid;
+    return true;
   }
   return false;
 }
@@ -565,7 +742,7 @@ function parseLabelValuesQuery(
   let queryStr = '';
   if (typeof rawQuery === 'string') {
     queryStr = rawQuery.trim();
-  } else if (rawQuery && typeof rawQuery === 'object') {
+  } else if (rawQuery && typeof rawQuery === 'object' && !Array.isArray(rawQuery)) {
     const qObj = rawQuery as { query?: unknown };
     if (typeof qObj.query === 'string') {
       queryStr = qObj.query.trim();
@@ -598,15 +775,41 @@ function parseLabelValuesQuery(
 }
 
 function extractVariableCurrentValue(rawCurrent: unknown): string {
-  if (!rawCurrent || typeof rawCurrent !== 'object') {
+  if (!rawCurrent || typeof rawCurrent !== 'object' || Array.isArray(rawCurrent)) {
     return '';
   }
   const val = (rawCurrent as { value?: unknown }).value;
   if (typeof val === 'string') {
-    return val.trim();
+    const trimmed = val.trim();
+    return trimmed && trimmed !== '$__all' ? trimmed : '';
   }
-  if (Array.isArray(val) && typeof val[0] === 'string') {
-    return val[0].trim();
+  if (Array.isArray(val)) {
+    for (const entry of val) {
+      if (typeof entry === 'string') {
+        const trimmed = entry.trim();
+        if (trimmed && trimmed !== '$__all') {
+          return trimmed;
+        }
+      }
+    }
+  }
+  return '';
+}
+
+function extractFirstConcreteOption(rawOptions: unknown): string {
+  if (!Array.isArray(rawOptions)) {
+    return '';
+  }
+  for (const o of rawOptions) {
+    if (o && typeof o === 'object' && !Array.isArray(o)) {
+      const val = (o as { value?: unknown }).value;
+      if (typeof val === 'string') {
+        const trimmed = val.trim();
+        if (trimmed && trimmed !== '$__all') {
+          return trimmed;
+        }
+      }
+    }
   }
   return '';
 }
@@ -616,7 +819,12 @@ function extractCustomVariableOptions(rawVar: Record<string, unknown>): string[]
   const out: string[] = [];
   const pushOpt = (raw: string) => {
     const clean = sanitizePlainText(raw, 64);
-    if (clean && !seen.has(clean)) {
+    if (
+      clean &&
+      clean !== '$__all' &&
+      !seen.has(clean) &&
+      validateVariableValueClient('option', clean, 1, 64, true) === null
+    ) {
       seen.add(clean);
       out.push(clean);
     }
@@ -624,9 +832,9 @@ function extractCustomVariableOptions(rawVar: Record<string, unknown>): string[]
 
   if (Array.isArray(rawVar.options)) {
     for (const o of rawVar.options) {
-      if (o && typeof o === 'object') {
+      if (o && typeof o === 'object' && !Array.isArray(o)) {
         const val = (o as { value?: unknown }).value;
-        if (typeof val === 'string' && val !== '$__all') {
+        if (typeof val === 'string' && val.trim() !== '$__all') {
           pushOpt(val);
         }
       }
@@ -641,7 +849,7 @@ function extractCustomVariableOptions(rawVar: Record<string, unknown>): string[]
 }
 
 function convertThresholds(rawThresholds: unknown): ThresholdIR[] {
-  if (!rawThresholds || typeof rawThresholds !== 'object') {
+  if (!rawThresholds || typeof rawThresholds !== 'object' || Array.isArray(rawThresholds)) {
     return [];
   }
   const steps = (rawThresholds as { steps?: unknown }).steps;
@@ -650,11 +858,17 @@ function convertThresholds(rawThresholds: unknown): ThresholdIR[] {
   }
   const converted: ThresholdIR[] = [];
   for (const s of steps) {
-    if (!s || typeof s !== 'object') {
+    if (!s || typeof s !== 'object' || Array.isArray(s)) {
       continue;
     }
     const step = s as { value?: unknown; color?: unknown };
-    if (step.value === null || step.value === undefined) {
+    if (
+      step.value === null ||
+      step.value === undefined ||
+      typeof step.value === 'boolean' ||
+      (typeof step.value === 'string' && step.value.trim() === '') ||
+      (typeof step.value !== 'number' && typeof step.value !== 'string')
+    ) {
       continue;
     }
     const num = Number(step.value);
@@ -730,13 +944,65 @@ function makeUniquePanelId(title: string, index: number, used: Set<string>): str
   return fallback;
 }
 
+function sanitizeExprText(input: string, maxRunes: number): string | null {
+  // Collapse valid PromQL multi-line indentation/newlines to single spaces before validating.
+  const collapsed = input.replace(/[\r\n\t]+/g, ' ').trim();
+  if (!collapsed || Array.from(collapsed).length > maxRunes) {
+    return null;
+  }
+  for (let i = 0; i < collapsed.length; i++) {
+    const code = collapsed.charCodeAt(i);
+    if (
+      code < 0x20 ||
+      (code >= 0x7f && code <= 0x9f) ||
+      code === 0x200e ||
+      code === 0x200f ||
+      (code >= 0x202a && code <= 0x202e) ||
+      (code >= 0x2066 && code <= 0x2069)
+    ) {
+      return null;
+    }
+  }
+  if (FORBIDDEN_EXPR_MARKUP.test(collapsed)) {
+    return null;
+  }
+  return collapsed;
+}
+
+function findUndeclaredOrLegacyVarRef(expr: string, declaredVars: Set<string>): string | null {
+  EXPR_VAR_REF_REGEX.lastIndex = 0;
+  let m: RegExpExecArray | null;
+  while ((m = EXPR_VAR_REF_REGEX.exec(expr)) !== null) {
+    if (m[3]) {
+      // Legacy [[var]] syntax is rejected by backend policy.
+      return `[[${m[3]}]]`;
+    }
+    const name = m[1] ?? m[2] ?? '';
+    if (name && !declaredVars.has(name)) {
+      return `$${name}`;
+    }
+  }
+  return null;
+}
+
 function sanitizePlainText(input: string, maxRunes: number): string {
-  const stripped = input
-    .replace(/<[^>]*>/g, '')
-    .replace(/\bon[a-z]+\s*=/gi, '')
-    .replace(/javascript:|vbscript:|data:text\/html/gi, '')
-    .replace(/[\u0000-\u001F\u007F-\u009F\u200E\u200F\u202A-\u202E\u2066-\u2069]/g, ' ')
-    .replace(/\s+/g, ' ')
-    .trim();
-  return Array.from(stripped).slice(0, maxRunes).join('').trim();
+  let cur = input.replace(
+    /[\u0000-\u001F\u007F-\u009F\u200E\u200F\u202A-\u202E\u2066-\u2069]/g,
+    ' '
+  );
+  // Fixed-point loop with space substitution defeats nested/split bypasses like
+  // `<scr<script>ipt>ononclick=` without gluing adjacent tokens across removed tags.
+  for (let pass = 0; pass < 5; pass++) {
+    const next = cur
+      .replace(/<[^>]*>/g, ' ')
+      .replace(/[<>]/g, ' ')
+      .replace(/\bon[a-z]+\s*=/gi, ' ')
+      .replace(/javascript:|vbscript:|data:text\/html/gi, ' ');
+    if (next === cur) {
+      break;
+    }
+    cur = next;
+  }
+  const normalized = cur.replace(/\s+/g, ' ').trim();
+  return Array.from(normalized).slice(0, maxRunes).join('').trim();
 }

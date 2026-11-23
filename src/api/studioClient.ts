@@ -48,14 +48,20 @@ export function extractApiError(err: unknown): string {
   }
   if (typeof err === 'object' && err !== null) {
     const e = err as {
-      data?: { error?: string; message?: string };
-      message?: string;
-      statusText?: string;
+      data?: { error?: unknown; message?: unknown };
+      message?: unknown;
+      statusText?: unknown;
       status?: number;
     };
-    const msg = e.data?.error || e.data?.message || e.message || e.statusText;
+    const candidates = [e.data?.error, e.data?.message, e.message, e.statusText];
+    const msg = candidates.find(
+      (c): c is string => typeof c === 'string' && c.trim().length > 0
+    );
     if (msg) {
-      return e.status ? `HTTP ${e.status}: ${msg}` : String(msg);
+      return e.status ? `HTTP ${e.status}: ${msg}` : msg;
+    }
+    if (typeof e.status === 'number') {
+      return `HTTP ${e.status}`;
     }
   }
   return String(err);

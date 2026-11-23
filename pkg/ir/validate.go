@@ -14,12 +14,13 @@ import (
 )
 
 var (
-	panelIDPattern   = regexp.MustCompile(`^panel-[a-z0-9][a-z0-9-]{0,31}$`)
-	varNamePattern   = regexp.MustCompile(`^[a-zA-Z_][a-zA-Z0-9_]{0,31}$`)
-	labelNamePattern = regexp.MustCompile(`^[a-zA-Z_][a-zA-Z0-9_]{0,63}$`)
-	metricPattern    = regexp.MustCompile(`^[a-zA-Z_:][a-zA-Z0-9_:]{0,127}$`)
-	htmlTagPattern   = regexp.MustCompile(`<[^>]*>`)
-	eventAttrPattern = regexp.MustCompile(`(?i)\bon[a-z]+\s*=`)
+	panelIDPattern        = regexp.MustCompile(`^panel-[a-z0-9][a-z0-9-]{0,31}$`)
+	varNamePattern        = regexp.MustCompile(`^[a-zA-Z_][a-zA-Z0-9_]{0,31}$`)
+	labelNamePattern      = regexp.MustCompile(`^[a-zA-Z_][a-zA-Z0-9_]{0,63}$`)
+	metricPattern         = regexp.MustCompile(`^[a-zA-Z_:][a-zA-Z0-9_:]{0,127}$`)
+	htmlTagPattern        = regexp.MustCompile(`<[^>]*>`)
+	eventAttrPattern      = regexp.MustCompile(`(?i)\bon[a-z]+\s*=`)
+	legendVarTokenPattern = regexp.MustCompile(`(?:\$(?:\{|[a-zA-Z_])|\[\[[a-zA-Z_])`)
 
 	allowedSchemaVersions = map[string]bool{
 		"1.0": true,
@@ -94,19 +95,9 @@ var (
 	}
 
 	reservedVariableNames = map[string]bool{
-		"__name__":        true,
-		"__from":          true,
-		"__to":            true,
-		"__interval":      true,
-		"__interval_ms":   true,
-		"__rate_interval": true,
-		"__range":         true,
-		"__range_s":       true,
-		"__range_ms":      true,
-		"__dashboard":     true,
-		"__org":           true,
-		"__user":          true,
-		"timeFilter":      true,
+		"timeFilter": true,
+		"timeFrom":   true,
+		"timeTo":     true,
 	}
 
 	forbiddenMarkupFragments = []string{
@@ -121,6 +112,12 @@ var (
 	}
 )
 
+// IsReservedVariableName returns true for Grafana global/built-in variable identifiers
+// (all "__*" names plus timeFilter/timeFrom/timeTo).
+func IsReservedVariableName(name string) bool {
+	return strings.HasPrefix(name, "__") || reservedVariableNames[name]
+}
+
 // ValidationError aggregates deterministic IR validation issues.
 type ValidationError struct {
 	Issues []string
@@ -130,27 +127,61 @@ func (e *ValidationError) Error() string {
 	return fmt.Sprintf("IR validation failed (%d issue(s)): %s", len(e.Issues), strings.Join(e.Issues, "; "))
 }
 
-// rawPanelRequiredCheck ensures required numeric fields (layout.row, layout.col, thresholds[].value)
+type rawThresholdCheck struct {
+	Value *float64 `json:"value"`
+}
+
+type rawLayoutCheck struct {
+	Row *int `json:"row"`
+	Col *int `json:"col"`
+}
+
+// rawIRRequiredCheck ensures required numeric fields (layout.row, layout.col, thresholds[].value)
 // are explicitly present in JSON rather than silently defaulted to Go zero values, and detects
-// mutually exclusive query + queries on the same panel.
+// mutually exclusive query + queries (including empty queries: []) on the same panel.
 type rawIRRequiredCheck struct {
 	Revision *int `json:"revision"`
 	Panels   []struct {
-		ID         string            `json:"id"`
-		Query      *json.RawMessage  `json:"query"`
-		Queries    []json.RawMessage `json:"queries"`
-		Thresholds []struct {
-			Value *float64 `json:"value"`
-		} `json:"thresholds"`
-		Layout *struct {
-			Row *int `json:"row"`
-			Col *int `json:"col"`
-		} `json:"layout"`
+		ID         string              `json:"id"`
+		Query      *json.RawMessage    `json:"query"`
+		Queries    *json.RawMessage    `json:"queries"`
+		Thresholds []rawThresholdCheck `json:"thresholds"`
+		Layout     *rawLayoutCheck     `json:"layout"`
 	} `json:"panels"`
 }
 
+type rawPatchRequiredCheck struct {
+	BaseRevision *int `json:"baseRevision"`
+	Operations   []struct {
+		Panel *struct {
+			Query      *json.RawMessage    `json:"query"`
+			Queries    *json.RawMessage    `json:"queries"`
+			Thresholds []rawThresholdCheck `json:"thresholds"`
+			Layout     *rawLayoutCheck     `json:"layout"`
+		} `json:"panel"`
+	} `json:"operations"`
+}
+
+func isJSONNull(raw *json.RawMessage) bool {
+	if raw == nil {
+		return true
+	}
+	return bytes.Equal(bytes.TrimSpace(*raw), []byte("null"))
+}
+
+func isEmptyJSONArray(raw *json.RawMessage) bool {
+	if isJSONNull(raw) {
+		return false
+	}
+	var arr []json.RawMessage
+	if err := json.Unmarshal(*raw, &arr); err != nil {
+		return false
+	}
+	return len(arr) == 0
+}
+
 // DecodeStrictIR parses JSON bytes into DashboardIR, rejecting unknown fields,
-// missing required numeric fields, trailing garbage, or oversized payloads.
+// missing required numeric fields, trailing garbage, query/queries conflicts, or oversized payloads.
 func DecodeStrictIR(raw []byte) (DashboardIR, error) {
 	if len(raw) == 0 {
 		return DashboardIR{}, errors.New("empty IR payload")
@@ -177,8 +208,13 @@ func DecodeStrictIR(raw []byte) (DashboardIR, error) {
 		return DashboardIR{}, errors.New("missing required field: revision")
 	}
 	for i, p := range req.Panels {
-		if p.Query != nil && len(p.Queries) > 0 {
+		hasRawQuery := !isJSONNull(p.Query)
+		hasRawQueries := !isJSONNull(p.Queries)
+		if hasRawQuery && hasRawQueries {
 			return DashboardIR{}, fmt.Errorf("panels[%d]: cannot specify both query and queries", i)
+		}
+		if hasRawQueries && isEmptyJSONArray(p.Queries) {
+			return DashboardIR{}, fmt.Errorf("panels[%d]: queries must contain 1..%d items", i, MaxQueriesPerPanel)
 		}
 		if p.Layout == nil || p.Layout.Row == nil || p.Layout.Col == nil {
 			return DashboardIR{}, fmt.Errorf("panels[%d]: missing required layout.row or layout.col", i)
@@ -192,7 +228,8 @@ func DecodeStrictIR(raw []byte) (DashboardIR, error) {
 	return doc, nil
 }
 
-// DecodeStrictPatch parses JSON bytes into DashboardPatch with DisallowUnknownFields.
+// DecodeStrictPatch parses JSON bytes into DashboardPatch with DisallowUnknownFields
+// and strict required numeric field checks for baseRevision, layout, and thresholds.
 func DecodeStrictPatch(raw []byte) (DashboardPatch, error) {
 	if len(raw) == 0 {
 		return DashboardPatch{}, errors.New("empty patch payload")
@@ -209,6 +246,35 @@ func DecodeStrictPatch(raw []byte) (DashboardPatch, error) {
 	}
 	if err := dec.Decode(&struct{}{}); err != io.EOF {
 		return DashboardPatch{}, errors.New("unexpected trailing tokens after patch JSON object")
+	}
+
+	var req rawPatchRequiredCheck
+	if err := json.Unmarshal(raw, &req); err != nil {
+		return DashboardPatch{}, fmt.Errorf("patch required field inspection failed: %w", err)
+	}
+	if req.BaseRevision == nil {
+		return DashboardPatch{}, errors.New("missing required field: baseRevision")
+	}
+	for i, op := range req.Operations {
+		if op.Panel == nil {
+			continue
+		}
+		hasRawQuery := !isJSONNull(op.Panel.Query)
+		hasRawQueries := !isJSONNull(op.Panel.Queries)
+		if hasRawQuery && hasRawQueries {
+			return DashboardPatch{}, fmt.Errorf("operations[%d].panel: cannot specify both query and queries", i)
+		}
+		if hasRawQueries && isEmptyJSONArray(op.Panel.Queries) {
+			return DashboardPatch{}, fmt.Errorf("operations[%d].panel: queries must contain 1..%d items", i, MaxQueriesPerPanel)
+		}
+		if op.Panel.Layout != nil && (op.Panel.Layout.Row == nil || op.Panel.Layout.Col == nil) {
+			return DashboardPatch{}, fmt.Errorf("operations[%d].panel: missing required layout.row or layout.col", i)
+		}
+		for ti, th := range op.Panel.Thresholds {
+			if th.Value == nil {
+				return DashboardPatch{}, fmt.Errorf("operations[%d].panel.thresholds[%d]: missing required value", i, ti)
+			}
+		}
 	}
 	return patch, nil
 }
@@ -390,6 +456,8 @@ func validatePanelQueries(prefix string, p PanelIR) []string {
 		if q.LegendFormat != "" {
 			if err := validatePlainText(qPrefix+".legendFormat", q.LegendFormat, 0, MaxLegendLen); err != nil {
 				issues = append(issues, err.Error())
+			} else if legendVarTokenPattern.MatchString(q.LegendFormat) {
+				issues = append(issues, fmt.Sprintf("%s.legendFormat must not reference template variables ($ or [[...]])", qPrefix))
 			}
 		}
 	}
@@ -402,7 +470,7 @@ func validateVariable(idx int, v VariableIR, seen map[string]bool) []string {
 
 	if !varNamePattern.MatchString(v.Name) {
 		issues = append(issues, fmt.Sprintf("%s.name %q violates pattern", prefix, v.Name))
-	} else if reservedVariableNames[v.Name] {
+	} else if IsReservedVariableName(v.Name) {
 		issues = append(issues, fmt.Sprintf("%s.name %q is reserved", prefix, v.Name))
 	} else if seen[v.Name] {
 		issues = append(issues, fmt.Sprintf("%s.name %q is duplicated", prefix, v.Name))
@@ -435,10 +503,8 @@ func validateVariable(idx int, v VariableIR, seen map[string]bool) []string {
 		if len(v.Options) > 0 {
 			issues = append(issues, fmt.Sprintf("%s.options must not be set on query variable", prefix))
 		}
-		if v.DefaultValue != "" {
-			if err := validatePlainText(prefix+".defaultValue", v.DefaultValue, 1, MaxVariableDefaultLen); err != nil {
-				issues = append(issues, err.Error())
-			}
+		if err := validateVariableValue(prefix+".defaultValue", v.DefaultValue, 1, MaxVariableDefaultLen, false); err != nil {
+			issues = append(issues, err.Error())
 		}
 
 	case "custom":
@@ -453,7 +519,7 @@ func validateVariable(idx int, v VariableIR, seen map[string]bool) []string {
 		}
 		optSeen := make(map[string]bool, len(v.Options))
 		for oi, opt := range v.Options {
-			if err := validatePlainText(fmt.Sprintf("%s.options[%d]", prefix, oi), opt, 1, MaxVariableOptionLen); err != nil {
+			if err := validateVariableValue(fmt.Sprintf("%s.options[%d]", prefix, oi), opt, 1, MaxVariableOptionLen, true); err != nil {
 				issues = append(issues, err.Error())
 			}
 			if optSeen[opt] {
@@ -462,7 +528,7 @@ func validateVariable(idx int, v VariableIR, seen map[string]bool) []string {
 			optSeen[opt] = true
 		}
 		if v.DefaultValue != "" {
-			if err := validatePlainText(prefix+".defaultValue", v.DefaultValue, 1, MaxVariableDefaultLen); err != nil {
+			if err := validateVariableValue(prefix+".defaultValue", v.DefaultValue, 1, MaxVariableDefaultLen, true); err != nil {
 				issues = append(issues, err.Error())
 			} else if !optSeen[v.DefaultValue] {
 				issues = append(issues, fmt.Sprintf("%s.defaultValue %q must be one of custom options", prefix, v.DefaultValue))
@@ -471,6 +537,23 @@ func validateVariable(idx int, v VariableIR, seen map[string]bool) []string {
 	}
 
 	return issues
+}
+
+// validateVariableValue ensures variable defaultValue and custom options cannot break out of
+// PromQL string literals, trigger chained variable expansion, or corrupt Grafana CSV custom syntax.
+func validateVariableValue(field, val string, minRunes, maxRunes int, isCustom bool) error {
+	if err := validatePlainText(field, val, minRunes, maxRunes); err != nil {
+		return err
+	}
+	if strings.ContainsAny(val, "\"\\`$") || strings.Contains(val, "[[") {
+		return fmt.Errorf("%s contains forbidden quote, backslash, backtick, or variable token", field)
+	}
+	if isCustom {
+		if strings.Contains(val, ",") || strings.Contains(val, " : ") {
+			return fmt.Errorf("%s must not contain ',' or ' : ' (reserved by Grafana custom variable syntax)", field)
+		}
+	}
+	return nil
 }
 
 // ValidateImportSource checks provenance metadata for an imported Grafana dashboard.

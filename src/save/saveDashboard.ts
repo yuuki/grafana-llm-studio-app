@@ -28,6 +28,14 @@ export interface UpdateDashboardRequest {
    */
   expectedResourceVersion: string;
   folderUid: string;
+  /**
+   * Non-folder metadata.annotations captured at import time so PUT does not strip Grafana metadata.
+   */
+  preservedAnnotations?: Record<string, string>;
+  /**
+   * metadata.labels captured at import time so PUT does not strip Grafana labels.
+   */
+  preservedLabels?: Record<string, string>;
 }
 
 export interface SaveDashboardResult {
@@ -288,18 +296,35 @@ export class DashboardSaver {
       const namespace = getOrgNamespace();
 
       const annotations: Record<string, string> = {};
+      if (req.preservedAnnotations) {
+        for (const [k, v] of Object.entries(req.preservedAnnotations)) {
+          if (k !== 'grafana.app/folder' && typeof v === 'string') {
+            annotations[k] = v;
+          }
+        }
+      }
       if (req.folderUid && req.folderUid.trim() !== '') {
         annotations['grafana.app/folder'] = req.folderUid.trim();
+      }
+
+      const metadata: {
+        name: string;
+        resourceVersion: string;
+        annotations: Record<string, string>;
+        labels?: Record<string, string>;
+      } = {
+        name: targetUid,
+        resourceVersion: expectedRV,
+        annotations,
+      };
+      if (req.preservedLabels && Object.keys(req.preservedLabels).length > 0) {
+        metadata.labels = { ...req.preservedLabels };
       }
 
       const payload = {
         apiVersion: 'dashboard.grafana.app/v1beta1',
         kind: 'Dashboard',
-        metadata: {
-          name: targetUid,
-          resourceVersion: expectedRV,
-          annotations,
-        },
+        metadata,
         spec: foundationSpec,
       };
 

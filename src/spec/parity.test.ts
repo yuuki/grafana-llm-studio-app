@@ -25,7 +25,7 @@ import {
   VizPanel,
 } from '@grafana/scenes';
 import { DashboardIR, validateIRClient } from '../ir/types';
-import { normalizeDashboardIR } from './normalize';
+import { interpolatePromQLVariables, normalizeDashboardIR } from './normalize';
 import { buildFoundationDashboard } from './toFoundation';
 import { buildPreviewScene } from './toScene';
 
@@ -367,5 +367,115 @@ describe('Scenes and Foundation SDK adapter parity', () => {
     const issues = validateIRClient(badDoc);
     expect(issues.some((m) => m.includes('reserved'))).toBe(true);
     expect(issues.some((m) => m.includes('max 3 queries'))).toBe(true);
+
+    // Adversarial client validation checks: HTML/Bidi/quotes/legend var token/empty queries
+    const adversarialDoc: DashboardIR = {
+      schemaVersion: '1.1',
+      revision: 1,
+      title: 'Safe <img src=x>',
+      timeRange: { from: 'now-15m', to: 'now' },
+      variables: [
+        {
+          name: '__custom_var',
+          type: 'query',
+          datasourceRef: 'selected_prometheus',
+          labelName: 'service',
+          defaultValue: '',
+        },
+        {
+          name: 'env',
+          type: 'custom',
+          options: ['prod,staging'],
+          defaultValue: 'prod,staging',
+        },
+      ],
+      panels: [
+        {
+          id: 'panel-a',
+          type: 'timeseries',
+          title: 'Panel A',
+          datasourceRef: 'selected_prometheus',
+          query: { expr: 'up', legendFormat: '{{instance}} $env' },
+          queries: [],
+          unit: 'short',
+          layout: { row: 0, col: 0, width: 'full' },
+        },
+      ],
+    };
+    const advIssues = validateIRClient(adversarialDoc);
+    expect(advIssues.some((m) => m.includes('angle brackets'))).toBe(true);
+    expect(advIssues.some((m) => m.includes('__custom_var'))).toBe(true);
+    expect(advIssues.some((m) => m.includes('comma'))).toBe(true);
+    expect(advIssues.some((m) => m.includes('both query and queries'))).toBe(true);
+  });
+
+  test('multi + includeAll variable parity and single-pass PromQL interpolation escaping (H-1, M-2)', () => {
+    const multiVarDoc: DashboardIR = {
+      schemaVersion: '1.1',
+      revision: 1,
+      title: 'Multi Var Parity',
+      timeRange: { from: 'now-15m', to: 'now' },
+      variables: [
+        {
+          name: 'host',
+          type: 'query',
+          datasourceRef: 'selected_prometheus',
+          labelName: 'instance',
+          metricName: 'up',
+          defaultValue: 'api.v1',
+          multi: true,
+          includeAll: true,
+        },
+        {
+          name: 'tier',
+          type: 'custom',
+          options: ['web', 'worker'],
+          defaultValue: 'web',
+          multi: true,
+          includeAll: true,
+        },
+      ],
+      panels: [
+        {
+          id: 'panel-up',
+          type: 'stat',
+          title: 'Up',
+          datasourceRef: 'selected_prometheus',
+          query: { expr: 'avg(up{instance=~"${host:regex}",tier=~"${tier:pipe}"})' },
+          unit: 'short',
+          layout: { row: 0, col: 0, width: 'full' },
+        },
+      ],
+    };
+
+    const spec = normalizeDashboardIR(multiVarDoc, { uid: 'prom-main', type: 'prometheus' });
+    const scene = buildPreviewScene(spec);
+    const foundationDash = buildFoundationDashboard(spec, { uid: 'llmstudio-multi-var' });
+
+    const sceneVars = (scene.state.$variables as SceneVariableSet).state.variables;
+    const foundationVars = foundationDash.templating?.list ?? [];
+
+    // Multi variables must use array initial values in both Scenes and Foundation SDK
+    expect((sceneVars[0] as QueryVariable).state.value).toEqual(['api.v1']);
+    expect(foundationVars[0].current?.value).toEqual(['api.v1']);
+    expect(foundationVars[0].allowCustomValue).toBe(false);
+
+    expect((sceneVars[1] as CustomVariable).state.value).toEqual(['web']);
+    expect(foundationVars[1].current?.value).toEqual(['web']);
+    expect(foundationVars[1].allowCustomValue).toBe(false);
+    expect(foundationVars[1].options?.[0]).toEqual({ text: 'All', value: '$__all', selected: false });
+
+    // Single-pass interpolation escapes RE2 dots + PromQL backslashes (\\. not \.)
+    expect(
+      interpolatePromQLVariables('up{instance=~"${host:regex}",tier=~"${tier:pipe}"}', spec.variables)
+    ).toBe('up{instance=~"api\\\\.v1",tier=~"web"}');
+
+    // Single-pass prevents secondary expansion ($a -> "$b" must NOT expand $b)
+    expect(
+      interpolatePromQLVariables('up{a="$a",b="$b"}', [
+        { name: 'a', label: 'a', type: 'custom', query: '$b', options: ['$b'], defaultValue: '$b', multi: false, includeAll: false },
+        { name: 'b', label: 'b', type: 'custom', query: 'pwned', options: ['pwned'], defaultValue: 'pwned', multi: false, includeAll: false },
+      ])
+    ).toBe('up{a="$b",b="pwned"}');
   });
 });
