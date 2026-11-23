@@ -86,3 +86,82 @@ Then open `http://localhost:3000`, switch `yuuki-llmstudio-app` from `mock` to `
 - **HTTP `429` (Rate Limit) and `4xx` errors are never automatically retried** by the Go backend to prevent quota burn or retry storms.
 - Only transient network/gateway errors (`502`, `503`, `504`, plus wrapped `520`/`522`/`524` internet edge errors) are retried at most **once** at the transport layer, strictly separated from semantic syntax repair attempts.
 - Tune `maxOutputTokens`, `llmTimeoutSeconds`, `maxConcurrentJobs`, and `maxRepairAttempts` in App Config to match your provider's rate limits and cost budget.
+
+## 5. Running Live Integration Benchmarks (`cmd/llm-bench`)
+
+This repository includes a repeatable benchmark CLI ([`cmd/llm-bench`](../cmd/llm-bench/main.go), backed by [`pkg/bench`](../pkg/bench/runner.go)) that exercises **all three Studio workflows** (`generate`, `patch`, and query-only `repair`) strictly through `grafana-llm-app`.
+
+### What Is Measured
+- **9 built-in scenarios** grounded in the sample `checkout-api` Prometheus catalog (`deploy/prometheus/exporter.py`):
+  - **Generate (4):** English RED dashboard (`gen-red-en`), Japanese RED + memory (`gen-red-ja`), gauge/counter type discipline (`gen-gauge-discipline`), prompt injection resilience (`gen-prompt-injection`)
+  - **Patch (3):** Targeted single-panel edit (`patch-single-panel-p99`), adding a new panel (`patch-add-memory-panel`), multi-op `timeRange` + error ratio update (`patch-timerange-and-4xx`)
+  - **Repair (2):** PromQL syntax parenthesis repair (`repair-syntax-paren`), runtime duplicate-match vector repair (`repair-duplicate-match`) — both enforcing query-only mutation guards
+- **Metrics recorded per run & aggregate:** strict JSON decode pass rate, IR + PromQL AST/policy/scope/catalog validation pass rate, prompt adherence pass rate, optional live Prometheus `/api/v1/query_range` execution pass rate, latency (`min` / `p50` / `mean` / `p95` / `max`), prompt/completion token usage, and `finish_reason` distribution (`stop`, `length`, `content_filter`, etc.).
+
+### Step-by-Step Benchmark Execution
+
+1. Build the benchmark binary:
+   ```bash
+   make build-bench
+   ```
+2. Start Grafana (with `grafana-llm-app` pointed at your provider or local vLLM) and Prometheus (`deploy/docker-compose.yml` + `deploy/docker-compose.openai.yml`), then mint a minimum-privilege `Viewer` Service Account token:
+   ```bash
+   export GRAFANA_SA_TOKEN="$(node scripts/bootstrap-bench-sa.mjs)"
+   ```
+3. Run `bin/llm-bench` with the matching provider preset (add `--iterations 3` for multi-run latency/pass-rate stability):
+   ```bash
+   # OpenAI gpt-4.1-mini (base tier)
+   ./bin/llm-bench --preset openai-gpt41-mini --provider-label openai/gpt-4.1-mini \
+     --prometheus-url http://127.0.0.1:9090 \
+     --json-out bench-results/openai-gpt41-mini.json --md-out bench-results/openai-gpt41-mini.md
+
+   # OpenAI gpt-4.1 (large tier)
+   ./bin/llm-bench --preset openai-gpt41 --provider-label openai/gpt-4.1 \
+     --prometheus-url http://127.0.0.1:9090 \
+     --json-out bench-results/openai-gpt41.json --md-out bench-results/openai-gpt41.md
+
+   # OpenAI o3 (large tier, reasoning_effort=low, maxOutputTokens=4096)
+   ./bin/llm-bench --preset openai-o3 --provider-label openai/o3 \
+     --prometheus-url http://127.0.0.1:9090 \
+     --json-out bench-results/openai-o3.json --md-out bench-results/openai-o3.md
+
+   # DeepSeek API (structuredOutputMode=json_object, tokenLimitField=max_tokens)
+   ./bin/llm-bench --preset deepseek --provider-label deepseek/deepseek-chat \
+     --prometheus-url http://127.0.0.1:9090 \
+     --json-out bench-results/deepseek.json --md-out bench-results/deepseek.md
+
+   # OpenRouter / Gemini OpenAI-compat / Local vLLM
+   ./bin/llm-bench --preset openrouter --provider-label openrouter/<model> --prometheus-url http://127.0.0.1:9090
+   ./bin/llm-bench --preset gemini --provider-label gemini/<model> --prometheus-url http://127.0.0.1:9090
+   ./bin/llm-bench --preset vllm --provider-label vllm/<model> --prometheus-url http://127.0.0.1:9090
+   ```
+   Use `./bin/llm-bench --list-presets` and `./bin/llm-bench --list-scenarios` to inspect all options.
+
+### Verifying Real `grafana-llm-app` Wire Protocol Without API Keys
+
+Before spending API credits or provisioning GPUs, you can verify the exact HTTP wire contract through a **real `grafana-llm-app` container** and live Prometheus using the bundled deterministic capture stub:
+
+```bash
+make verify-llm-protocol
+```
+
+This runs `deploy/docker-compose.yml` + `deploy/docker-compose.bench-verify.yml` and executes `scripts/verify-grafana-llm-app.mjs`, confirming:
+- `Viewer`-role Service Account auth against `/api/plugins/grafana-llm-app/health` and `/resources/llm/v1/chat/completions`
+- `json_schema` (`strict: false`, `max_completion_tokens`, string enum preservation for `dashboard_ir` and `dashboard_patch`)
+- `json_object` + embedded canonical JSON Schema + `max_tokens` (`deepseek` preset)
+- `large` tier mapping + `reasoning_effort: "low"` + omitted `temperature` (`openai-o3` preset)
+- Single transport retry recovery on wrapped upstream HTTP `503` and explicit `ErrOutputTruncated` detection on `finish_reason: "length"`
+- Live PromQL `/api/v1/query_range` execution of all generated/patched/repaired queries against `prom/prometheus:v3.5.0`
+
+### Live Benchmark Tracking Matrix
+
+| Target Provider / Model | Preset | Wire Protocol (`grafana-llm-app`) | Live Model Benchmark Status | Notes |
+|---|---|---|---|---|
+| **Real `grafana-llm-app` `v1.2.0` (`Grafana 13.3.1`) + Capture Stub** | `openai-gpt41-mini`, `deepseek`, `openai-o3` | **Verified** (`9/9` scenarios + live Prometheus + `503` retry + `finish_reason=length`) | N/A (deterministic stub) | Preserves `minLength`/`maxLength`/`minimum`/`maximum` on wire; reproducible via `make verify-llm-protocol` |
+| **Real `grafana-llm-app` `v1.0.8` (`Grafana 12.4.15`) + Capture Stub** | `openai-gpt41-mini`, `deepseek`, `openai-o3` | **Verified** (`9/9` scenarios + live Prometheus + `503` retry + `finish_reason=length`) | N/A (deterministic stub) | Drops `minLength`/`maxLength`/`minimum`/`maximum`/`pattern` on wire (enforced by Go backend); reproducible via `GRAFANA_VERSION=12.4.15 GRAFANA_LLM_APP_INSTALL="grafana-llm-app 1.0.8" make verify-llm-protocol` |
+| **OpenAI (`gpt-4.1-mini`, `gpt-4.1`, `o3`)** | `openai-gpt41-mini` / `openai-gpt41` / `openai-o3` | Verified via `grafana-llm-app` containers (`v1.2.0` & `v1.0.8`) | Pending live API key run | Run with `cmd/llm-bench` and paste Markdown report |
+| **OpenRouter** | `openrouter` | Verified via `grafana-llm-app` containers (`v1.2.0` & `v1.0.8`) | Pending live API key run | Use `--structured-output json_object` for non-`json_schema` models |
+| **DeepSeek API** | `deepseek` | Verified (`json_object` + `max_tokens`) | Pending live API key run | Embedded canonical schema verified on wire |
+| **Google Gemini (OpenAI-compat)** | `gemini` | Verified via `grafana-llm-app` containers (`v1.2.0` & `v1.0.8`) | Pending live API key run | Set `OPENAI_API_PATH=""` in `grafana-llm-app` |
+| **Local vLLM (`>= v0.12.0`)** | `vllm` / `vllm-reasoning` | Verified via `grafana-llm-app` containers (`v1.2.0` & `v1.0.8`) | Pending GPU host run | Pin engine flags (e.g. XGrammar / Guidance) on vLLM server |
+
