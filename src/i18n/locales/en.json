@@ -1,0 +1,202 @@
+{
+  "studio": {
+    "title": "LLM Dashboard Studio (MVP)",
+    "mockBanner": {
+      "title": "Development/Testing Mock LLM Mode",
+      "body": "Currently running with llmMode=mock. Switch to grafana-llm-app mode in App Config for production use."
+    },
+    "alert": {
+      "errorTitle": "Error"
+    },
+    "savedAlert": {
+      "title": "New dashboard saved",
+      "uidPrefix": "UID:",
+      "revision": "(rev {{revision}})",
+      "openLink": "Open saved dashboard to review queries, units, thresholds, and layout"
+    },
+    "datasource": {
+      "label": "Allowlisted Prometheus Datasource",
+      "placeholder": "Select a datasource"
+    },
+    "scope": {
+      "labelName": "Scope Label",
+      "labelValue": "Target Service / Job Value",
+      "placeholder": "checkout-api",
+      "fetchValues": "Fetch Values",
+      "selectValuePlaceholder": "Select from values"
+    },
+    "catalog": {
+      "fetch": "Fetch Scoped Metrics",
+      "fetching": "Fetching...",
+      "loadedPrefix": "Loaded metric candidates (browser memory only):",
+      "loadedUnit": "items",
+      "truncatedSuffix": "(truncated at limit)",
+      "staleSuffix": "(scope changed — re-fetch required)"
+    },
+    "edit": {
+      "label": "Edit Mode / Target Panel",
+      "autoPatch": "Patch existing draft (auto-detect)",
+      "panelPatch": "Patch panel: {{title}} ({{id}})",
+      "newDraft": "Generate from scratch as a new draft"
+    },
+    "prompt": {
+      "label": "What would you like to build or modify?",
+      "defaultText": "Show request rate, 5xx error rate, and p95 latency for the selected service",
+      "placeholder": "e.g., Change only the error rate panel to timeseries"
+    },
+    "actions": {
+      "generating": "Generating...",
+      "applyPatch": "Apply Partial Edit",
+      "generateDraft": "Generate Dashboard Draft",
+      "cancel": "Cancel",
+      "undo": "Undo"
+    },
+    "job": {
+      "statusLabel": "Status:",
+      "revision": "rev {{revision}}",
+      "messageTitle": "Generation & Validation Message",
+      "diffTitle": "Changes (Diff):",
+      "repairBudget": "Repair budget: {{used}} / {{max}} used"
+    },
+    "validation": {
+      "heading": "Validation Results (Dry-Run: last 5m / maxDataPoints=10)",
+      "repairing": "Repairing...",
+      "repairSyntaxOnly": "Auto-Repair Syntax Errors Only",
+      "category": {
+        "ok": "OK",
+        "empty_result": "Empty result (not auto-repaired)",
+        "syntax_error": "Syntax error (repairable)",
+        "permission_error": "Permission error (not auto-repairable)",
+        "timeout": "Timeout (not auto-repairable)",
+        "datasource_error": "Datasource error"
+      }
+    },
+    "save": {
+      "folderLabel": "Target Folder (Create-Only)",
+      "saving": "Saving...",
+      "saveNewDashboard": "Save New Dashboard",
+      "exportJson": "Export JSON",
+      "requiresValidationHint": "Saving is enabled once \"Validate & Preview\" completes without errors for the latest revision (rev {{revision}})."
+    },
+    "rightPane": {
+      "tabPreview": "Scenes Preview",
+      "tabIr": "IR JSON",
+      "tabFoundation": "Foundation SDK JSON",
+      "validating": "Validating...",
+      "validateAndPreview": "Validate & Preview",
+      "draftReadyHint": "IR checks passed for draft rev {{revision}}. Click \"Validate & Preview\" to run dry-run query validation and render the Scenes preview (auto-refresh is disabled).",
+      "emptyHint": "Select a datasource and load scoped metrics in the left pane, then generate a dashboard draft.",
+      "noIrYet": "// No IR generated yet",
+      "noFoundationYet": "// No Foundation SDK output yet"
+    },
+    "errors": {
+      "initFailed": "Initialization failed (check allowed datasources and LLM mode in App Config): {{error}}",
+      "scopeValuesFailed": "Failed to fetch scope values: {{error}}",
+      "scopeRequired": "Please select a datasource and enter a target scope value (e.g., checkout-api).",
+      "metadataFailed": "Failed to fetch scoped metadata: {{error}}",
+      "datasourceRequired": "Please select an allowlisted Prometheus datasource.",
+      "catalogRequired": "Please fetch metric candidates for the current scope (click \"Fetch Scoped Metrics\").",
+      "validationBlocked": "Dry-run validation detected blocking errors (syntax error, permission error, timeout, etc.), so Scenes preview and saving were blocked.",
+      "validationFailed": "Validation & preview failed: {{error}}",
+      "previewRequiredBeforeSave": "Run \"Validate & Preview\" to verify the latest draft before saving.",
+      "latestDraftUnvalidated": "The latest draft has not been validated yet. Complete \"Validate & Preview\" first.",
+      "validationErrorsRemain": "Cannot save a draft while blocking validation errors remain.",
+      "exportFailed": "Failed to export JSON: {{error}}"
+    }
+  },
+  "appConfig": {
+    "securityAlert": {
+      "title": "Permissions & Security Policy",
+      "body": "All LLM calls are routed exclusively through grafana-llm-app (whether using air-gapped local vLLM or internet-hosted OpenAI / OpenAI-compatible APIs, configure the endpoint URL, API key, and model mappings in grafana-llm-app). The service account token entered below is stored encrypted in secureJsonData and is never reused for datasource queries or dashboard writes."
+    },
+    "status": {
+      "savedTitle": "Saved",
+      "errorTitle": "Error",
+      "savedMessage": "Settings saved. Reload the page to apply changes.",
+      "saveFailed": "Failed to save settings: {{error}}"
+    },
+    "validation": {
+      "allowMockRequired": "Explicitly enable allowMockInDev to save llmMode=mock.",
+      "numberRange": "{{label}} must be a number between {{min}} and {{max}}.",
+      "reasoningEffort": "Reasoning Effort must be blank or one of: low, medium, high.",
+      "fields": {
+        "maxPanels": "Max panels",
+        "maxRepairAttempts": "Max auto-repair attempts",
+        "maxOutputTokens": "LLM max output tokens",
+        "llmTimeoutSeconds": "LLM timeout (seconds)",
+        "jobDeadlineSeconds": "Job deadline (seconds)",
+        "maxConcurrentJobs": "Max concurrent LLM jobs",
+        "validationTimeoutSeconds": "Validation query timeout (seconds)",
+        "maxConcurrentQueries": "Max concurrent datasource queries"
+      }
+    },
+    "datasource": {
+      "fieldset": "Datasource Allowlist (MVP: Single Organization, Prometheus-Compatible)",
+      "allowedUidsLabel": "Allowed Prometheus Datasource UIDs (comma-separated)",
+      "allowedUidsDescription": "Only datasources listed here can be selected in Studio. The LLM can never specify arbitrary datasource UIDs."
+    },
+    "llm": {
+      "fieldset": "LLM Connection Settings (Unified via grafana-llm-app)",
+      "modeLabel": "LLM Mode",
+      "modeGrafanaLlmApp": "grafana-llm-app (Recommended for production — relays local vLLM / OpenAI-compatible APIs)",
+      "modeMock": "mock (Development & testing only)",
+      "allowMockLabel": "Explicitly allow mock mode for development & testing",
+      "allowMockDescription": "Keep disabled in production. Real LLM failures never fall back to mock mode automatically.",
+      "allowMockCheckbox": "Enable allowMockInDev",
+      "grafanaUrlLabel": "Grafana Internal URL",
+      "grafanaUrlDescription": "URL used by the Go backend llmclient to connect to /api/plugins/grafana-llm-app/resources/llm/v1 (loopback or same origin as Grafana AppURL only).",
+      "modelTierLabel": "grafana-llm-app Model Tier",
+      "modelTierBase": "base (Fast, high throughput)",
+      "modelTierLarge": "large (Higher accuracy)",
+      "structuredOutputLabel": "Structured Output Format",
+      "structuredOutputDescription": "Recommended: json_schema for OpenAI (GPT-4o/4.1/5), Azure OpenAI, OpenRouter, Gemini OpenAI-compatible, and vLLM. Choose json_object for OpenAI-compatible APIs without json_schema support (e.g., DeepSeek API).",
+      "structuredOutputSchema": "json_schema (Standard — recommended for OpenAI / OpenRouter / Gemini-compat / vLLM)",
+      "structuredOutputObject": "json_object (For OpenAI-compatible APIs without json_schema support)",
+      "tokenLimitLabel": "Output Token Limit Parameter",
+      "tokenLimitDescription": "Use max_completion_tokens for OpenAI, Azure OpenAI, OpenRouter, Groq, and vLLM. Choose max_tokens for legacy or third-party OpenAI-compatible APIs (e.g., DeepSeek API).",
+      "tokenLimitCompletion": "max_completion_tokens (Recommended — OpenAI / OpenRouter / Groq / vLLM)",
+      "tokenLimitLegacy": "max_tokens (For third-party OpenAI-compatible APIs)",
+      "reasoningEffortLabel": "Reasoning Effort (Optional, for reasoning models)",
+      "reasoningEffortDescription": "Leave unspecified (auto) for standard models (GPT-4o / GPT-4.1 / Llama / DeepSeek-Chat, etc.). For reasoning models (o3 / GPT-5 / GLM-5.3, etc.), \"low\" is recommended to curb excessive thinking time.",
+      "reasoningEffortAuto": "Unspecified / Auto (Recommended for standard OpenAI & OpenAI-compatible models)",
+      "reasoningEffortLow": "low (Reasoning models — fast)",
+      "reasoningEffortMedium": "medium (Reasoning models — balanced)",
+      "reasoningEffortHigh": "high (Reasoning models — maximum)",
+      "saTokenLabel": "Dedicated LLM Service Account Token (secureJsonData)",
+      "saTokenDescription": "Assign the minimum basic role Viewer in Grafana OSS and dedicate it solely to llmclient (reset and save blank to delete an existing token)."
+    },
+    "limits": {
+      "fieldset": "Budgets & Query Limits (Initial Defaults — Tune for Your Environment)",
+      "maxPanels": "Max panels (1..6)",
+      "maxRepairAttempts": "Max auto-repair attempts (0..2, 0 to disable)",
+      "maxOutputTokens": "LLM max output tokens (256..8192)",
+      "llmTimeoutSeconds": "LLM request timeout (seconds, 5..120)",
+      "jobDeadlineSeconds": "Overall job deadline (seconds, 10..180)",
+      "maxConcurrentJobs": "Max concurrent LLM jobs (1..16)",
+      "validationTimeoutSeconds": "Validation query timeout (seconds, 2..30)",
+      "maxConcurrentQueries": "Max concurrent datasource queries (1..4)"
+    },
+    "actions": {
+      "saving": "Saving...",
+      "save": "Save settings"
+    }
+  },
+  "save": {
+    "folder": {
+      "generalRoot": "General (Root)"
+    },
+    "errors": {
+      "inFlight": "A save operation is already in progress. Please wait for it to finish.",
+      "revisionMismatch": "Target revision (rev {{targetRevision}}) does not match the validated preview (rev {{previewedRevision}}). Run Validate & Preview first.",
+      "defaultMessage": "Failed to create new dashboard",
+      "permissionDenied": "You do not have permission to save to the selected folder (HTTP {{status}}): {{message}}",
+      "uidConflict": "Aborted dashboard creation due to a UID conflict. No existing dashboard was overwritten (HTTP {{status}}): {{message}}",
+      "apiError": "Dashboard save API error (HTTP {{status}}): {{message}}"
+    }
+  },
+  "validator": {
+    "errors": {
+      "timeout": "Validation query timed out ({{seconds}}s)"
+    }
+  }
+}
