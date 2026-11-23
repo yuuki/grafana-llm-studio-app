@@ -23,6 +23,7 @@ import {
 import { selectMetricCandidates } from '../datasource/bm25';
 import { fetchScopedMetricCatalog, fetchScopeLabelValues } from '../datasource/metadata';
 import { runDryRunValidation } from '../datasource/validator';
+import { TranslationKey, useStudioTranslation } from '../i18n';
 import {
   computeQueryHash,
   JobSnapshot,
@@ -62,13 +63,13 @@ const VALIDATION_BADGE_COLOR: Record<ValidationCategory, 'green' | 'orange' | 'r
   datasource_error: 'red',
 };
 
-const VALIDATION_LABEL: Record<ValidationCategory, string> = {
-  ok: '正常',
-  empty_result: '空結果（自動修復対象外）',
-  syntax_error: '構文エラー（修復可）',
-  permission_error: '権限エラー（自動修復不可）',
-  timeout: 'タイムアウト（自動修復不可）',
-  datasource_error: 'データソースエラー',
+const VALIDATION_LABEL_KEYS: Record<ValidationCategory, TranslationKey> = {
+  ok: 'studio.validation.category.ok',
+  empty_result: 'studio.validation.category.empty_result',
+  syntax_error: 'studio.validation.category.syntax_error',
+  permission_error: 'studio.validation.category.permission_error',
+  timeout: 'studio.validation.category.timeout',
+  datasource_error: 'studio.validation.category.datasource_error',
 };
 
 const BLOCKING_CATEGORIES = new Set<ValidationCategory>([
@@ -88,6 +89,7 @@ function makeScopeKey(dsUid: string, labelName: string, labelValue: string): str
 }
 
 export const StudioPage: React.FC = () => {
+  const { t } = useStudioTranslation();
   const currentOrgId = config.bootData?.user?.orgId ?? 1;
 
   const [publicCfg, setPublicCfg] = useState<PublicConfig | null>(null);
@@ -104,9 +106,7 @@ export const StudioPage: React.FC = () => {
   const [loadingCatalog, setLoadingCatalog] = useState(false);
 
   // Studio conversation & job state.
-  const [promptText, setPromptText] = useState(
-    '選択したサービスのリクエスト数、5xxエラー率、p95レイテンシを見たい'
-  );
+  const [promptText, setPromptText] = useState(() => t('studio.prompt.defaultText'));
   const [editPanelId, setEditPanelId] = useState<string>('');
   const [job, setJob] = useState<JobSnapshot | null>(null);
   const [busyState, setBusyState] = useState<
@@ -122,7 +122,9 @@ export const StudioPage: React.FC = () => {
   const [rightTab, setRightTab] = useState<'preview' | 'ir' | 'foundation'>('preview');
 
   // Create-only save state.
-  const [folders, setFolders] = useState<GrafanaFolderOption[]>([{ uid: '', title: 'General (Root)' }]);
+  const [folders, setFolders] = useState<GrafanaFolderOption[]>(() => [
+    { uid: '', title: t('save.folder.generalRoot') },
+  ]);
   const [selectedFolderUid, setSelectedFolderUid] = useState<string>('');
   const [savedResult, setSavedResult] = useState<SaveDashboardResult | null>(null);
 
@@ -193,11 +195,7 @@ export const StudioPage: React.FC = () => {
         setSelectedDsUid(filtered.length > 0 ? filtered[0].uid : '');
       } catch (err: unknown) {
         if (active && !initController.signal.aborted) {
-          setUiError(
-            `初期化に失敗しました（App Config で許可データソースと LLM モードを確認してください）: ${extractApiError(
-              err
-            )}`
-          );
+          setUiError(t('studio.errors.initFailed', { error: extractApiError(err) }));
         }
         return;
       }
@@ -210,7 +208,7 @@ export const StudioPage: React.FC = () => {
         }
       } catch {
         if (active) {
-          setFolders([{ uid: '', title: 'General (Root)' }]);
+          setFolders([{ uid: '', title: t('save.folder.generalRoot') }]);
         }
       }
     })();
@@ -267,14 +265,14 @@ export const StudioPage: React.FC = () => {
       }
     } catch (err: unknown) {
       if (!controller.signal.aborted && seq === contextSeqRef.current) {
-        setUiError(`スコープ値取得エラー: ${extractApiError(err)}`);
+        setUiError(t('studio.errors.scopeValuesFailed', { error: extractApiError(err) }));
       }
     }
   };
 
   const handleLoadScopedCatalog = async () => {
     if (!selectedDsUid || !scopeLabelValue.trim()) {
-      setUiError('データソースと対象スコープ値（例: checkout-api）を指定してください。');
+      setUiError(t('studio.errors.scopeRequired'));
       return;
     }
     metadataAbortRef.current?.abort();
@@ -299,7 +297,7 @@ export const StudioPage: React.FC = () => {
       setCatalogTruncated(res.truncated);
     } catch (err: unknown) {
       if (!controller.signal.aborted && seq === contextSeqRef.current) {
-        setUiError(`メタデータ取得エラー: ${extractApiError(err)}`);
+        setUiError(t('studio.errors.metadataFailed', { error: extractApiError(err) }));
       }
     } finally {
       if (metadataAbortRef.current === controller && seq === contextSeqRef.current) {
@@ -310,13 +308,11 @@ export const StudioPage: React.FC = () => {
 
   const handleGenerateOrPatch = async () => {
     if (!selectedDsUid) {
-      setUiError('許可された Prometheus データソースを選択してください。');
+      setUiError(t('studio.errors.datasourceRequired'));
       return;
     }
     if (!isCatalogFresh) {
-      setUiError(
-        '現在のスコープに対応するメトリクス候補を取得してください（「スコープのメトリクスを取得」を実行）。'
-      );
+      setUiError(t('studio.errors.catalogRequired'));
       return;
     }
 
@@ -522,9 +518,7 @@ export const StudioPage: React.FC = () => {
         setPreviewSpec(null);
         setPreviewScene(null);
         setPreviewMeta(null);
-        setUiError(
-          'Dry-Run 検証でエラー（構文エラー・権限エラー・タイムアウト等）が検出されたため、Scenes プレビューと保存をブロックしました。'
-        );
+        setUiError(t('studio.errors.validationBlocked'));
         return;
       }
 
@@ -535,7 +529,7 @@ export const StudioPage: React.FC = () => {
       setRightTab('preview');
     } catch (err: unknown) {
       if (!controller.signal.aborted && seq === contextSeqRef.current) {
-        setUiError(`検証・プレビューに失敗しました: ${extractApiError(err)}`);
+        setUiError(t('studio.errors.validationFailed', { error: extractApiError(err) }));
       }
     } finally {
       if (abortRef.current === controller && seq === contextSeqRef.current) {
@@ -611,15 +605,15 @@ export const StudioPage: React.FC = () => {
 
   const handleSaveNewDashboard = async () => {
     if (!job?.currentIR || !selectedDatasource || !previewSpec || !previewMeta) {
-      setUiError('保存前に「検証・プレビューを実行」して最新ドラフトを確認してください。');
+      setUiError(t('studio.errors.previewRequiredBeforeSave'));
       return;
     }
     if (previewMeta.jobId !== job.jobId || previewMeta.revision !== job.currentIR.revision) {
-      setUiError('最新ドラフトが未検証です。先に「検証・プレビューを実行」を完了してください。');
+      setUiError(t('studio.errors.latestDraftUnvalidated'));
       return;
     }
     if (hasBlockingValidationErrors) {
-      setUiError('検証エラーが残っているドラフトは保存できません。');
+      setUiError(t('studio.errors.validationErrorsRemain'));
       return;
     }
 
@@ -673,7 +667,7 @@ export const StudioPage: React.FC = () => {
       a.click();
       URL.revokeObjectURL(url);
     } catch (err: unknown) {
-      setUiError(`JSON エクスポートに失敗しました: ${extractApiError(err)}`);
+      setUiError(t('studio.errors.exportFailed', { error: extractApiError(err) }));
     }
   };
 
@@ -712,15 +706,15 @@ export const StudioPage: React.FC = () => {
     <div data-testid="studio-page" style={{ display: 'flex', flexDirection: 'column', gap: 12, padding: 16 }}>
       {publicCfg?.mockBanner && (
         <div data-testid="studio-mock-banner">
-          <Alert title="開発・テスト用モックLLMモード" severity="warning">
-            現在 llmMode=mock で動作しています。本番利用時は App Config で grafana-llm-app モードへ切り替えてください。
+          <Alert title={t('studio.mockBanner.title')} severity="warning">
+            {t('studio.mockBanner.body')}
           </Alert>
         </div>
       )}
 
       {uiError && (
         <div data-testid="studio-error-alert">
-          <Alert title="エラー" severity="error" onRemove={() => setUiError(null)}>
+          <Alert title={t('studio.alert.errorTitle')} severity="error" onRemove={() => setUiError(null)}>
             {uiError}
           </Alert>
         </div>
@@ -728,10 +722,12 @@ export const StudioPage: React.FC = () => {
 
       {savedResult && (
         <div data-testid="studio-saved-alert">
-          <Alert title="ダッシュボードを新規保存しました" severity="success">
-            UID: <code data-testid="studio-saved-uid">{savedResult.uid}</code> (rev {savedResult.revision}) —{' '}
+          <Alert title={t('studio.savedAlert.title')} severity="success">
+            {t('studio.savedAlert.uidPrefix')}{' '}
+            <code data-testid="studio-saved-uid">{savedResult.uid}</code>{' '}
+            {t('studio.savedAlert.revision', { revision: savedResult.revision })} —{' '}
             <a href={savedResult.url} target="_blank" rel="noreferrer">
-              保存したダッシュボードを開いてクエリ・単位・閾値・配置を確認
+              {t('studio.savedAlert.openLink')}
             </a>
           </Alert>
         </div>
@@ -740,19 +736,19 @@ export const StudioPage: React.FC = () => {
       <div style={{ display: 'grid', gridTemplateColumns: '420px 1fr', gap: 16, alignItems: 'start' }}>
         {/* Left Pane: Scope, Chat, Status, Diff, Validation, Save/Export */}
         <div style={{ display: 'flex', flexDirection: 'column', gap: 12, border: '1px solid #2c3235', borderRadius: 6, padding: 12 }}>
-          <h4 style={{ margin: 0 }}>LLM Dashboard Studio (MVP)</h4>
+          <h4 style={{ margin: 0 }}>{t('studio.title')}</h4>
 
-          <Field label="許可済み Prometheus データソース">
+          <Field label={t('studio.datasource.label')}>
             <Select
               options={allowedDatasources.map((d) => ({ label: `${d.name} (${d.uid})`, value: d.uid }))}
               value={selectedDsUid}
               onChange={(v) => setSelectedDsUid(v.value ?? '')}
-              placeholder="データソースを選択"
+              placeholder={t('studio.datasource.placeholder')}
             />
           </Field>
 
           <div style={{ display: 'grid', gridTemplateColumns: '120px 1fr', gap: 8 }}>
-            <Field label="スコープラベル">
+            <Field label={t('studio.scope.labelName')}>
               <Select
                 options={[
                   { label: 'service', value: 'service' },
@@ -763,18 +759,18 @@ export const StudioPage: React.FC = () => {
                 onChange={(v) => setScopeLabelName(v.value ?? 'service')}
               />
             </Field>
-            <Field label="対象サービス / ジョブ値">
+            <Field label={t('studio.scope.labelValue')}>
               <Input
                 value={scopeLabelValue}
                 onChange={(e) => setScopeLabelValue(e.currentTarget.value)}
-                placeholder="checkout-api"
+                placeholder={t('studio.scope.placeholder')}
               />
             </Field>
           </div>
 
           <div style={{ display: 'flex', gap: 8 }}>
             <Button size="sm" variant="secondary" onClick={handleLoadScopeValues} disabled={!selectedDsUid}>
-              値候補を取得
+              {t('studio.scope.fetchValues')}
             </Button>
             <Button
               size="sm"
@@ -782,7 +778,7 @@ export const StudioPage: React.FC = () => {
               onClick={handleLoadScopedCatalog}
               disabled={!selectedDsUid || !scopeLabelValue.trim() || loadingCatalog}
             >
-              {loadingCatalog ? '取得中...' : 'スコープのメトリクスを取得'}
+              {loadingCatalog ? t('studio.catalog.fetching') : t('studio.catalog.fetch')}
             </Button>
           </div>
 
@@ -791,27 +787,28 @@ export const StudioPage: React.FC = () => {
               options={scopeLabelValues.map((v) => ({ label: v, value: v }))}
               value={scopeLabelValue}
               onChange={(v) => setScopeLabelValue(v.value ?? '')}
-              placeholder="候補から選択"
+              placeholder={t('studio.scope.selectValuePlaceholder')}
             />
           )}
 
           <div style={{ fontSize: 12, color: '#9fa7b3' }}>
-            読込済みメトリクス候補（ブラウザメモリのみ）:{' '}
-            <strong data-testid="studio-catalog-count">{catalog.length}</strong> 件
-            {catalogTruncated ? '（上限で打ち切り）' : ''}
-            {catalog.length > 0 && !isCatalogFresh ? '（スコープ変更済み・再取得が必要）' : ''}
+            {t('studio.catalog.loadedPrefix')}{' '}
+            <strong data-testid="studio-catalog-count">{catalog.length}</strong>{' '}
+            {t('studio.catalog.loadedUnit')}
+            {catalogTruncated ? ` ${t('studio.catalog.truncatedSuffix')}` : ''}
+            {catalog.length > 0 && !isCatalogFresh ? ` ${t('studio.catalog.staleSuffix')}` : ''}
           </div>
 
           {job?.currentIR && (
-            <Field label="編集モード / 対象パネル">
+            <Field label={t('studio.edit.label')}>
               <Select
                 options={[
-                  { label: '既存ドラフトを部分修正（自動判定）', value: '' },
+                  { label: t('studio.edit.autoPatch'), value: '' },
                   ...job.currentIR.panels.map((p) => ({
-                    label: `部分修正: ${p.title} (${p.id})`,
+                    label: t('studio.edit.panelPatch', { title: p.title, id: p.id }),
                     value: p.id,
                   })),
-                  { label: '新規ドラフトとして最初から生成', value: '__new__' },
+                  { label: t('studio.edit.newDraft'), value: '__new__' },
                 ]}
                 value={editPanelId}
                 onChange={(v) => setEditPanelId(v.value ?? '')}
@@ -819,12 +816,12 @@ export const StudioPage: React.FC = () => {
             </Field>
           )}
 
-          <Field label="作成・修正したい内容">
+          <Field label={t('studio.prompt.label')}>
             <TextArea
               rows={3}
               value={promptText}
               onChange={(e) => setPromptText(e.currentTarget.value)}
-              placeholder="例: エラー率のパネルだけ timeseries に変更して"
+              placeholder={t('studio.prompt.placeholder')}
             />
           </Field>
 
@@ -834,19 +831,19 @@ export const StudioPage: React.FC = () => {
               disabled={busyState !== 'idle' || !isCatalogFresh}
             >
               {busyState === 'generating' || busyState === 'patching'
-                ? '生成中...'
+                ? t('studio.actions.generating')
                 : job?.currentIR && editPanelId !== '__new__'
-                ? '部分修正を適用'
-                : 'ダッシュボード案を生成'}
+                ? t('studio.actions.applyPatch')
+                : t('studio.actions.generateDraft')}
             </Button>
             {canCancel && (
               <Button variant="destructive" size="sm" onClick={handleCancel}>
-                キャンセル
+                {t('studio.actions.cancel')}
               </Button>
             )}
             {job?.canUndo && busyState === 'idle' && (
               <Button variant="secondary" size="sm" onClick={handleUndo}>
-                取り消し (Undo)
+                {t('studio.actions.undo')}
               </Button>
             )}
           </div>
@@ -858,23 +855,24 @@ export const StudioPage: React.FC = () => {
             >
               <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
                 <span>
-                  状態: <Badge text={job.status} color={job.status === 'failed' ? 'red' : 'blue'} />
+                  {t('studio.job.statusLabel')}{' '}
+                  <Badge text={job.status} color={job.status === 'failed' ? 'red' : 'blue'} />
                 </span>
                 {job.currentIR && (
                   <span data-testid="studio-job-revision" style={{ fontSize: 12 }}>
-                    rev {job.currentIR.revision}
+                    {t('studio.job.revision', { revision: job.currentIR.revision })}
                   </span>
                 )}
               </div>
               {job.summary && <div style={{ fontSize: 13 }}>{job.summary}</div>}
               {job.errorMessage && (
-                <Alert title="生成・検査メッセージ" severity="warning">
+                <Alert title={t('studio.job.messageTitle')} severity="warning">
                   {job.errorMessage}
                 </Alert>
               )}
               {job.lastDiff && job.lastDiff.length > 0 && (
                 <div data-testid="studio-job-diff" style={{ fontSize: 12 }}>
-                  <strong>変更内容 (Diff):</strong>
+                  <strong>{t('studio.job.diffTitle')}</strong>
                   <ul style={{ margin: '4px 0', paddingLeft: 18 }}>
                     {job.lastDiff.map((d, i) => (
                       <li key={i}>
@@ -886,7 +884,10 @@ export const StudioPage: React.FC = () => {
                 </div>
               )}
               <div style={{ fontSize: 12, color: '#9fa7b3' }}>
-                修復予算: {job.repairAttemptsUsed} / {job.maxRepairAttempts} 回使用
+                {t('studio.job.repairBudget', {
+                  used: job.repairAttemptsUsed,
+                  max: job.maxRepairAttempts,
+                })}
               </div>
             </div>
           )}
@@ -896,7 +897,7 @@ export const StudioPage: React.FC = () => {
               data-testid="studio-validation-results"
               style={{ borderTop: '1px solid #2c3235', paddingTop: 10, display: 'flex', flexDirection: 'column', gap: 6 }}
             >
-              <strong>検証結果（Dry-Run: 直近5m / maxDataPoints=10）</strong>
+              <strong>{t('studio.validation.heading')}</strong>
               {validationResults.map((r) => (
                 <div
                   key={r.panelId}
@@ -905,7 +906,7 @@ export const StudioPage: React.FC = () => {
                 >
                   <div style={{ display: 'flex', justifyContent: 'space-between' }}>
                     <code>{r.panelId}</code>
-                    <Badge text={VALIDATION_LABEL[r.category]} color={VALIDATION_BADGE_COLOR[r.category]} />
+                    <Badge text={t(VALIDATION_LABEL_KEYS[r.category])} color={VALIDATION_BADGE_COLOR[r.category]} />
                   </div>
                   {r.errorText && <div style={{ color: '#ff7383' }}>{r.errorText}</div>}
                 </div>
@@ -919,7 +920,9 @@ export const StudioPage: React.FC = () => {
                     onClick={handleRepairSyntaxErrors}
                     disabled={busyState !== 'idle'}
                   >
-                    {busyState === 'repairing' ? '修復中...' : '構文エラーのみ自動修復'}
+                    {busyState === 'repairing'
+                      ? t('studio.validation.repairing')
+                      : t('studio.validation.repairSyntaxOnly')}
                   </Button>
                 )}
             </div>
@@ -927,24 +930,29 @@ export const StudioPage: React.FC = () => {
 
           {job?.currentIR && (
             <div style={{ borderTop: '1px solid #2c3235', paddingTop: 10, display: 'flex', flexDirection: 'column', gap: 8 }}>
-              <Field label="保存先フォルダ（新規作成のみ）">
+              <Field label={t('studio.save.folderLabel')}>
                 <Select
-                  options={folders.map((f) => ({ label: f.title, value: f.uid }))}
+                  options={folders.map((f) => ({
+                    label: f.uid === '' ? t('save.folder.generalRoot') : f.title,
+                    value: f.uid,
+                  }))}
                   value={selectedFolderUid}
                   onChange={(v) => setSelectedFolderUid(v.value ?? '')}
                 />
               </Field>
               <div style={{ display: 'flex', gap: 8 }}>
                 <Button onClick={handleSaveNewDashboard} disabled={!canSave}>
-                  {busyState === 'saving' ? '保存中...' : '新規ダッシュボード保存'}
+                  {busyState === 'saving'
+                    ? t('studio.save.saving')
+                    : t('studio.save.saveNewDashboard')}
                 </Button>
                 <Button variant="secondary" onClick={handleExportJson} disabled={busyState !== 'idle'}>
-                  JSONエクスポート
+                  {t('studio.save.exportJson')}
                 </Button>
               </div>
               {!canSave && job.currentIR && (
                 <div style={{ fontSize: 12, color: '#9fa7b3' }}>
-                  最新リビジョン (rev {job.currentIR.revision}) の「検証・プレビューを実行」がエラーなしで完了すると保存できます。
+                  {t('studio.save.requiresValidationHint', { revision: job.currentIR.revision })}
                 </div>
               )}
             </div>
@@ -960,21 +968,21 @@ export const StudioPage: React.FC = () => {
                 variant={rightTab === 'preview' ? 'primary' : 'secondary'}
                 onClick={() => setRightTab('preview')}
               >
-                Scenes プレビュー
+                {t('studio.rightPane.tabPreview')}
               </Button>
               <Button
                 size="sm"
                 variant={rightTab === 'ir' ? 'primary' : 'secondary'}
                 onClick={() => setRightTab('ir')}
               >
-                IR JSON
+                {t('studio.rightPane.tabIr')}
               </Button>
               <Button
                 size="sm"
                 variant={rightTab === 'foundation' ? 'primary' : 'secondary'}
                 onClick={() => setRightTab('foundation')}
               >
-                Foundation SDK JSON
+                {t('studio.rightPane.tabFoundation')}
               </Button>
             </div>
 
@@ -985,10 +993,10 @@ export const StudioPage: React.FC = () => {
             >
               {busyState === 'validating' ? (
                 <>
-                  <Spinner inline /> 検証中...
+                  <Spinner inline /> {t('studio.rightPane.validating')}
                 </>
               ) : (
-                '検証・プレビューを実行'
+                t('studio.rightPane.validateAndPreview')
               )}
             </Button>
           </div>
@@ -1003,8 +1011,8 @@ export const StudioPage: React.FC = () => {
             ) : (
               <div style={{ padding: 32, textAlign: 'center', color: '#9fa7b3' }}>
                 {job?.currentIR
-                  ? `ドラフト rev ${job.currentIR.revision} の IR 検査が完了しています。「検証・プレビューを実行」を押すとクエリ検証と Scenes 描画を行います（自動更新は無効です）。`
-                  : '左ペインでデータソースとスコープのメトリクスを読み込み、ダッシュボード案を生成してください。'}
+                  ? t('studio.rightPane.draftReadyHint', { revision: job.currentIR.revision })
+                  : t('studio.rightPane.emptyHint')}
               </div>
             )}
           </div>
@@ -1014,7 +1022,7 @@ export const StudioPage: React.FC = () => {
               data-testid="studio-ir-json"
               style={{ margin: 0, padding: 12, background: '#111217', borderRadius: 4, overflow: 'auto', maxHeight: 520, fontSize: 12 }}
             >
-              {job?.currentIR ? JSON.stringify(job.currentIR, null, 2) : '// まだ IR が生成されていません'}
+              {job?.currentIR ? JSON.stringify(job.currentIR, null, 2) : t('studio.rightPane.noIrYet')}
             </pre>
           )}
 
@@ -1023,7 +1031,7 @@ export const StudioPage: React.FC = () => {
               data-testid="studio-foundation-json"
               style={{ margin: 0, padding: 12, background: '#111217', borderRadius: 4, overflow: 'auto', maxHeight: 520, fontSize: 12 }}
             >
-              {foundationJsonPreview || '// まだ Foundation SDK 出力がありません'}
+              {foundationJsonPreview || t('studio.rightPane.noFoundationYet')}
             </pre>
           )}
         </div>

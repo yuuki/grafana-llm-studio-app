@@ -217,4 +217,42 @@ describe('Dry-run validation concurrency and error classification', () => {
     });
     expect(budgeted.map((m) => m.name)).toEqual(['http_requests_total']);
   });
+
+  test('localizes dry-run query timeout messages across en and ja locales', async () => {
+    const { DEFAULT_LOCALE, setStudioLocale } = await import('../i18n');
+    mockFetch.mockImplementation(() => new Observable(() => {}));
+
+    const irDoc: DashboardIR = {
+      schemaVersion: '1.0',
+      revision: 1,
+      title: 'Timeout Test',
+      timeRange: { from: 'now-15m', to: 'now' },
+      panels: [
+        {
+          id: 'panel-slow',
+          type: 'stat',
+          title: 'Slow',
+          datasourceRef: 'selected_prometheus',
+          query: { expr: 'up' },
+          unit: 'short',
+          layout: { row: 0, col: 0, width: 'full' },
+        },
+      ],
+    };
+    const spec = normalizeDashboardIR(irDoc, { uid: 'prom-main', type: 'prometheus' });
+
+    try {
+      await setStudioLocale('en');
+      const enRes = await runDryRunValidation(spec, { maxConcurrency: 1, timeoutMs: 1000 });
+      expect(enRes[0].category).toBe('timeout');
+      expect(enRes[0].errorText).toBe('Validation query timed out (1s)');
+
+      await setStudioLocale('ja-JP');
+      const jaRes = await runDryRunValidation(spec, { maxConcurrency: 1, timeoutMs: 1000 });
+      expect(jaRes[0].category).toBe('timeout');
+      expect(jaRes[0].errorText).toBe('検証クエリがタイムアウトしました (1s)');
+    } finally {
+      await setStudioLocale(DEFAULT_LOCALE);
+    }
+  });
 });

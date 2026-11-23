@@ -1,7 +1,8 @@
 import React from 'react';
-import { fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { act, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { of } from 'rxjs';
 import { AppPluginMeta } from '@grafana/data';
+import { DEFAULT_LOCALE, setStudioLocale, SUPPORTED_LOCALES, t } from '../../i18n';
 import { AppConfig, StudioJsonData } from './AppConfig';
 
 const mockFetch = jest.fn();
@@ -116,86 +117,124 @@ function makePlugin(
   };
 }
 
-describe('AppConfig settings preservation, secret reset, and validation', () => {
-  beforeEach(() => {
-    mockFetch.mockReset();
-    mockFetch.mockReturnValue(of({ data: {} }));
-  });
-
-  test('preserves existing jsonData fields and sends empty secureJsonData string on SecretInput reset (H-11)', async () => {
-    const plugin = makePlugin(
-      {
-        allowedDatasourceUids: ['prom-main'],
-        llmMode: 'grafana-llm-app',
-        jobDeadlineSeconds: 120,
-        maxConcurrentJobs: 6,
-        customProvisionedKey: 'keep-me',
-      },
-      { llmServiceAccountToken: true }
-    );
-
-    render(<AppConfig plugin={plugin as never} query={{}} />);
-
-    // Reset the configured secret token without entering a replacement.
-    fireEvent.click(screen.getByText('Reset Secret'));
-    fireEvent.click(screen.getByText('設定を保存'));
-
-    await waitFor(() => expect(mockFetch).toHaveBeenCalledTimes(1));
-    const req = mockFetch.mock.calls[0][0];
-    expect(req.url).toBe('/api/plugins/yuuki-llmstudio-app/settings');
-    expect(req.data.jsonData.jobDeadlineSeconds).toBe(120);
-    expect(req.data.jsonData.maxConcurrentJobs).toBe(6);
-    expect(req.data.jsonData.customProvisionedKey).toBe('keep-me');
-    expect(req.data.secureJsonData).toEqual({ llmServiceAccountToken: '' });
-  });
-
-  test('rejects saving llmMode=mock without allowMockInDev and normalizes allowMockInDev=false outside mock (M-13)', async () => {
-    const plugin = makePlugin({
-      allowedDatasourceUids: ['prom-main'],
-      llmMode: 'mock',
-      allowMockInDev: false,
+describe.each(SUPPORTED_LOCALES)(
+  'AppConfig settings preservation, secret reset, and validation (locale: %s)',
+  (locale) => {
+    beforeEach(async () => {
+      await setStudioLocale(locale);
+      mockFetch.mockReset();
+      mockFetch.mockReturnValue(of({ data: {} }));
     });
 
-    render(<AppConfig plugin={plugin as never} query={{}} />);
+    afterAll(async () => {
+      await setStudioLocale(DEFAULT_LOCALE);
+    });
 
-    // Attempting to save mock without allowMockInDev MUST fail client-side before fetch.
-    fireEvent.click(screen.getByText('設定を保存'));
-    await waitFor(() =>
-      expect(screen.getByText(/allowMockInDev を明示的に有効化してください/)).toBeTruthy()
-    );
-    expect(mockFetch).not.toHaveBeenCalled();
+    test('preserves existing jsonData fields and sends empty secureJsonData string on SecretInput reset (H-11)', async () => {
+      const plugin = makePlugin(
+        {
+          allowedDatasourceUids: ['prom-main'],
+          llmMode: 'grafana-llm-app',
+          jobDeadlineSeconds: 120,
+          maxConcurrentJobs: 6,
+          customProvisionedKey: 'keep-me',
+        },
+        { llmServiceAccountToken: true }
+      );
 
-    // Enable allowMockInDev, then switch back to grafana-llm-app -> saved payload MUST normalize allowMockInDev: false.
-    fireEvent.click(screen.getByRole('checkbox'));
-    const modeSelect = screen.getAllByRole('combobox')[0];
-    fireEvent.change(modeSelect, { target: { value: 'grafana-llm-app' } });
+      render(<AppConfig plugin={plugin as never} query={{}} />);
 
-    fireEvent.click(screen.getByText('設定を保存'));
-    await waitFor(() => expect(mockFetch).toHaveBeenCalledTimes(1));
-    expect(mockFetch.mock.calls[0][0].data.jsonData.llmMode).toBe('grafana-llm-app');
-    expect(mockFetch.mock.calls[0][0].data.jsonData.allowMockInDev).toBe(false);
-    expect(mockFetch.mock.calls[0][0].data.jsonData.structuredOutputMode).toBe('json_schema');
-    expect(mockFetch.mock.calls[0][0].data.jsonData.tokenLimitField).toBe('max_completion_tokens');
-    expect(mockFetch.mock.calls[0][0].data.jsonData.reasoningEffort).toBe('');
+      // Reset the configured secret token without entering a replacement.
+      fireEvent.click(screen.getByText('Reset Secret'));
+      fireEvent.click(screen.getByText(t('appConfig.actions.save')));
+
+      await waitFor(() => expect(mockFetch).toHaveBeenCalledTimes(1));
+      const req = mockFetch.mock.calls[0][0];
+      expect(req.url).toBe('/api/plugins/yuuki-llmstudio-app/settings');
+      expect(req.data.jsonData.jobDeadlineSeconds).toBe(120);
+      expect(req.data.jsonData.maxConcurrentJobs).toBe(6);
+      expect(req.data.jsonData.customProvisionedKey).toBe('keep-me');
+      expect(req.data.secureJsonData).toEqual({ llmServiceAccountToken: '' });
+    });
+
+    test('rejects saving llmMode=mock without allowMockInDev and normalizes allowMockInDev=false outside mock (M-13)', async () => {
+      const plugin = makePlugin({
+        allowedDatasourceUids: ['prom-main'],
+        llmMode: 'mock',
+        allowMockInDev: false,
+      });
+
+      render(<AppConfig plugin={plugin as never} query={{}} />);
+
+      // Attempting to save mock without allowMockInDev MUST fail client-side before fetch.
+      fireEvent.click(screen.getByText(t('appConfig.actions.save')));
+      await waitFor(() =>
+        expect(screen.getByText(t('appConfig.validation.allowMockRequired'))).toBeTruthy()
+      );
+      expect(mockFetch).not.toHaveBeenCalled();
+
+      // Enable allowMockInDev, then switch back to grafana-llm-app -> saved payload MUST normalize allowMockInDev: false.
+      fireEvent.click(screen.getByRole('checkbox'));
+      const modeSelect = screen.getAllByRole('combobox')[0];
+      fireEvent.change(modeSelect, { target: { value: 'grafana-llm-app' } });
+
+      fireEvent.click(screen.getByText(t('appConfig.actions.save')));
+      await waitFor(() => expect(mockFetch).toHaveBeenCalledTimes(1));
+      expect(mockFetch.mock.calls[0][0].data.jsonData.llmMode).toBe('grafana-llm-app');
+      expect(mockFetch.mock.calls[0][0].data.jsonData.allowMockInDev).toBe(false);
+      expect(mockFetch.mock.calls[0][0].data.jsonData.structuredOutputMode).toBe('json_schema');
+      expect(mockFetch.mock.calls[0][0].data.jsonData.tokenLimitField).toBe('max_completion_tokens');
+      expect(mockFetch.mock.calls[0][0].data.jsonData.reasoningEffort).toBe('');
+    });
+
+    test('allows configuring json_object, max_tokens, and reasoningEffort for third-party OpenAI-compatible APIs', async () => {
+      const plugin = makePlugin({
+        allowedDatasourceUids: ['prom-main'],
+        llmMode: 'grafana-llm-app',
+      });
+
+      render(<AppConfig plugin={plugin as never} query={{}} />);
+      const selects = screen.getAllByRole('combobox');
+      // Selects: [0]=llmMode, [1]=modelTier, [2]=structuredOutputMode, [3]=tokenLimitField, [4]=reasoningEffort
+      fireEvent.change(selects[2], { target: { value: 'json_object' } });
+      fireEvent.change(selects[3], { target: { value: 'max_tokens' } });
+      fireEvent.change(selects[4], { target: { value: 'low' } });
+
+      fireEvent.click(screen.getByText(t('appConfig.actions.save')));
+      await waitFor(() => expect(mockFetch).toHaveBeenCalledTimes(1));
+      expect(mockFetch.mock.calls[0][0].data.jsonData.structuredOutputMode).toBe('json_object');
+      expect(mockFetch.mock.calls[0][0].data.jsonData.tokenLimitField).toBe('max_tokens');
+      expect(mockFetch.mock.calls[0][0].data.jsonData.reasoningEffort).toBe('low');
+    });
+  }
+);
+
+describe('AppConfig reactive locale switching', () => {
+  beforeEach(async () => {
+    await setStudioLocale(DEFAULT_LOCALE);
   });
 
-  test('allows configuring json_object, max_tokens, and reasoningEffort for third-party OpenAI-compatible APIs', async () => {
+  afterEach(async () => {
+    await act(async () => {
+      await setStudioLocale(DEFAULT_LOCALE);
+    });
+  });
+
+  test('renders English by default and re-renders in Japanese when shared i18next switches to ja-JP', async () => {
     const plugin = makePlugin({
       allowedDatasourceUids: ['prom-main'],
       llmMode: 'grafana-llm-app',
     });
 
     render(<AppConfig plugin={plugin as never} query={{}} />);
-    const selects = screen.getAllByRole('combobox');
-    // Selects: [0]=llmMode, [1]=modelTier, [2]=structuredOutputMode, [3]=tokenLimitField, [4]=reasoningEffort
-    fireEvent.change(selects[2], { target: { value: 'json_object' } });
-    fireEvent.change(selects[3], { target: { value: 'max_tokens' } });
-    fireEvent.change(selects[4], { target: { value: 'low' } });
+    expect(screen.getByText('Permissions & Security Policy')).toBeTruthy();
+    expect(screen.getByText('Save settings')).toBeTruthy();
 
-    fireEvent.click(screen.getByText('設定を保存'));
-    await waitFor(() => expect(mockFetch).toHaveBeenCalledTimes(1));
-    expect(mockFetch.mock.calls[0][0].data.jsonData.structuredOutputMode).toBe('json_object');
-    expect(mockFetch.mock.calls[0][0].data.jsonData.tokenLimitField).toBe('max_tokens');
-    expect(mockFetch.mock.calls[0][0].data.jsonData.reasoningEffort).toBe('low');
+    await act(async () => {
+      await setStudioLocale('ja-JP');
+    });
+
+    expect(screen.getByText('権限とセキュリティ方針')).toBeTruthy();
+    expect(screen.getByText('設定を保存')).toBeTruthy();
   });
 });

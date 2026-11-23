@@ -1,5 +1,6 @@
 import { config, getBackendSrv } from '@grafana/runtime';
 import { lastValueFrom } from 'rxjs';
+import { t } from '../i18n';
 import { NormalizedDashboardSpec } from '../spec/normalize';
 import { buildFoundationDashboard } from '../spec/toFoundation';
 
@@ -86,7 +87,7 @@ interface FolderV1Beta1ListResponse {
  * Uses showErrorAlert: false so Viewer accounts without folders:read do not see spurious error toasts (M-10).
  */
 export async function listWritableFolders(): Promise<GrafanaFolderOption[]> {
-  const list: GrafanaFolderOption[] = [{ uid: '', title: 'General (Root)' }];
+  const list: GrafanaFolderOption[] = [{ uid: '', title: t('save.folder.generalRoot') }];
   try {
     const res = await lastValueFrom(
       getBackendSrv().fetch<Array<{ uid: string; title: string }>>({
@@ -153,14 +154,14 @@ export class DashboardSaver {
 
   async createNewDashboard(req: SaveDashboardRequest): Promise<SaveDashboardResult> {
     if (this.inFlight) {
-      throw new SaveDashboardError(
-        '保存処理がすでに進行中です。完了までお待ちください。',
-        'IN_FLIGHT'
-      );
+      throw new SaveDashboardError(t('save.errors.inFlight'), 'IN_FLIGHT');
     }
     if (req.spec.revision !== req.previewedRevision) {
       throw new SaveDashboardError(
-        `保存対象リビジョン (rev ${req.spec.revision}) が確認済みプレビュー (rev ${req.previewedRevision}) と一致しません。先に検証・プレビューを実行してください。`,
+        t('save.errors.revisionMismatch', {
+          targetRevision: req.spec.revision,
+          previewedRevision: req.previewedRevision,
+        }),
         'REVISION_MISMATCH'
       );
     }
@@ -213,22 +214,22 @@ export class DashboardSaver {
       const msg =
         (err as { data?: { message?: string }; message?: string })?.data?.message ||
         (err as { message?: string })?.message ||
-        'ダッシュボードの新規保存に失敗しました';
+        t('save.errors.defaultMessage');
 
       if (status === 401 || status === 403) {
         throw new SaveDashboardError(
-          `選択したフォルダへの保存権限がありません (HTTP ${status}): ${msg}`,
+          t('save.errors.permissionDenied', { status, message: msg }),
           'PERMISSION_DENIED'
         );
       }
       if (status === 409 || status === 412) {
         throw new SaveDashboardError(
-          `UID 衝突のため新規作成を中止しました。既存ダッシュボードは上書きされていません (HTTP ${status}): ${msg}`,
+          t('save.errors.uidConflict', { status, message: msg }),
           'UID_CONFLICT'
         );
       }
       throw new SaveDashboardError(
-        `ダッシュボード保存 API エラー (HTTP ${status ?? 'unknown'}): ${msg}`,
+        t('save.errors.apiError', { status: status ?? 'unknown', message: msg }),
         'API_ERROR'
       );
     } finally {
