@@ -1,5 +1,7 @@
 import { BackendSrvRequest, getBackendSrv } from '@grafana/runtime';
 import {
+  DashboardIR,
+  ImportSource,
   JobSnapshot,
   MetricCatalogItem,
   PanelValidationResult,
@@ -14,6 +16,14 @@ export interface GenerateJobRequest {
   scope?: ScopeFilter;
   userIntent: string;
   catalog: MetricCatalogItem[];
+}
+
+export interface ImportJobRequest {
+  datasourceUid: string;
+  scope?: ScopeFilter;
+  draft: DashboardIR;
+  importSource?: ImportSource;
+  catalog?: MetricCatalogItem[];
 }
 
 export interface PatchJobRequest {
@@ -121,6 +131,21 @@ export async function generateDraft(
   return fetchWithAbort<JobSnapshot>(
     {
       url: `${PLUGIN_RESOURCE_BASE}/jobs/generate`,
+      method: 'POST',
+      data: req,
+      showErrorAlert: false,
+    },
+    signal
+  );
+}
+
+export async function importDraft(
+  req: ImportJobRequest,
+  signal?: AbortSignal
+): Promise<JobSnapshot> {
+  return fetchWithAbort<JobSnapshot>(
+    {
+      url: `${PLUGIN_RESOURCE_BASE}/jobs/import`,
       method: 'POST',
       data: req,
       showErrorAlert: false,

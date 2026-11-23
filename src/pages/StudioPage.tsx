@@ -16,6 +16,7 @@ import {
   extractApiError,
   fetchPublicConfig,
   generateDraft,
+  importDraft,
   patchDraft,
   repairDraft,
   undoDraft,
@@ -24,7 +25,14 @@ import { selectMetricCandidates } from '../datasource/bm25';
 import { fetchScopedMetricCatalog, fetchScopeLabelValues } from '../datasource/metadata';
 import { runDryRunValidation } from '../datasource/validator';
 import {
-  computeQueryHash,
+  convertGrafanaDashboardToIR,
+  ExistingDashboardSummary,
+  fetchExistingDashboardByUid,
+  ImportConversionReport,
+  listExistingDashboards,
+} from '../import/importDashboard';
+import {
+  computePanelQueryHash,
   JobSnapshot,
   MetricCatalogItem,
   PanelValidationResult,
@@ -110,9 +118,15 @@ export const StudioPage: React.FC = () => {
   const [editPanelId, setEditPanelId] = useState<string>('');
   const [job, setJob] = useState<JobSnapshot | null>(null);
   const [busyState, setBusyState] = useState<
-    'idle' | 'generating' | 'patching' | 'validating' | 'repairing' | 'undoing' | 'saving'
+    'idle' | 'generating' | 'importing' | 'patching' | 'validating' | 'repairing' | 'undoing' | 'saving'
   >('idle');
   const [uiError, setUiError] = useState<string | null>(null);
+
+  // Optional safe import state.
+  const [showImportPanel, setShowImportPanel] = useState(false);
+  const [importUid, setImportUid] = useState('');
+  const [existingDashboards, setExistingDashboards] = useState<ExistingDashboardSummary[]>([]);
+  const [importReport, setImportReport] = useState<ImportConversionReport | null>(null);
 
   // Dry-run validation and explicit Scenes preview state bound to (jobId, revision).
   const [validationResults, setValidationResults] = useState<PanelValidationResult[]>([]);
@@ -121,9 +135,10 @@ export const StudioPage: React.FC = () => {
   const [previewMeta, setPreviewMeta] = useState<PreviewMeta | null>(null);
   const [rightTab, setRightTab] = useState<'preview' | 'ir' | 'foundation'>('preview');
 
-  // Create-only save state.
+  // Save state (create-only copy by default; opt-in revision-checked update for imported dashboards).
   const [folders, setFolders] = useState<GrafanaFolderOption[]>([{ uid: '', title: 'General (Root)' }]);
   const [selectedFolderUid, setSelectedFolderUid] = useState<string>('');
+  const [optInUpdateExisting, setOptInUpdateExisting] = useState(false);
   const [savedResult, setSavedResult] = useState<SaveDashboardResult | null>(null);
 
   const abortRef = useRef<AbortController | null>(null);
@@ -145,6 +160,8 @@ export const StudioPage: React.FC = () => {
     setScopeLabelValues([]);
     setScopeLabelValue('');
     setJob(null);
+    setImportReport(null);
+    setOptInUpdateExisting(false);
     setValidationResults([]);
     setPreviewSpec(null);
     setPreviewScene(null);
@@ -336,6 +353,8 @@ export const StudioPage: React.FC = () => {
       setPreviewScene(null);
       setPreviewMeta(null);
       setValidationResults([]);
+      setImportReport(null);
+      setOptInUpdateExisting(false);
     }
 
     const narrowedCatalog = selectMetricCandidates(catalog, promptText, {
@@ -386,6 +405,81 @@ export const StudioPage: React.FC = () => {
       }
       syncJobFromError(err);
       setUiError(extractApiError(err));
+    } finally {
+      if (abortRef.current === controller && seq === contextSeqRef.current) {
+        setBusyState('idle');
+      }
+    }
+  };
+
+  const handleListExistingDashboards = async () => {
+    setUiError(null);
+    try {
+      const list = await listExistingDashboards(50);
+      setExistingDashboards(list);
+      if (list.length > 0 && !importUid) {
+        setImportUid(list[0].uid);
+      }
+    } catch (err: unknown) {
+      setUiError(`ダッシュボード一覧取得エラー: ${extractApiError(err)}`);
+    }
+  };
+
+  const handleImportExistingDashboard = async () => {
+    if (!selectedDatasource || !importUid.trim() || busyState !== 'idle') {
+      return;
+    }
+    abortRef.current?.abort();
+    const controller = new AbortController();
+    abortRef.current = controller;
+    const seq = contextSeqRef.current;
+
+    setBusyState('importing');
+    setUiError(null);
+    setSavedResult(null);
+    setPreviewSpec(null);
+    setPreviewScene(null);
+    setPreviewMeta(null);
+    setValidationResults([]);
+    setOptInUpdateExisting(false);
+
+    try {
+      const fetched = await fetchExistingDashboardByUid(importUid.trim());
+      if (controller.signal.aborted || seq !== contextSeqRef.current) {
+        return;
+      }
+      const { draft, report } = convertGrafanaDashboardToIR(fetched.rawDashboard, {
+        selectedDatasourceUid: selectedDatasource.uid,
+        selectedDatasourceName: selectedDatasource.name,
+        maxPanels: publicCfg?.maxPanels ?? 6,
+      });
+      const scope: ScopeFilter | undefined =
+        isCatalogFresh && scopeLabelValue.trim()
+          ? { labelName: scopeLabelName, labelValue: scopeLabelValue.trim() }
+          : undefined;
+      const importedJob = await importDraft(
+        {
+          datasourceUid: selectedDatasource.uid,
+          scope,
+          draft,
+          importSource: fetched.source,
+          catalog: isCatalogFresh ? catalog.slice(0, 50) : undefined,
+        },
+        controller.signal
+      );
+      if (controller.signal.aborted || seq !== contextSeqRef.current) {
+        return;
+      }
+      setJob(importedJob);
+      setImportReport(report);
+      if (fetched.source.folderUid !== undefined) {
+        setSelectedFolderUid(fetched.source.folderUid);
+      }
+      reconcileEditPanelId(importedJob);
+    } catch (err: unknown) {
+      if (!controller.signal.aborted && seq === contextSeqRef.current) {
+        setUiError(`既存ダッシュボードのインポートに失敗しました: ${extractApiError(err)}`);
+      }
     } finally {
       if (abortRef.current === controller && seq === contextSeqRef.current) {
         setBusyState('idle');
@@ -485,7 +579,7 @@ export const StudioPage: React.FC = () => {
 
       const panelsNeedingValidation: string[] = [];
       for (const panel of normalized.panels) {
-        const expectedHash = await computeQueryHash(panel.target.expr);
+        const expectedHash = await computePanelQueryHash(panel.targets);
         const cached = prevByPanel.get(panel.id);
         const cachedClean =
           cached &&
@@ -609,7 +703,11 @@ export const StudioPage: React.FC = () => {
     }
   };
 
-  const handleSaveNewDashboard = async () => {
+  const canOptInUpdate = Boolean(
+    job?.importSource?.uid && job?.importSource?.resourceVersion
+  );
+
+  const handleSaveDashboard = async () => {
     if (!job?.currentIR || !selectedDatasource || !previewSpec || !previewMeta) {
       setUiError('保存前に「検証・プレビューを実行」して最新ドラフトを確認してください。');
       return;
@@ -634,13 +732,39 @@ export const StudioPage: React.FC = () => {
         selectedDatasource,
         publicCfg?.maxPanels ?? 6
       );
-      const res = await saverRef.current.createNewDashboard({
-        spec: currentSpec,
-        previewedRevision: previewMeta.revision,
-        folderUid: selectedFolderUid,
-      });
+      const useUpdate =
+        optInUpdateExisting &&
+        Boolean(job.importSource?.uid) &&
+        Boolean(job.importSource?.resourceVersion);
+
+      const res = useUpdate
+        ? await saverRef.current.updateExistingDashboard({
+            spec: currentSpec,
+            previewedRevision: previewMeta.revision,
+            targetUid: job.importSource!.uid,
+            expectedResourceVersion: job.importSource!.resourceVersion!,
+            folderUid: selectedFolderUid,
+          })
+        : await saverRef.current.createNewDashboard({
+            spec: currentSpec,
+            previewedRevision: previewMeta.revision,
+            folderUid: selectedFolderUid,
+          });
       if (seq === contextSeqRef.current) {
         setSavedResult(res);
+        if (useUpdate && res.resourceVersion) {
+          setJob((prev) =>
+            prev?.importSource
+              ? {
+                  ...prev,
+                  importSource: {
+                    ...prev.importSource,
+                    resourceVersion: res.resourceVersion,
+                  },
+                }
+              : prev
+          );
+        }
       }
     } catch (err: unknown) {
       if (seq === contextSeqRef.current) {
@@ -704,6 +828,7 @@ export const StudioPage: React.FC = () => {
 
   const canCancel =
     busyState === 'generating' ||
+    busyState === 'importing' ||
     busyState === 'patching' ||
     busyState === 'validating' ||
     busyState === 'repairing';
@@ -728,7 +853,14 @@ export const StudioPage: React.FC = () => {
 
       {savedResult && (
         <div data-testid="studio-saved-alert">
-          <Alert title="ダッシュボードを新規保存しました" severity="success">
+          <Alert
+            title={
+              savedResult.mode === 'updated'
+                ? '既存ダッシュボードを更新しました（revision 検証済み）'
+                : 'ダッシュボードを新規保存しました'
+            }
+            severity="success"
+          >
             UID: <code data-testid="studio-saved-uid">{savedResult.uid}</code> (rev {savedResult.revision}) —{' '}
             <a href={savedResult.url} target="_blank" rel="noreferrer">
               保存したダッシュボードを開いてクエリ・単位・閾値・配置を確認
@@ -738,7 +870,7 @@ export const StudioPage: React.FC = () => {
       )}
 
       <div style={{ display: 'grid', gridTemplateColumns: '420px 1fr', gap: 16, alignItems: 'start' }}>
-        {/* Left Pane: Scope, Chat, Status, Diff, Validation, Save/Export */}
+        {/* Left Pane: Scope, Optional Safe Import, Chat, Status, Diff, Validation, Save/Export */}
         <div style={{ display: 'flex', flexDirection: 'column', gap: 12, border: '1px solid #2c3235', borderRadius: 6, padding: 12 }}>
           <h4 style={{ margin: 0 }}>LLM Dashboard Studio (MVP)</h4>
 
@@ -801,6 +933,76 @@ export const StudioPage: React.FC = () => {
             {catalogTruncated ? '（上限で打ち切り）' : ''}
             {catalog.length > 0 && !isCatalogFresh ? '（スコープ変更済み・再取得が必要）' : ''}
           </div>
+
+          <div style={{ borderTop: '1px solid #2c3235', paddingTop: 8 }}>
+            <Button
+              size="sm"
+              variant="secondary"
+              onClick={() => setShowImportPanel((prev) => !prev)}
+              disabled={!selectedDsUid}
+            >
+              {showImportPanel ? '既存インポートを閉じる' : '既存ダッシュボードをインポート（任意）'}
+            </Button>
+            {showImportPanel && (
+              <div
+                data-testid="studio-import-section"
+                style={{ marginTop: 8, display: 'flex', flexDirection: 'column', gap: 8 }}
+              >
+                <Field label="既存ダッシュボード UID">
+                  <Input
+                    value={importUid}
+                    onChange={(e) => setImportUid(e.currentTarget.value)}
+                    placeholder="existing-dashboard-uid"
+                  />
+                </Field>
+                <div style={{ display: 'flex', gap: 8 }}>
+                  <Button
+                    size="sm"
+                    variant="secondary"
+                    onClick={handleListExistingDashboards}
+                    disabled={busyState !== 'idle'}
+                  >
+                    一覧取得
+                  </Button>
+                  <Button
+                    size="sm"
+                    variant="primary"
+                    onClick={handleImportExistingDashboard}
+                    disabled={!importUid.trim() || !selectedDatasource || busyState !== 'idle'}
+                  >
+                    {busyState === 'importing' ? 'インポート中...' : '安全な IR としてインポート'}
+                  </Button>
+                </div>
+                {existingDashboards.length > 0 && (
+                  <Select
+                    options={existingDashboards.map((d) => ({
+                      label: `${d.title} (${d.uid})`,
+                      value: d.uid,
+                    }))}
+                    value={importUid}
+                    onChange={(v) => setImportUid(v.value ?? '')}
+                    placeholder="既存ダッシュボードを選択"
+                  />
+                )}
+              </div>
+            )}
+          </div>
+
+          {importReport && (
+            <div
+              data-testid="studio-import-report"
+              style={{ fontSize: 12, border: '1px solid #2c3235', borderRadius: 4, padding: 8 }}
+            >
+              <strong>インポート結果:</strong> パネル {importReport.importedPanelCount} 件 / 変数{' '}
+              {importReport.importedVariableCount} 件
+              {importReport.skippedPanels.length > 0 && (
+                <div>スキップしたパネル: {importReport.skippedPanels.map((s) => `${s.title} (${s.reason})`).join(', ')}</div>
+              )}
+              {importReport.warnings.length > 0 && (
+                <div style={{ color: '#ff9830' }}>{importReport.warnings.join(' / ')}</div>
+              )}
+            </div>
+          )}
 
           {job?.currentIR && (
             <Field label="編集モード / 対象パネル">
@@ -866,6 +1068,12 @@ export const StudioPage: React.FC = () => {
                   </span>
                 )}
               </div>
+              {job.currentIR?.variables && job.currentIR.variables.length > 0 && (
+                <div data-testid="studio-ir-variables" style={{ fontSize: 12, color: '#9fa7b3' }}>
+                  変数:{' '}
+                  {job.currentIR.variables.map((v) => `$${v.name} (${v.type})`).join(', ')}
+                </div>
+              )}
               {job.summary && <div style={{ fontSize: 13 }}>{job.summary}</div>}
               {job.errorMessage && (
                 <Alert title="生成・検査メッセージ" severity="warning">
@@ -934,9 +1142,30 @@ export const StudioPage: React.FC = () => {
                   onChange={(v) => setSelectedFolderUid(v.value ?? '')}
                 />
               </Field>
+              {canOptInUpdate && (
+                <label
+                  data-testid="studio-optin-update-label"
+                  style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 12, cursor: 'pointer' }}
+                >
+                  <input
+                    data-testid="studio-optin-update-checkbox"
+                    type="checkbox"
+                    checked={optInUpdateExisting}
+                    onChange={(e) => setOptInUpdateExisting(e.currentTarget.checked)}
+                  />
+                  <span>
+                    インポート元 (<code>{job.importSource?.uid}</code>, rv=
+                    <code>{job.importSource?.resourceVersion}</code>) を revision 検証付きで更新（任意）
+                  </span>
+                </label>
+              )}
               <div style={{ display: 'flex', gap: 8 }}>
-                <Button onClick={handleSaveNewDashboard} disabled={!canSave}>
-                  {busyState === 'saving' ? '保存中...' : '新規ダッシュボード保存'}
+                <Button onClick={handleSaveDashboard} disabled={!canSave}>
+                  {busyState === 'saving'
+                    ? '保存中...'
+                    : optInUpdateExisting && canOptInUpdate
+                    ? '既存ダッシュボードを更新'
+                    : '新規ダッシュボード保存'}
                 </Button>
                 <Button variant="secondary" onClick={handleExportJson} disabled={busyState !== 'idle'}>
                   JSONエクスポート

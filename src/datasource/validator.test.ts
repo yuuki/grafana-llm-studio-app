@@ -217,4 +217,77 @@ describe('Dry-run validation concurrency and error classification', () => {
     });
     expect(budgeted.map((m) => m.name)).toEqual(['http_requests_total']);
   });
+
+  test('validates multi-query panels in one /api/ds/query request with variable interpolation and per-refId error surfacing', async () => {
+    mockFetch
+      .mockReturnValueOnce(
+        of({
+          data: {
+            results: {
+              A: { frames: [{ data: { values: [[1, 2], [0.1, 0.2]] } }] },
+              B: { frames: [{ data: { values: [[1, 2], [0.5, 0.6]] } }] },
+            },
+          },
+        })
+      )
+      .mockReturnValueOnce(
+        of({
+          data: {
+            results: {
+              A: { frames: [{ data: { values: [[1, 2], [0.1, 0.2]] } }] },
+              B: { status: 400, error: 'parse error: unexpected ")"' },
+            },
+          },
+        })
+      );
+
+    const multiVarIR: DashboardIR = {
+      schemaVersion: '1.1',
+      revision: 1,
+      title: 'Multi-query + Vars',
+      timeRange: { from: 'now-15m', to: 'now' },
+      variables: [
+        {
+          name: 'service',
+          type: 'query',
+          datasourceRef: 'selected_prometheus',
+          labelName: 'service',
+          defaultValue: 'checkout-api',
+        },
+      ],
+      panels: [
+        {
+          id: 'panel-lat',
+          type: 'timeseries',
+          title: 'Latency',
+          datasourceRef: 'selected_prometheus',
+          queries: [
+            { refId: 'A', expr: 'histogram_quantile(0.50, sum by (le) (rate(http_request_duration_seconds_bucket{service="$service"}[5m])))' },
+            { refId: 'B', expr: 'histogram_quantile(0.95, sum by (le) (rate(http_request_duration_seconds_bucket{service="$service"}[5m])))' },
+          ],
+          unit: 's',
+          layout: { row: 0, col: 0, width: 'full' },
+        },
+      ],
+    };
+
+    const spec = normalizeDashboardIR(multiVarIR, { uid: 'prom-main', type: 'prometheus' });
+    const okRes = await runDryRunValidation(spec, { maxConcurrency: 1 });
+    expect(okRes).toHaveLength(1);
+    expect(okRes[0].category).toBe('ok');
+    expect(okRes[0].seriesCount).toBe(2);
+
+    // Verify variable interpolation happened before /api/ds/query was called.
+    const sentQueries = mockFetch.mock.calls[0][0].data.queries as Array<{ refId: string; expr: string }>;
+    expect(sentQueries).toHaveLength(2);
+    expect(sentQueries[0].refId).toBe('A');
+    expect(sentQueries[0].expr).toContain('service="checkout-api"');
+    expect(sentQueries[1].refId).toBe('B');
+    expect(sentQueries[1].expr).toContain('service="checkout-api"');
+
+    // Second run: refId B fails with syntax_error -> surfaced with [B] prefix.
+    const errRes = await runDryRunValidation(spec, { maxConcurrency: 1 });
+    expect(errRes[0].category).toBe('syntax_error');
+    expect(errRes[0].errorText).toContain('[B] parse error');
+  });
 });

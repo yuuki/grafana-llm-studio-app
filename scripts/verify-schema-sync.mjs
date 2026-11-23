@@ -68,13 +68,23 @@ assertStringOnlyEnums(irSchema, 'dashboard-ir');
 assertStringOnlyEnums(patchSchema, 'dashboard-patch');
 
 const irPanelProps = irSchema.properties.panels.items.properties;
-const patchPanelProps = patchSchema.properties.operations.items.properties.panel.properties;
+const irVarProps = irSchema.properties.variables.items.properties;
+const patchOpProps = patchSchema.properties.operations.items.properties;
+const patchPanelProps = patchOpProps.panel.properties;
+const patchVarProps = patchOpProps.variable.properties;
 
 const checks = [
   {
+    label: 'schemaVersion',
+    irEnum: irSchema.properties.schemaVersion.enum,
+    patchEnum: patchSchema.properties.schemaVersion.enum,
+    tsConst: 'ALLOWED_SCHEMA_VERSIONS',
+    goMap: 'allowedSchemaVersions',
+  },
+  {
     label: 'timeRange.from',
     irEnum: irSchema.properties.timeRange.properties.from.enum,
-    patchEnum: patchSchema.properties.operations.items.properties.timeRange.properties.from.enum,
+    patchEnum: patchOpProps.timeRange.properties.from.enum,
     tsConst: 'ALLOWED_TIME_FROM',
     goMap: 'allowedTimeFrom',
   },
@@ -106,6 +116,27 @@ const checks = [
     tsConst: 'ALLOWED_WIDTHS',
     goMap: 'allowedWidths',
   },
+  {
+    label: 'panel.query.refId',
+    irEnum: irPanelProps.query.properties.refId.enum,
+    patchEnum: patchPanelProps.query.properties.refId.enum,
+    tsConst: 'ALLOWED_QUERY_REF_IDS',
+    goMap: 'allowedQueryRefIDs',
+  },
+  {
+    label: 'panel.queries.refId',
+    irEnum: irPanelProps.queries.items.properties.refId.enum,
+    patchEnum: patchPanelProps.queries.items.properties.refId.enum,
+    tsConst: 'ALLOWED_QUERY_REF_IDS',
+    goMap: 'allowedQueryRefIDs',
+  },
+  {
+    label: 'variable.type',
+    irEnum: irVarProps.type.enum,
+    patchEnum: patchVarProps.type.enum,
+    tsConst: 'ALLOWED_VARIABLE_TYPES',
+    goMap: 'allowedVariableTypes',
+  },
 ];
 
 for (const c of checks) {
@@ -114,6 +145,11 @@ for (const c of checks) {
   assertExactSetEqual(c.label, c.irEnum, extractGoMapKeys(goValidate, c.goMap), 'pkg/ir/validate.go');
 }
 
+// Verify patch.operations.op enum sync across dashboard-patch.schema.json, TS, and Go.
+const patchOpEnum = patchOpProps.op.enum;
+assertExactSetEqual('patch.operations.op', patchOpEnum, extractTsConstArray(tsTypes, 'ALLOWED_PATCH_OPS'), 'src/ir/types.ts');
+assertExactSetEqual('patch.operations.op', patchOpEnum, extractGoMapKeys(goValidate, 'allowedPatchOps'), 'pkg/ir/validate.go');
+
 console.log(
-  `Bidirectional schema sync OK: ${checks.map((c) => `${c.label}(${c.irEnum.length})`).join(', ')}; string-only enums verified.`
+  `Bidirectional schema sync OK: ${checks.map((c) => `${c.label}(${c.irEnum.length})`).join(', ')}, patch.operations.op(${patchOpEnum.length}); string-only enums verified.`
 );

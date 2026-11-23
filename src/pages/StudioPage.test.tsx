@@ -25,6 +25,7 @@ jest.mock('../spec/toScene', () => ({
 }));
 
 const mockGenerateDraft = jest.fn();
+const mockImportDraft = jest.fn();
 const mockPatchDraft = jest.fn();
 const mockRepairDraft = jest.fn();
 const mockUndoDraft = jest.fn();
@@ -42,6 +43,7 @@ jest.mock('../api/studioClient', () => ({
     mockBanner: true,
   })),
   generateDraft: (...args: unknown[]) => mockGenerateDraft(...args),
+  importDraft: (...args: unknown[]) => mockImportDraft(...args),
   patchDraft: (...args: unknown[]) => mockPatchDraft(...args),
   repairDraft: (...args: unknown[]) => mockRepairDraft(...args),
   undoDraft: (...args: unknown[]) => mockUndoDraft(...args),
@@ -67,11 +69,27 @@ jest.mock('../datasource/validator', () => ({
   runDryRunValidation: (...args: unknown[]) => mockRunDryRunValidation(...args),
 }));
 
+const mockFetchExistingDashboardByUid = jest.fn();
+const mockListExistingDashboards = jest.fn();
+
+jest.mock('../import/importDashboard', () => {
+  const actual = jest.requireActual('../import/importDashboard');
+  return {
+    ...actual,
+    fetchExistingDashboardByUid: (...args: unknown[]) => mockFetchExistingDashboardByUid(...args),
+    listExistingDashboards: (...args: unknown[]) => mockListExistingDashboards(...args),
+  };
+});
+
+const mockCreateNewDashboard = jest.fn();
+const mockUpdateExistingDashboard = jest.fn();
+
 jest.mock('../save/saveDashboard', () => ({
   listWritableFolders: jest.fn(async () => [{ uid: '', title: 'General (Root)' }]),
   buildExportableDashboardJson: jest.fn(() => '{}'),
   DashboardSaver: jest.fn().mockImplementation(() => ({
-    createNewDashboard: jest.fn(),
+    createNewDashboard: (...args: unknown[]) => mockCreateNewDashboard(...args),
+    updateExistingDashboard: (...args: unknown[]) => mockUpdateExistingDashboard(...args),
   })),
 }));
 
@@ -338,6 +356,96 @@ describe('StudioPage Scenes lifecycle, Dry-Run gating, and partial re-validation
       2,
       expect.anything(),
       expect.objectContaining({ onlyPanelIds: ['panel-err'] })
+    );
+  });
+
+  test('safe import defaults to create-as-copy and only uses revision-checked PUT when explicitly opted in', async () => {
+    const reqHash = await computeQueryHash(REQ_EXPR);
+
+    mockFetchExistingDashboardByUid.mockResolvedValueOnce({
+      source: {
+        uid: 'existing-dash-1',
+        resourceVersion: '27',
+        folderUid: '',
+        title: 'Existing Dash',
+      },
+      rawDashboard: {
+        title: 'Existing Dash',
+        time: { from: 'now-15m', to: 'now' },
+        panels: [
+          {
+            type: 'gauge',
+            title: 'Request Gauge',
+            datasource: { type: 'prometheus', uid: 'prom-main' },
+            gridPos: { x: 0, y: 0, w: 12, h: 6 },
+            fieldConfig: { defaults: { unit: 'reqps' } },
+            targets: [{ expr: REQ_EXPR }],
+          },
+        ],
+      },
+    });
+    mockImportDraft.mockImplementationOnce(async (req: { draft: unknown; importSource: unknown }) => ({
+      jobId: 'job-imported-1',
+      status: 'awaiting_preview',
+      datasourceUid: 'prom-main',
+      importSource: req.importSource,
+      currentIR: req.draft,
+      repairAttemptsUsed: 0,
+      maxRepairAttempts: 2,
+      canUndo: false,
+      updatedAt: '2026-11-23T00:00:00Z',
+    }));
+    mockRunDryRunValidation.mockResolvedValueOnce([
+      { panelId: 'panel-request-gauge', queryHash: reqHash, category: 'ok', seriesCount: 1, durationMs: 8 },
+    ]);
+    mockCreateNewDashboard.mockResolvedValueOnce({
+      uid: 'llmstudio-copy123',
+      url: '/d/llmstudio-copy123',
+      folderUid: '',
+      revision: 1,
+      mode: 'created',
+    });
+    mockUpdateExistingDashboard.mockResolvedValueOnce({
+      uid: 'existing-dash-1',
+      url: '/d/existing-dash-1',
+      folderUid: '',
+      revision: 1,
+      mode: 'updated',
+      resourceVersion: '28',
+    });
+
+    render(<StudioPage />);
+    await waitFor(() => expect(screen.getByText('開発・テスト用モックLLMモード')).toBeTruthy());
+
+    // Open collapsible safe import panel and import existing dashboard
+    fireEvent.click(screen.getByText('既存ダッシュボードをインポート（任意）'));
+    fireEvent.change(screen.getByPlaceholderText('existing-dashboard-uid'), {
+      target: { value: 'existing-dash-1' },
+    });
+    fireEvent.click(screen.getByText('安全な IR としてインポート'));
+
+    await waitFor(() => expect(screen.getByTestId('studio-import-report')).toBeTruthy());
+    expect(mockImportDraft).toHaveBeenCalledTimes(1);
+
+    // Dry-run & preview to unlock save
+    fireEvent.click(screen.getByText('検証・プレビューを実行'));
+    await waitFor(() => expect(screen.getByTestId('mock-scene-canvas')).toBeTruthy());
+
+    // Default save mode is create-as-copy (POST)
+    fireEvent.click(screen.getByText('新規ダッシュボード保存'));
+    await waitFor(() => expect(mockCreateNewDashboard).toHaveBeenCalledTimes(1));
+    expect(mockUpdateExistingDashboard).not.toHaveBeenCalled();
+
+    // Explicitly opt in to revision-checked update (PUT with resourceVersion)
+    fireEvent.click(screen.getByTestId('studio-optin-update-checkbox'));
+    fireEvent.click(screen.getByText('既存ダッシュボードを更新'));
+    await waitFor(() => expect(mockUpdateExistingDashboard).toHaveBeenCalledTimes(1));
+    expect(mockUpdateExistingDashboard).toHaveBeenCalledWith(
+      expect.objectContaining({
+        targetUid: 'existing-dash-1',
+        expectedResourceVersion: '27',
+        previewedRevision: 1,
+      })
     );
   });
 });

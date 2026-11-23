@@ -375,7 +375,7 @@ func (r *Runner) runScenario(ctx context.Context, sc Scenario, iteration int) Ca
 			allowedTargetIDs[t.PanelID] = true
 		}
 		for _, op := range patch.Operations {
-			if op.Op != "update_panel" || !allowedTargetIDs[op.PanelID] || op.Panel == nil || op.Panel.Query == nil {
+			if op.Op != "update_panel" || !allowedTargetIDs[op.PanelID] || op.Panel == nil || (op.Panel.Query == nil && op.Panel.Queries == nil) {
 				res.FailureStage = "patch_guard"
 				res.FailureDetail = fmt.Sprintf("repair patch contained disallowed op/panel (%s:%s)", op.Op, op.PanelID)
 				return res
@@ -406,7 +406,14 @@ func (r *Runner) runScenario(ctx context.Context, sc Scenario, iteration int) Ca
 	res.PanelCount = len(finalDoc.Panels)
 	res.GeneratedExprs = make([]string, 0, len(finalDoc.Panels))
 	for _, p := range finalDoc.Panels {
-		res.GeneratedExprs = append(res.GeneratedExprs, fmt.Sprintf("%s: %s", p.ID, p.Query.Expr))
+		qs := p.EffectiveQueries()
+		for qi, q := range qs {
+			if len(qs) == 1 {
+				res.GeneratedExprs = append(res.GeneratedExprs, fmt.Sprintf("%s: %s", p.ID, q.Expr))
+			} else {
+				res.GeneratedExprs = append(res.GeneratedExprs, fmt.Sprintf("%s[%d]: %s", p.ID, qi, q.Expr))
+			}
+		}
 	}
 
 	warnings, valErr := promql.ValidateDashboardIR(
@@ -468,42 +475,45 @@ func (r *Runner) validateAgainstPrometheus(ctx context.Context, doc ir.Dashboard
 	nonEmpty := 0
 
 	for _, p := range doc.Panels {
-		q := url.Values{}
-		q.Set("query", p.Query.Expr)
-		q.Set("start", strconv.FormatInt(start.Unix(), 10))
-		q.Set("end", strconv.FormatInt(now.Unix(), 10))
-		q.Set("step", "30s")
+		panelHasSeries := false
+		for _, qry := range p.EffectiveQueries() {
+			expr := promql.InterpolateVariables(qry.Expr, doc.Variables)
+			q := url.Values{}
+			q.Set("query", expr)
+			q.Set("start", strconv.FormatInt(start.Unix(), 10))
+			q.Set("end", strconv.FormatInt(now.Unix(), 10))
+			q.Set("step", "30s")
 
-		reqURL := base + "/api/v1/query_range?" + q.Encode()
-		httpReq, err := http.NewRequestWithContext(ctx, http.MethodGet, reqURL, nil)
-		if err != nil {
-			return nonEmpty, fmt.Errorf("panel %s: build prometheus request: %w", p.ID, err)
-		}
-		resp, err := r.httpClient.Do(httpReq)
-		if err != nil {
-			return nonEmpty, fmt.Errorf("panel %s: prometheus query failed: %w", p.ID, err)
-		}
-		body, readErr := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
-		_ = resp.Body.Close()
-		if readErr != nil {
-			return nonEmpty, fmt.Errorf("panel %s: read prometheus response: %w", p.ID, readErr)
-		}
+			reqURL := base + "/api/v1/query_range?" + q.Encode()
+			httpReq, err := http.NewRequestWithContext(ctx, http.MethodGet, reqURL, nil)
+			if err != nil {
+				return nonEmpty, fmt.Errorf("panel %s: build prometheus request: %w", p.ID, err)
+			}
+			resp, err := r.httpClient.Do(httpReq)
+			if err != nil {
+				return nonEmpty, fmt.Errorf("panel %s: prometheus query failed: %w", p.ID, err)
+			}
+			body, readErr := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+			_ = resp.Body.Close()
+			if readErr != nil {
+				return nonEmpty, fmt.Errorf("panel %s: read prometheus response: %w", p.ID, readErr)
+			}
 
-		var pr promRangeResponse
-		if err := json.Unmarshal(body, &pr); err != nil {
-			return nonEmpty, fmt.Errorf("panel %s: decode prometheus HTTP %d response: %w", p.ID, resp.StatusCode, err)
-		}
-		if resp.StatusCode != http.StatusOK || pr.Status != "success" {
-			return nonEmpty, fmt.Errorf("panel %s: prometheus %s (%d): %s", p.ID, pr.ErrorType, resp.StatusCode, pr.Error)
-		}
-		hasSeries := false
-		for _, s := range pr.Data.Result {
-			if len(s.Values) > 0 {
-				hasSeries = true
-				break
+			var pr promRangeResponse
+			if err := json.Unmarshal(body, &pr); err != nil {
+				return nonEmpty, fmt.Errorf("panel %s: decode prometheus HTTP %d response: %w", p.ID, resp.StatusCode, err)
+			}
+			if resp.StatusCode != http.StatusOK || pr.Status != "success" {
+				return nonEmpty, fmt.Errorf("panel %s: prometheus %s (%d): %s", p.ID, pr.ErrorType, resp.StatusCode, pr.Error)
+			}
+			for _, s := range pr.Data.Result {
+				if len(s.Values) > 0 {
+					panelHasSeries = true
+					break
+				}
 			}
 		}
-		if hasSeries {
+		if panelHasSeries {
 			nonEmpty++
 		}
 	}

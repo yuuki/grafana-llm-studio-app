@@ -173,4 +173,58 @@ describe('Create-only DashboardSaver (Grafana 12.4.15 v1beta1)', () => {
       '/apis/folder.grafana.app/v1beta1/namespaces/org-7/folders'
     );
   });
+
+  test('opt-in updateExistingDashboard sends PUT with metadata.resourceVersion and rejects missing resourceVersion or 409 conflict without force-overwriting', async () => {
+    const saver = new DashboardSaver();
+
+    // Missing resourceVersion MUST be rejected before sending any HTTP request.
+    await expect(
+      saver.updateExistingDashboard({
+        spec,
+        previewedRevision: 3,
+        targetUid: 'existing-dash',
+        expectedResourceVersion: '',
+        folderUid: 'team-folder',
+      })
+    ).rejects.toMatchObject({ code: 'MISSING_RESOURCE_VERSION' });
+    expect(mockFetch).not.toHaveBeenCalled();
+
+    // Valid revision-checked PUT succeeds and returns updated resourceVersion.
+    mockFetch.mockReturnValueOnce(
+      of({ data: { metadata: { name: 'existing-dash', resourceVersion: '18' } } })
+    );
+    const updated = await saver.updateExistingDashboard({
+      spec,
+      previewedRevision: 3,
+      targetUid: 'existing-dash',
+      expectedResourceVersion: '17',
+      folderUid: 'team-folder',
+    });
+    expect(updated.uid).toBe('existing-dash');
+    expect(updated.mode).toBe('updated');
+    expect(updated.resourceVersion).toBe('18');
+
+    const putCall = mockFetch.mock.calls[0][0];
+    expect(putCall.method).toBe('PUT');
+    expect(putCall.url).toBe(
+      '/apis/dashboard.grafana.app/v1beta1/namespaces/default/dashboards/existing-dash'
+    );
+    expect(putCall.data.metadata.name).toBe('existing-dash');
+    expect(putCall.data.metadata.resourceVersion).toBe('17');
+
+    // Concurrent external modification (HTTP 409/412) fails with REVISION_CONFLICT and NEVER retries without resourceVersion.
+    mockFetch.mockReturnValueOnce(
+      throwError(() => ({ status: 409, data: { message: 'resourceVersion conflict' } }))
+    );
+    await expect(
+      saver.updateExistingDashboard({
+        spec,
+        previewedRevision: 3,
+        targetUid: 'existing-dash',
+        expectedResourceVersion: '17',
+        folderUid: 'team-folder',
+      })
+    ).rejects.toMatchObject({ code: 'REVISION_CONFLICT' });
+    expect(mockFetch).toHaveBeenCalledTimes(2);
+  });
 });

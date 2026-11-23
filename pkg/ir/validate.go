@@ -15,8 +15,16 @@ import (
 
 var (
 	panelIDPattern   = regexp.MustCompile(`^panel-[a-z0-9][a-z0-9-]{0,31}$`)
+	varNamePattern   = regexp.MustCompile(`^[a-zA-Z_][a-zA-Z0-9_]{0,31}$`)
+	labelNamePattern = regexp.MustCompile(`^[a-zA-Z_][a-zA-Z0-9_]{0,63}$`)
+	metricPattern    = regexp.MustCompile(`^[a-zA-Z_:][a-zA-Z0-9_:]{0,127}$`)
 	htmlTagPattern   = regexp.MustCompile(`<[^>]*>`)
 	eventAttrPattern = regexp.MustCompile(`(?i)\bon[a-z]+\s*=`)
+
+	allowedSchemaVersions = map[string]bool{
+		"1.0": true,
+		"1.1": true,
+	}
 
 	allowedTimeFrom = map[string]bool{
 		"now-5m":  true,
@@ -28,8 +36,13 @@ var (
 	}
 
 	allowedPanelTypes = map[string]bool{
-		"timeseries": true,
-		"stat":       true,
+		"timeseries":     true,
+		"stat":           true,
+		"table":          true,
+		"gauge":          true,
+		"bargauge":       true,
+		"piechart":       true,
+		"state-timeline": true,
 	}
 
 	allowedUnits = map[string]bool{
@@ -59,6 +72,43 @@ var (
 		"full": true,
 	}
 
+	allowedQueryRefIDs = map[string]bool{
+		"A": true,
+		"B": true,
+		"C": true,
+	}
+
+	allowedVariableTypes = map[string]bool{
+		"query":  true,
+		"custom": true,
+	}
+
+	allowedPatchOps = map[string]bool{
+		"update_panel":    true,
+		"add_panel":       true,
+		"remove_panel":    true,
+		"update_meta":     true,
+		"add_variable":    true,
+		"update_variable": true,
+		"remove_variable": true,
+	}
+
+	reservedVariableNames = map[string]bool{
+		"__name__":        true,
+		"__from":          true,
+		"__to":            true,
+		"__interval":      true,
+		"__interval_ms":   true,
+		"__rate_interval": true,
+		"__range":         true,
+		"__range_s":       true,
+		"__range_ms":      true,
+		"__dashboard":     true,
+		"__org":           true,
+		"__user":          true,
+		"timeFilter":      true,
+	}
+
 	forbiddenMarkupFragments = []string{
 		"<script",
 		"</script",
@@ -81,11 +131,14 @@ func (e *ValidationError) Error() string {
 }
 
 // rawPanelRequiredCheck ensures required numeric fields (layout.row, layout.col, thresholds[].value)
-// are explicitly present in JSON rather than silently defaulted to Go zero values.
+// are explicitly present in JSON rather than silently defaulted to Go zero values, and detects
+// mutually exclusive query + queries on the same panel.
 type rawIRRequiredCheck struct {
 	Revision *int `json:"revision"`
 	Panels   []struct {
-		ID         string `json:"id"`
+		ID         string            `json:"id"`
+		Query      *json.RawMessage  `json:"query"`
+		Queries    []json.RawMessage `json:"queries"`
 		Thresholds []struct {
 			Value *float64 `json:"value"`
 		} `json:"thresholds"`
@@ -124,6 +177,9 @@ func DecodeStrictIR(raw []byte) (DashboardIR, error) {
 		return DashboardIR{}, errors.New("missing required field: revision")
 	}
 	for i, p := range req.Panels {
+		if p.Query != nil && len(p.Queries) > 0 {
+			return DashboardIR{}, fmt.Errorf("panels[%d]: cannot specify both query and queries", i)
+		}
 		if p.Layout == nil || p.Layout.Row == nil || p.Layout.Col == nil {
 			return DashboardIR{}, fmt.Errorf("panels[%d]: missing required layout.row or layout.col", i)
 		}
@@ -163,7 +219,7 @@ type ValidateOptions struct {
 }
 
 // ValidateIR performs deterministic schema and invariant validation on DashboardIR.
-// PromQL AST/catalog validation is layered on top via pkg/promql.
+// PromQL AST/catalog/variable validation is layered on top via pkg/promql.
 func ValidateIR(doc DashboardIR, opts ValidateOptions) error {
 	maxPanels := opts.MaxPanels
 	if maxPanels <= 0 || maxPanels > MaxPanelsHardCap {
@@ -172,8 +228,8 @@ func ValidateIR(doc DashboardIR, opts ValidateOptions) error {
 
 	var issues []string
 
-	if doc.SchemaVersion != SchemaVersion {
-		issues = append(issues, fmt.Sprintf("schemaVersion must be %q, got %q", SchemaVersion, doc.SchemaVersion))
+	if !allowedSchemaVersions[doc.SchemaVersion] {
+		issues = append(issues, fmt.Sprintf("schemaVersion %q is not allowed (allowed: 1.0, 1.1)", doc.SchemaVersion))
 	}
 	if doc.Revision < 1 || doc.Revision > MaxRevision {
 		issues = append(issues, fmt.Sprintf("revision must be between 1 and %d, got %d", MaxRevision, doc.Revision))
@@ -191,6 +247,14 @@ func ValidateIR(doc DashboardIR, opts ValidateOptions) error {
 	}
 	if doc.TimeRange.To != "now" {
 		issues = append(issues, fmt.Sprintf("timeRange.to must be %q, got %q", "now", doc.TimeRange.To))
+	}
+
+	if len(doc.Variables) > MaxVariables {
+		issues = append(issues, fmt.Sprintf("variables count %d exceeds max %d", len(doc.Variables), MaxVariables))
+	}
+	seenVars := make(map[string]bool, len(doc.Variables))
+	for i, v := range doc.Variables {
+		issues = append(issues, validateVariable(i, v, seenVars)...)
 	}
 
 	if len(doc.Panels) == 0 {
@@ -214,7 +278,7 @@ func ValidateIR(doc DashboardIR, opts ValidateOptions) error {
 		}
 
 		if !allowedPanelTypes[p.Type] {
-			issues = append(issues, fmt.Sprintf("%s.type %q is not allowed (allowed: timeseries, stat)", prefix, p.Type))
+			issues = append(issues, fmt.Sprintf("%s.type %q is not allowed", prefix, p.Type))
 		}
 		if err := validatePlainText(prefix+".title", p.Title, 1, MaxPanelTitleLen); err != nil {
 			issues = append(issues, err.Error())
@@ -227,14 +291,9 @@ func ValidateIR(doc DashboardIR, opts ValidateOptions) error {
 		if p.DatasourceRef != SelectedDatasourceRef {
 			issues = append(issues, fmt.Sprintf("%s.datasourceRef must be %q, got %q", prefix, SelectedDatasourceRef, p.DatasourceRef))
 		}
-		if err := validateExprText(prefix+".query.expr", p.Query.Expr, 1, MaxExprLen); err != nil {
-			issues = append(issues, err.Error())
-		}
-		if p.Query.LegendFormat != "" {
-			if err := validatePlainText(prefix+".query.legendFormat", p.Query.LegendFormat, 0, MaxLegendLen); err != nil {
-				issues = append(issues, err.Error())
-			}
-		}
+
+		issues = append(issues, validatePanelQueries(prefix, p)...)
+
 		if !allowedUnits[p.Unit] {
 			issues = append(issues, fmt.Sprintf("%s.unit %q is not in allowlist", prefix, p.Unit))
 		}
@@ -284,6 +343,161 @@ func ValidateIR(doc DashboardIR, opts ValidateOptions) error {
 
 	if len(issues) > 0 {
 		return &ValidationError{Issues: issues}
+	}
+	return nil
+}
+
+func validatePanelQueries(prefix string, p PanelIR) []string {
+	var issues []string
+	hasSingle := p.Query != (QueryIR{})
+	hasMulti := len(p.Queries) > 0
+
+	if hasSingle && hasMulti {
+		return []string{fmt.Sprintf("%s cannot specify both query and queries", prefix)}
+	}
+	if !hasSingle && !hasMulti {
+		return []string{fmt.Sprintf("%s must specify query or 1..%d queries", prefix, MaxQueriesPerPanel)}
+	}
+
+	qs := p.EffectiveQueries()
+	if len(qs) > MaxQueriesPerPanel {
+		issues = append(issues, fmt.Sprintf("%s.queries count %d exceeds limit %d", prefix, len(qs), MaxQueriesPerPanel))
+	}
+
+	seenRefIDs := make(map[string]bool, len(qs))
+	for qi, q := range qs {
+		qPrefix := fmt.Sprintf("%s.query", prefix)
+		if hasMulti {
+			qPrefix = fmt.Sprintf("%s.queries[%d]", prefix, qi)
+		}
+		refID := q.RefID
+		if refID != "" {
+			if !allowedQueryRefIDs[refID] {
+				issues = append(issues, fmt.Sprintf("%s.refId %q is not allowed (allowed: A, B, C)", qPrefix, refID))
+			}
+		} else if qi < len(defaultQueryRefIDs) {
+			refID = defaultQueryRefIDs[qi]
+		}
+		if refID != "" {
+			if seenRefIDs[refID] {
+				issues = append(issues, fmt.Sprintf("%s.refId %q is duplicated", qPrefix, refID))
+			}
+			seenRefIDs[refID] = true
+		}
+		if err := validateExprText(qPrefix+".expr", q.Expr, 1, MaxExprLen); err != nil {
+			issues = append(issues, err.Error())
+		}
+		if q.LegendFormat != "" {
+			if err := validatePlainText(qPrefix+".legendFormat", q.LegendFormat, 0, MaxLegendLen); err != nil {
+				issues = append(issues, err.Error())
+			}
+		}
+	}
+	return issues
+}
+
+func validateVariable(idx int, v VariableIR, seen map[string]bool) []string {
+	var issues []string
+	prefix := fmt.Sprintf("variables[%d]", idx)
+
+	if !varNamePattern.MatchString(v.Name) {
+		issues = append(issues, fmt.Sprintf("%s.name %q violates pattern", prefix, v.Name))
+	} else if reservedVariableNames[v.Name] {
+		issues = append(issues, fmt.Sprintf("%s.name %q is reserved", prefix, v.Name))
+	} else if seen[v.Name] {
+		issues = append(issues, fmt.Sprintf("%s.name %q is duplicated", prefix, v.Name))
+	} else {
+		seen[v.Name] = true
+	}
+
+	if v.Label != "" {
+		if err := validatePlainText(prefix+".label", v.Label, 0, MaxVariableLabelLen); err != nil {
+			issues = append(issues, err.Error())
+		}
+	}
+
+	if !allowedVariableTypes[v.Type] {
+		issues = append(issues, fmt.Sprintf("%s.type %q is not allowed (allowed: query, custom)", prefix, v.Type))
+		return issues
+	}
+
+	switch v.Type {
+	case "query":
+		if v.DatasourceRef != SelectedDatasourceRef {
+			issues = append(issues, fmt.Sprintf("%s.datasourceRef must be %q for query variable, got %q", prefix, SelectedDatasourceRef, v.DatasourceRef))
+		}
+		if !labelNamePattern.MatchString(v.LabelName) || v.LabelName == "__name__" {
+			issues = append(issues, fmt.Sprintf("%s.labelName %q is invalid for query variable", prefix, v.LabelName))
+		}
+		if v.MetricName != "" && !metricPattern.MatchString(v.MetricName) {
+			issues = append(issues, fmt.Sprintf("%s.metricName %q violates Prometheus metric pattern", prefix, v.MetricName))
+		}
+		if len(v.Options) > 0 {
+			issues = append(issues, fmt.Sprintf("%s.options must not be set on query variable", prefix))
+		}
+		if v.DefaultValue != "" {
+			if err := validatePlainText(prefix+".defaultValue", v.DefaultValue, 1, MaxVariableDefaultLen); err != nil {
+				issues = append(issues, err.Error())
+			}
+		}
+
+	case "custom":
+		if v.DatasourceRef != "" {
+			issues = append(issues, fmt.Sprintf("%s.datasourceRef must be empty for custom variable", prefix))
+		}
+		if v.LabelName != "" || v.MetricName != "" {
+			issues = append(issues, fmt.Sprintf("%s.labelName and metricName must be empty for custom variable", prefix))
+		}
+		if len(v.Options) == 0 || len(v.Options) > MaxVariableOptions {
+			issues = append(issues, fmt.Sprintf("%s.options count %d must be between 1 and %d", prefix, len(v.Options), MaxVariableOptions))
+		}
+		optSeen := make(map[string]bool, len(v.Options))
+		for oi, opt := range v.Options {
+			if err := validatePlainText(fmt.Sprintf("%s.options[%d]", prefix, oi), opt, 1, MaxVariableOptionLen); err != nil {
+				issues = append(issues, err.Error())
+			}
+			if optSeen[opt] {
+				issues = append(issues, fmt.Sprintf("%s.options[%d] %q is duplicated", prefix, oi, opt))
+			}
+			optSeen[opt] = true
+		}
+		if v.DefaultValue != "" {
+			if err := validatePlainText(prefix+".defaultValue", v.DefaultValue, 1, MaxVariableDefaultLen); err != nil {
+				issues = append(issues, err.Error())
+			} else if !optSeen[v.DefaultValue] {
+				issues = append(issues, fmt.Sprintf("%s.defaultValue %q must be one of custom options", prefix, v.DefaultValue))
+			}
+		}
+	}
+
+	return issues
+}
+
+// ValidateImportSource checks provenance metadata for an imported Grafana dashboard.
+func ValidateImportSource(src *ImportSource) error {
+	if src == nil {
+		return nil
+	}
+	if err := validatePlainText("importSource.uid", src.UID, 1, 64); err != nil {
+		return err
+	}
+	if src.ResourceVersion != "" {
+		if err := validatePlainText("importSource.resourceVersion", src.ResourceVersion, 1, 64); err != nil {
+			return err
+		}
+	}
+	if src.FolderUID != "" {
+		if err := validatePlainText("importSource.folderUid", src.FolderUID, 1, 64); err != nil {
+			return err
+		}
+	}
+	if src.Title != "" {
+		if err := validatePlainText("importSource.title", src.Title, 0, MaxTitleLen); err != nil {
+			return err
+		}
+	}
+	if src.Version < 0 || src.Version > 1000000 {
+		return fmt.Errorf("importSource.version %d out of range", src.Version)
 	}
 	return nil
 }

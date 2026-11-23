@@ -1,5 +1,11 @@
-export const IR_SCHEMA_VERSION = '1.0' as const;
+export const ALLOWED_SCHEMA_VERSIONS = ['1.0', '1.1'] as const;
+export type IRSchemaVersion = (typeof ALLOWED_SCHEMA_VERSIONS)[number];
+export const IR_SCHEMA_VERSION: IRSchemaVersion = '1.1';
 export const SELECTED_DATASOURCE_REF = 'selected_prometheus' as const;
+
+export const MAX_QUERIES_PER_PANEL = 3;
+export const MAX_VARIABLES = 4;
+export const MAX_VARIABLE_OPTIONS = 20;
 
 export const ALLOWED_TIME_FROM = [
   'now-5m',
@@ -11,7 +17,15 @@ export const ALLOWED_TIME_FROM = [
 ] as const;
 export type AllowedTimeFrom = (typeof ALLOWED_TIME_FROM)[number];
 
-export const ALLOWED_PANEL_TYPES = ['timeseries', 'stat'] as const;
+export const ALLOWED_PANEL_TYPES = [
+  'timeseries',
+  'stat',
+  'table',
+  'gauge',
+  'bargauge',
+  'piechart',
+  'state-timeline',
+] as const;
 export type PanelType = (typeof ALLOWED_PANEL_TYPES)[number];
 
 export const ALLOWED_UNITS = [
@@ -35,12 +49,43 @@ export type ThresholdColor = (typeof ALLOWED_THRESHOLD_COLORS)[number];
 export const ALLOWED_WIDTHS = ['half', 'full'] as const;
 export type LayoutWidth = (typeof ALLOWED_WIDTHS)[number];
 
+export const ALLOWED_QUERY_REF_IDS = ['A', 'B', 'C'] as const;
+export type QueryRefId = (typeof ALLOWED_QUERY_REF_IDS)[number];
+
+export const ALLOWED_VARIABLE_TYPES = ['query', 'custom'] as const;
+export type VariableType = (typeof ALLOWED_VARIABLE_TYPES)[number];
+
+export const ALLOWED_PATCH_OPS = [
+  'update_panel',
+  'add_panel',
+  'remove_panel',
+  'update_meta',
+  'add_variable',
+  'update_variable',
+  'remove_variable',
+] as const;
+export type PatchOp = (typeof ALLOWED_PATCH_OPS)[number];
+
 export interface TimeRangeIR {
   from: AllowedTimeFrom;
   to: 'now';
 }
 
+export interface VariableIR {
+  name: string;
+  label?: string;
+  type: VariableType;
+  datasourceRef?: typeof SELECTED_DATASOURCE_REF;
+  labelName?: string;
+  metricName?: string;
+  options?: string[];
+  defaultValue?: string;
+  multi?: boolean;
+  includeAll?: boolean;
+}
+
 export interface QueryIR {
+  refId?: QueryRefId;
   expr: string;
   legendFormat?: string;
 }
@@ -62,24 +107,34 @@ export interface PanelIR {
   title: string;
   description?: string;
   datasourceRef: typeof SELECTED_DATASOURCE_REF;
-  query: QueryIR;
+  query?: QueryIR;
+  queries?: QueryIR[];
   unit: AllowedUnit;
   thresholds?: ThresholdIR[];
   layout: LayoutHintIR;
 }
 
 export interface DashboardIR {
-  schemaVersion: typeof IR_SCHEMA_VERSION;
+  schemaVersion: IRSchemaVersion;
   revision: number;
   title: string;
   description?: string;
   timeRange: TimeRangeIR;
+  variables?: VariableIR[];
   panels: PanelIR[];
 }
 
 export interface ScopeFilter {
   labelName: string;
   labelValue: string;
+}
+
+export interface ImportSource {
+  uid: string;
+  resourceVersion?: string;
+  folderUid?: string;
+  title?: string;
+  version?: number;
 }
 
 export interface MetricCatalogItem {
@@ -138,6 +193,7 @@ export interface JobSnapshot {
   status: JobStatus;
   datasourceUid: string;
   scope?: ScopeFilter;
+  importSource?: ImportSource;
   currentIR?: DashboardIR;
   lastDiff?: DiffEntry[];
   summary?: string;
@@ -162,6 +218,38 @@ export interface PublicConfig {
 }
 
 const PANEL_ID_REGEX = /^panel-[a-z0-9][a-z0-9-]{0,31}$/;
+const VAR_NAME_REGEX = /^[a-zA-Z_][a-zA-Z0-9_]{0,31}$/;
+const LABEL_NAME_REGEX = /^[a-zA-Z_][a-zA-Z0-9_]{0,63}$/;
+const METRIC_NAME_REGEX = /^[a-zA-Z_:][a-zA-Z0-9_:]{0,127}$/;
+
+const RESERVED_VAR_NAMES = new Set([
+  '__name__',
+  '__from',
+  '__to',
+  '__interval',
+  '__interval_ms',
+  '__rate_interval',
+  '__range',
+  '__range_s',
+  '__range_ms',
+  '__dashboard',
+  '__org',
+  '__user',
+  'timeFilter',
+]);
+
+/**
+ * Returns the ordered list of PromQL queries defined on a panel (supports both v1.0 `query` and v1.1 `queries`).
+ */
+export function getPanelQueries(panel: PanelIR): QueryIR[] {
+  if (Array.isArray(panel.queries) && panel.queries.length > 0) {
+    return panel.queries;
+  }
+  if (panel.query) {
+    return [panel.query];
+  }
+  return [];
+}
 
 /**
  * Deterministic client-side guard preventing invalid IR from ever reaching
@@ -172,7 +260,7 @@ export function validateIRClient(doc: DashboardIR, maxPanels = 6): string[] {
   if (!doc || typeof doc !== 'object') {
     return ['DashboardIR must be an object'];
   }
-  if (doc.schemaVersion !== IR_SCHEMA_VERSION) {
+  if (!ALLOWED_SCHEMA_VERSIONS.includes(doc.schemaVersion)) {
     issues.push(`Unsupported schemaVersion: ${doc.schemaVersion}`);
   }
   if (!Number.isInteger(doc.revision) || doc.revision < 1 || doc.revision > 10000) {
@@ -184,6 +272,51 @@ export function validateIRClient(doc: DashboardIR, maxPanels = 6): string[] {
   if (!doc.timeRange || !ALLOWED_TIME_FROM.includes(doc.timeRange.from) || doc.timeRange.to !== 'now') {
     issues.push(`Unsupported timeRange: ${doc.timeRange?.from}..${doc.timeRange?.to}`);
   }
+
+  if (doc.variables !== undefined) {
+    if (!Array.isArray(doc.variables)) {
+      issues.push('variables must be an array');
+    } else {
+      if (doc.variables.length > MAX_VARIABLES) {
+        issues.push(`Variable count ${doc.variables.length} exceeds max ${MAX_VARIABLES}`);
+      }
+      const seenVars = new Set<string>();
+      for (const v of doc.variables) {
+        if (!VAR_NAME_REGEX.test(v.name) || RESERVED_VAR_NAMES.has(v.name) || seenVars.has(v.name)) {
+          issues.push(`Invalid, reserved, or duplicate variable name: ${v.name}`);
+        }
+        seenVars.add(v.name);
+        if (!ALLOWED_VARIABLE_TYPES.includes(v.type)) {
+          issues.push(`Unsupported variable type on ${v.name}: ${v.type}`);
+          continue;
+        }
+        if (v.type === 'query') {
+          if (v.datasourceRef !== SELECTED_DATASOURCE_REF) {
+            issues.push(`Forbidden datasourceRef on query variable ${v.name}: ${v.datasourceRef}`);
+          }
+          if (!v.labelName || !LABEL_NAME_REGEX.test(v.labelName) || v.labelName === '__name__') {
+            issues.push(`Invalid labelName on query variable ${v.name}`);
+          }
+          if (v.metricName && !METRIC_NAME_REGEX.test(v.metricName)) {
+            issues.push(`Invalid metricName on query variable ${v.name}`);
+          }
+          if (v.options && v.options.length > 0) {
+            issues.push(`Query variable ${v.name} must not define custom options`);
+          }
+        } else if (v.type === 'custom') {
+          if (v.datasourceRef) {
+            issues.push(`Custom variable ${v.name} must not define datasourceRef`);
+          }
+          if (!Array.isArray(v.options) || v.options.length < 1 || v.options.length > MAX_VARIABLE_OPTIONS) {
+            issues.push(`Custom variable ${v.name} must define 1..${MAX_VARIABLE_OPTIONS} options`);
+          } else if (v.defaultValue && !v.options.includes(v.defaultValue)) {
+            issues.push(`Custom variable ${v.name} defaultValue must be in options`);
+          }
+        }
+      }
+    }
+  }
+
   const cap = Math.max(1, Math.min(maxPanels, 6));
   if (!Array.isArray(doc.panels) || doc.panels.length < 1 || doc.panels.length > cap) {
     issues.push(`Panel count must be between 1 and ${cap}`);
@@ -205,9 +338,34 @@ export function validateIRClient(doc: DashboardIR, maxPanels = 6): string[] {
     if (p.datasourceRef !== SELECTED_DATASOURCE_REF) {
       issues.push(`Forbidden datasourceRef on ${p.id}: ${p.datasourceRef}`);
     }
-    if (!p.query?.expr || p.query.expr.trim().length === 0 || p.query.expr.length > 512) {
-      issues.push(`Invalid query expr on ${p.id}`);
+
+    const hasSingle = Boolean(p.query);
+    const hasMulti = Array.isArray(p.queries) && p.queries.length > 0;
+    if (hasSingle && hasMulti) {
+      issues.push(`Panel ${p.id} cannot specify both query and queries`);
+    } else if (!hasSingle && !hasMulti) {
+      issues.push(`Panel ${p.id} must specify query or 1..${MAX_QUERIES_PER_PANEL} queries`);
+    } else {
+      const qs = getPanelQueries(p);
+      if (qs.length > MAX_QUERIES_PER_PANEL) {
+        issues.push(`Panel ${p.id} exceeds max ${MAX_QUERIES_PER_PANEL} queries`);
+      }
+      const seenRefIds = new Set<string>();
+      qs.forEach((q, qi) => {
+        if (!q?.expr || q.expr.trim().length === 0 || q.expr.length > 512) {
+          issues.push(`Invalid query expr on ${p.id}[${qi}]`);
+        }
+        const refId = q?.refId ?? ALLOWED_QUERY_REF_IDS[qi];
+        if (!refId || !ALLOWED_QUERY_REF_IDS.includes(refId)) {
+          issues.push(`Invalid query refId on ${p.id}[${qi}]: ${q?.refId}`);
+        } else if (seenRefIds.has(refId)) {
+          issues.push(`Duplicate query refId on ${p.id}: ${refId}`);
+        } else {
+          seenRefIds.add(refId);
+        }
+      });
     }
+
     if (!ALLOWED_UNITS.includes(p.unit)) {
       issues.push(`Unsupported unit on ${p.id}: ${p.unit}`);
     }
@@ -271,6 +429,28 @@ export async function computeQueryHash(expr: string): Promise<string> {
       .join('');
   }
   return sha256HexPure(normalized).slice(0, 32);
+}
+
+/**
+ * Computes the deterministic hash over all queries on a panel, matching Go ir.PanelQueryHash byte-for-byte.
+ * For single-query panels this equals computeQueryHash(expr).
+ */
+export async function computePanelQueryHash(
+  queries: Array<{ refId?: string; expr: string }>
+): Promise<string> {
+  if (queries.length === 0) {
+    return computeQueryHash('');
+  }
+  if (queries.length === 1) {
+    return computeQueryHash(queries[0].expr);
+  }
+  const canonical = queries
+    .map((q, idx) => {
+      const refId = q.refId || ALLOWED_QUERY_REF_IDS[idx] || '';
+      return `${refId}:${q.expr.trim()}`;
+    })
+    .join('\n');
+  return computeQueryHash(canonical);
 }
 
 const SHA256_K = new Uint32Array([

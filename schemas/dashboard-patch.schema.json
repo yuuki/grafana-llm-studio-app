@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://github.com/yuuki/grafana-llm-studio-app/schemas/dashboard-patch.schema.json",
   "title": "DashboardPatch",
-  "description": "Restricted typed patch operations targeting stable panel IDs and requiring baseRevision.",
+  "description": "Restricted typed patch operations targeting stable panel IDs and template variables, requiring baseRevision.",
   "type": "object",
   "additionalProperties": false,
   "required": [
@@ -14,7 +14,7 @@
   "properties": {
     "schemaVersion": {
       "type": "string",
-      "enum": ["1.0"]
+      "enum": ["1.0", "1.1"]
     },
     "baseRevision": {
       "type": "integer",
@@ -39,11 +39,23 @@
         "properties": {
           "op": {
             "type": "string",
-            "enum": ["update_panel", "add_panel", "remove_panel", "update_meta"]
+            "enum": [
+              "update_panel",
+              "add_panel",
+              "remove_panel",
+              "update_meta",
+              "add_variable",
+              "update_variable",
+              "remove_variable"
+            ]
           },
           "panelId": {
             "type": "string",
             "pattern": "^panel-[a-z0-9][a-z0-9-]{0,31}$"
+          },
+          "variableName": {
+            "type": "string",
+            "pattern": "^[a-zA-Z_][a-zA-Z0-9_]{0,31}$"
           },
           "title": {
             "type": "string",
@@ -69,6 +81,56 @@
               }
             }
           },
+          "variable": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "name": {
+                "type": "string",
+                "pattern": "^[a-zA-Z_][a-zA-Z0-9_]{0,31}$"
+              },
+              "label": {
+                "type": "string",
+                "maxLength": 64
+              },
+              "type": {
+                "type": "string",
+                "enum": ["query", "custom"]
+              },
+              "datasourceRef": {
+                "type": "string",
+                "enum": ["selected_prometheus"]
+              },
+              "labelName": {
+                "type": "string",
+                "pattern": "^[a-zA-Z_][a-zA-Z0-9_]{0,63}$"
+              },
+              "metricName": {
+                "type": "string",
+                "pattern": "^[a-zA-Z_:][a-zA-Z0-9_:]{0,127}$"
+              },
+              "options": {
+                "type": "array",
+                "minItems": 1,
+                "maxItems": 20,
+                "items": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 64
+                }
+              },
+              "defaultValue": {
+                "type": "string",
+                "maxLength": 128
+              },
+              "multi": {
+                "type": "boolean"
+              },
+              "includeAll": {
+                "type": "boolean"
+              }
+            }
+          },
           "panel": {
             "type": "object",
             "additionalProperties": false,
@@ -79,7 +141,15 @@
               },
               "type": {
                 "type": "string",
-                "enum": ["timeseries", "stat"]
+                "enum": [
+                  "timeseries",
+                  "stat",
+                  "table",
+                  "gauge",
+                  "bargauge",
+                  "piechart",
+                  "state-timeline"
+                ]
               },
               "title": {
                 "type": "string",
@@ -99,6 +169,10 @@
                 "additionalProperties": false,
                 "required": ["expr"],
                 "properties": {
+                  "refId": {
+                    "type": "string",
+                    "enum": ["A", "B", "C"]
+                  },
                   "expr": {
                     "type": "string",
                     "minLength": 1,
@@ -107,6 +181,31 @@
                   "legendFormat": {
                     "type": "string",
                     "maxLength": 80
+                  }
+                }
+              },
+              "queries": {
+                "type": "array",
+                "minItems": 1,
+                "maxItems": 3,
+                "items": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": ["expr"],
+                  "properties": {
+                    "refId": {
+                      "type": "string",
+                      "enum": ["A", "B", "C"]
+                    },
+                    "expr": {
+                      "type": "string",
+                      "minLength": 1,
+                      "maxLength": 512
+                    },
+                    "legendFormat": {
+                      "type": "string",
+                      "maxLength": 80
+                    }
                   }
                 }
               },

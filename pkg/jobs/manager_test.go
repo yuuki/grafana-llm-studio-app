@@ -356,3 +356,106 @@ func TestManager_UndoInvalidatesInFlightPatchFailure(t *testing.T) {
 		t.Fatalf("late failed patch corrupted post-Undo job state: %+v", finalSnap)
 	}
 }
+
+func TestManager_SafeImportAndMultiQueryRepair(t *testing.T) {
+	stub := &stubLLM{
+		onGenerate: (&llm.MockClient{}).GenerateIR,
+		onRepair: func(_ context.Context, req llm.RepairRequest) ([]byte, llm.CompletionMeta, error) {
+			fixed := []ir.QueryIR{
+				{RefID: "A", Expr: `histogram_quantile(0.50, sum by (le) (rate(http_request_duration_seconds_bucket{service="checkout-api"}[5m])))`, LegendFormat: "p50"},
+				{RefID: "B", Expr: `histogram_quantile(0.95, sum by (le) (rate(http_request_duration_seconds_bucket{service="checkout-api"}[5m])))`, LegendFormat: "p95"},
+			}
+			patch := ir.DashboardPatch{
+				SchemaVersion: ir.SchemaVersion,
+				BaseRevision:  req.CurrentIR.Revision,
+				Summary:       "Fixed multi-query panel",
+				Operations: []ir.PatchOperation{
+					{
+						Op:      "update_panel",
+						PanelID: req.Targets[0].PanelID,
+						Panel:   &ir.PanelUpdate{Queries: &fixed},
+					},
+				},
+			}
+			b, _ := json.Marshal(patch)
+			return b, llm.CompletionMeta{FinishReason: "stop", ProviderMode: "stub"}, nil
+		},
+	}
+
+	mgr := jobs.NewManager(stub, jobs.Config{AllowedDSUIDs: []string{"prom-main"}})
+	alice := jobs.Owner{OrgID: 1, UserLogin: "alice"}
+	bob := jobs.Owner{OrgID: 1, UserLogin: "bob"}
+
+	importedDraft := ir.DashboardIR{
+		SchemaVersion: ir.SchemaVersion,
+		Revision:      1,
+		Title:         "Imported Multi-Query Dashboard",
+		TimeRange:     ir.TimeRange{From: "now-15m", To: "now"},
+		Panels: []ir.PanelIR{
+			{
+				ID:            "panel-lat",
+				Type:          "timeseries",
+				Title:         "Latency",
+				DatasourceRef: ir.SelectedDatasourceRef,
+				Queries: []ir.QueryIR{
+					{RefID: "A", Expr: `histogram_quantile(0.50, sum by (le) (rate(http_request_duration_seconds_bucket{service="checkout-api"}[5m])))`, LegendFormat: "p50"},
+					{RefID: "B", Expr: `histogram_quantile(0.99, sum by (le) (rate(http_request_duration_seconds_bucket{service="checkout-api"}[5m])))`, LegendFormat: "p99"},
+				},
+				Unit:   "s",
+				Layout: ir.LayoutHint{Row: 0, Col: 0, Width: "full"},
+			},
+		},
+	}
+
+	snap, err := mgr.Import(alice, jobs.ImportInput{
+		DatasourceUID: "prom-main",
+		Scope:         &ir.ScopeFilter{LabelName: "service", LabelValue: "checkout-api"},
+		Draft:         importedDraft,
+		ImportSource: &ir.ImportSource{
+			UID:             "existing-dash-1",
+			ResourceVersion: "42",
+			FolderUID:       "sre-folder",
+			Title:           "Imported Multi-Query Dashboard",
+		},
+		Catalog: testCatalog(),
+	})
+	if err != nil {
+		t.Fatalf("Import failed: %v", err)
+	}
+	if snap.ImportSource == nil || snap.ImportSource.UID != "existing-dash-1" || snap.ImportSource.ResourceVersion != "42" {
+		t.Fatalf("expected ImportSource preserved on snapshot, got %+v", snap.ImportSource)
+	}
+	if _, err := mgr.Get(bob, snap.JobID); !errors.Is(err, jobs.ErrForbidden) {
+		t.Fatalf("expected cross-user access to imported job to return ErrForbidden, got %v", err)
+	}
+
+	// Reject imported draft containing unsafe catch-all regex even without catalog.
+	unsafeDraft := importedDraft.Clone()
+	unsafeDraft.Panels[0].Queries[0].Expr = `rate(http_requests_total{status=~".*"}[5m])`
+	if _, err := mgr.Import(alice, jobs.ImportInput{
+		DatasourceUID: "prom-main",
+		Draft:         unsafeDraft,
+	}); err == nil {
+		t.Fatal("expected Import to reject unsafe catch-all regex PromQL")
+	}
+
+	// Repair multi-query panel via PanelQueryHash.
+	repairedSnap, err := mgr.Repair(context.Background(), alice, snap.JobID, jobs.RepairInput{
+		BaseRevision: snap.CurrentIR.Revision,
+		Results: []ir.PanelValidationResult{
+			{
+				PanelID:   "panel-lat",
+				QueryHash: ir.PanelQueryHash(snap.CurrentIR.Panels[0]),
+				Category:  ir.ValidationSyntaxError,
+				ErrorText: "[B] parse error",
+			},
+		},
+		Catalog: testCatalog(),
+	})
+	if err != nil {
+		t.Fatalf("multi-query Repair failed: %v", err)
+	}
+	if repairedSnap.CurrentIR.Revision != 2 || len(repairedSnap.CurrentIR.Panels[0].Queries) != 2 {
+		t.Fatalf("unexpected repaired multi-query snapshot: %+v", repairedSnap.CurrentIR)
+	}
+}

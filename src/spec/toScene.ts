@@ -1,14 +1,30 @@
-import { ThresholdsMode } from '@grafana/data';
+import { ThresholdsMode, VariableRefresh, VariableSort } from '@grafana/data';
 import {
+  CustomVariable,
   EmbeddedScene,
   PanelBuilders,
+  QueryVariable,
   SceneGridItem,
   SceneGridLayout,
   SceneQueryRunner,
   SceneTimeRange,
+  SceneVariable,
+  SceneVariableSet,
+  VariableValueSelectors,
 } from '@grafana/scenes';
-import { LegendDisplayMode } from '@grafana/schema';
-import { NormalizedDashboardSpec, NormalizedPanelSpec } from './normalize';
+import {
+  BarGaugeDisplayMode,
+  LegendDisplayMode,
+  TableCellHeight,
+  VariableHide,
+  VisibilityMode,
+  VizOrientation,
+} from '@grafana/schema';
+import {
+  NormalizedDashboardSpec,
+  NormalizedPanelSpec,
+  NormalizedVariableSpec,
+} from './normalize';
 
 export interface SceneAdapterOptions {
   /**
@@ -22,7 +38,7 @@ export interface SceneAdapterOptions {
  * - Uses ONLY public @grafana/scenes APIs (never internal DashboardScene).
  * - Disables auto-refresh AND disables refreshOnActivate ({}) so re-activation never
  *   silently re-evaluates relative timeRange or re-issues Prometheus queries (H-8).
- * - Mirrors timeseries legend and stat reduceOptions identically to toFoundation.ts (H-12).
+ * - Mirrors panel options, multi-query targets, and template variables identically to toFoundation.ts (H-12).
  */
 export function buildPreviewScene(
   spec: NormalizedDashboardSpec,
@@ -31,8 +47,9 @@ export function buildPreviewScene(
   const maxDataPoints = options.maxDataPoints ?? 200;
 
   const gridItems = spec.panels.map((panel) => buildGridItem(panel, maxDataPoints));
+  const sceneVariables = spec.variables.map(buildSceneVariable);
 
-  return new EmbeddedScene({
+  const sceneState: ConstructorParameters<typeof EmbeddedScene>[0] = {
     $timeRange: new SceneTimeRange({
       from: spec.timeRange.from,
       to: spec.timeRange.to,
@@ -43,6 +60,46 @@ export function buildPreviewScene(
       isResizable: false,
       children: gridItems,
     }),
+  };
+
+  if (sceneVariables.length > 0) {
+    sceneState.$variables = new SceneVariableSet({
+      variables: sceneVariables,
+    });
+    sceneState.controls = [new VariableValueSelectors({})];
+  }
+
+  return new EmbeddedScene(sceneState);
+}
+
+function buildSceneVariable(v: NormalizedVariableSpec): SceneVariable {
+  if (v.type === 'query') {
+    return new QueryVariable({
+      name: v.name,
+      label: v.label,
+      datasource: v.datasource ?? null,
+      query: v.query,
+      value: v.defaultValue,
+      text: v.defaultValue,
+      isMulti: v.multi,
+      includeAll: v.includeAll,
+      refresh: VariableRefresh.onDashboardLoad,
+      sort: VariableSort.alphabeticalAsc,
+      hide: VariableHide.dontHide,
+      skipUrlSync: true,
+    });
+  }
+
+  return new CustomVariable({
+    name: v.name,
+    label: v.label,
+    query: v.query,
+    value: v.defaultValue,
+    text: v.defaultValue,
+    isMulti: v.multi,
+    includeAll: v.includeAll,
+    hide: VariableHide.dontHide,
+    skipUrlSync: true,
   });
 }
 
@@ -50,14 +107,12 @@ function buildGridItem(panel: NormalizedPanelSpec, maxDataPoints: number): Scene
   const queryRunner = new SceneQueryRunner({
     datasource: panel.datasource,
     maxDataPoints,
-    queries: [
-      {
-        refId: panel.target.refId,
-        expr: panel.target.expr,
-        legendFormat: panel.target.legendFormat,
-        datasource: panel.target.datasource,
-      },
-    ],
+    queries: panel.targets.map((target) => ({
+      refId: target.refId,
+      expr: target.expr,
+      legendFormat: target.legendFormat,
+      datasource: target.datasource,
+    })),
   });
 
   const thresholdSteps = panel.thresholds.map((step) => ({
@@ -65,43 +120,153 @@ function buildGridItem(panel: NormalizedPanelSpec, maxDataPoints: number): Scene
     color: step.color,
   }));
 
+  const thresholdsConfig = {
+    mode: ThresholdsMode.Absolute,
+    steps: thresholdSteps,
+  };
+
   let body;
-  if (panel.type === 'stat') {
-    const statBuilder = PanelBuilders.stat()
-      .setTitle(panel.title)
-      .setData(queryRunner)
-      .setUnit(panel.unit)
-      .setThresholds({
-        mode: ThresholdsMode.Absolute,
-        steps: thresholdSteps,
-      })
-      .setOption('reduceOptions', {
-        calcs: ['lastNotNull'],
-        values: false,
-      });
-    if (panel.description) {
-      statBuilder.setDescription(panel.description);
+  switch (panel.type) {
+    case 'stat': {
+      const builder = PanelBuilders.stat()
+        .setTitle(panel.title)
+        .setData(queryRunner)
+        .setUnit(panel.unit)
+        .setThresholds(thresholdsConfig)
+        .setOption('reduceOptions', {
+          calcs: ['lastNotNull'],
+          values: false,
+        });
+      if (panel.description) {
+        builder.setDescription(panel.description);
+      }
+      body = builder.build();
+      break;
     }
-    body = statBuilder.build();
-  } else {
-    const tsBuilder = PanelBuilders.timeseries()
-      .setTitle(panel.title)
-      .setData(queryRunner)
-      .setUnit(panel.unit)
-      .setThresholds({
-        mode: ThresholdsMode.Absolute,
-        steps: thresholdSteps,
-      })
-      .setOption('legend', {
-        showLegend: true,
-        displayMode: LegendDisplayMode.List,
-        placement: 'bottom',
-        calcs: [],
-      });
-    if (panel.description) {
-      tsBuilder.setDescription(panel.description);
+
+    case 'table': {
+      const builder = PanelBuilders.table()
+        .setTitle(panel.title)
+        .setData(queryRunner)
+        .setUnit(panel.unit)
+        .setThresholds(thresholdsConfig)
+        .setOption('frameIndex', 0)
+        .setOption('showHeader', true)
+        .setOption('showTypeIcons', false)
+        .setOption('cellHeight', TableCellHeight.Sm);
+      if (panel.description) {
+        builder.setDescription(panel.description);
+      }
+      body = builder.build();
+      break;
     }
-    body = tsBuilder.build();
+
+    case 'gauge': {
+      const builder = PanelBuilders.gauge()
+        .setTitle(panel.title)
+        .setData(queryRunner)
+        .setUnit(panel.unit)
+        .setThresholds(thresholdsConfig)
+        .setOption('reduceOptions', {
+          calcs: ['lastNotNull'],
+          values: false,
+        })
+        .setOption('showThresholdLabels', false)
+        .setOption('showThresholdMarkers', true)
+        .setOption('orientation', VizOrientation.Auto);
+      if (panel.description) {
+        builder.setDescription(panel.description);
+      }
+      body = builder.build();
+      break;
+    }
+
+    case 'bargauge': {
+      const builder = PanelBuilders.bargauge()
+        .setTitle(panel.title)
+        .setData(queryRunner)
+        .setUnit(panel.unit)
+        .setThresholds(thresholdsConfig)
+        .setOption('reduceOptions', {
+          calcs: ['lastNotNull'],
+          values: false,
+        })
+        .setOption('displayMode', BarGaugeDisplayMode.Gradient)
+        .setOption('orientation', VizOrientation.Horizontal)
+        .setOption('showUnfilled', true);
+      if (panel.description) {
+        builder.setDescription(panel.description);
+      }
+      body = builder.build();
+      break;
+    }
+
+    case 'piechart': {
+      const builder = PanelBuilders.piechart()
+        .setTitle(panel.title)
+        .setData(queryRunner)
+        .setUnit(panel.unit)
+        .setThresholds(thresholdsConfig)
+        .setOption('pieType', 'pie' as never)
+        .setOption('reduceOptions', {
+          calcs: ['lastNotNull'],
+          values: false,
+        })
+        .setOption('legend', {
+          showLegend: true,
+          displayMode: LegendDisplayMode.List,
+          placement: 'bottom',
+          values: [],
+          calcs: [],
+        });
+      if (panel.description) {
+        builder.setDescription(panel.description);
+      }
+      body = builder.build();
+      break;
+    }
+
+    case 'state-timeline': {
+      const builder = PanelBuilders.statetimeline()
+        .setTitle(panel.title)
+        .setData(queryRunner)
+        .setUnit(panel.unit)
+        .setThresholds(thresholdsConfig)
+        .setOption('mergeValues', true)
+        .setOption('showValue', VisibilityMode.Auto)
+        .setOption('rowHeight', 0.9)
+        .setOption('legend', {
+          showLegend: true,
+          displayMode: LegendDisplayMode.List,
+          placement: 'bottom',
+          calcs: [],
+        });
+      if (panel.description) {
+        builder.setDescription(panel.description);
+      }
+      body = builder.build();
+      break;
+    }
+
+    case 'timeseries':
+    default: {
+      const builder = PanelBuilders.timeseries()
+        .setTitle(panel.title)
+        .setData(queryRunner)
+        .setUnit(panel.unit)
+        .setThresholds(thresholdsConfig)
+        .setOption('legend', {
+          showLegend: true,
+          displayMode: LegendDisplayMode.List,
+          placement: 'bottom',
+          calcs: [],
+        });
+      if (panel.description) {
+        builder.setDescription(panel.description);
+      }
+      body = builder.build();
+      break;
+    }
   }
 
   return new SceneGridItem({
