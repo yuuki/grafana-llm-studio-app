@@ -174,5 +174,28 @@ describe('AppConfig settings preservation, secret reset, and validation', () => 
     await waitFor(() => expect(mockFetch).toHaveBeenCalledTimes(1));
     expect(mockFetch.mock.calls[0][0].data.jsonData.llmMode).toBe('grafana-llm-app');
     expect(mockFetch.mock.calls[0][0].data.jsonData.allowMockInDev).toBe(false);
+    expect(mockFetch.mock.calls[0][0].data.jsonData.structuredOutputMode).toBe('json_schema');
+    expect(mockFetch.mock.calls[0][0].data.jsonData.tokenLimitField).toBe('max_completion_tokens');
+    expect(mockFetch.mock.calls[0][0].data.jsonData.reasoningEffort).toBe('');
+  });
+
+  test('allows configuring json_object, max_tokens, and reasoningEffort for third-party OpenAI-compatible APIs', async () => {
+    const plugin = makePlugin({
+      allowedDatasourceUids: ['prom-main'],
+      llmMode: 'grafana-llm-app',
+    });
+
+    render(<AppConfig plugin={plugin as never} query={{}} />);
+    const selects = screen.getAllByRole('combobox');
+    // Selects: [0]=llmMode, [1]=modelTier, [2]=structuredOutputMode, [3]=tokenLimitField, [4]=reasoningEffort
+    fireEvent.change(selects[2], { target: { value: 'json_object' } });
+    fireEvent.change(selects[3], { target: { value: 'max_tokens' } });
+    fireEvent.change(selects[4], { target: { value: 'low' } });
+
+    fireEvent.click(screen.getByText('設定を保存'));
+    await waitFor(() => expect(mockFetch).toHaveBeenCalledTimes(1));
+    expect(mockFetch.mock.calls[0][0].data.jsonData.structuredOutputMode).toBe('json_object');
+    expect(mockFetch.mock.calls[0][0].data.jsonData.tokenLimitField).toBe('max_tokens');
+    expect(mockFetch.mock.calls[0][0].data.jsonData.reasoningEffort).toBe('low');
   });
 });

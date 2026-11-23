@@ -17,17 +17,26 @@ import (
 	"github.com/yuuki/grafana-llm-studio-app/schemas"
 )
 
+const (
+	StructuredOutputJSONSchema    = "json_schema"
+	StructuredOutputJSONObject    = "json_object"
+	TokenLimitMaxCompletionTokens = "max_completion_tokens"
+	TokenLimitMaxTokens           = "max_tokens"
+)
+
 // GrafanaLLMConfig configures the official grafana-llm-app llmclient adapter.
 // All inference traffic MUST go through Grafana's plugin resource API (/api/plugins/grafana-llm-app/resources/llm/v1).
 type GrafanaLLMConfig struct {
-	GrafanaURL          string
-	ServiceAccountToken string
-	ModelTier           llmclient.Model // "base" or "large"
-	MaxOutputTokens     int
-	ReasoningEffort     string // optional: "", "low", "medium", "high"
-	RequestTimeout      time.Duration
-	MaxTransportRetries int // strictly transport-level retries (max 1), never nested with semantic repair
-	HTTPClient          *http.Client
+	GrafanaURL           string
+	ServiceAccountToken  string
+	ModelTier            llmclient.Model // "base" or "large"
+	StructuredOutputMode string          // "json_schema" (default) or "json_object"
+	TokenLimitField      string          // "max_completion_tokens" (default) or "max_tokens"
+	MaxOutputTokens      int
+	ReasoningEffort      string // optional: "", "low", "medium", "high"
+	RequestTimeout       time.Duration
+	MaxTransportRetries  int // strictly transport-level retries (max 1), never nested with semantic repair
+	HTTPClient           *http.Client
 }
 
 // rawSchemaMarshaler satisfies json.Marshaler for go-openai's ChatCompletionResponseFormatJSONSchema.
@@ -55,6 +64,18 @@ func NewGrafanaLLMClient(cfg GrafanaLLMConfig) (*GrafanaLLMClient, error) {
 	}
 	if cfg.ModelTier != llmclient.ModelBase && cfg.ModelTier != llmclient.ModelLarge {
 		cfg.ModelTier = llmclient.ModelBase
+	}
+	if cfg.StructuredOutputMode == "" {
+		cfg.StructuredOutputMode = StructuredOutputJSONSchema
+	}
+	if cfg.StructuredOutputMode != StructuredOutputJSONSchema && cfg.StructuredOutputMode != StructuredOutputJSONObject {
+		return nil, fmt.Errorf("unsupported structuredOutputMode %q", cfg.StructuredOutputMode)
+	}
+	if cfg.TokenLimitField == "" {
+		cfg.TokenLimitField = TokenLimitMaxCompletionTokens
+	}
+	if cfg.TokenLimitField != TokenLimitMaxCompletionTokens && cfg.TokenLimitField != TokenLimitMaxTokens {
+		return nil, fmt.Errorf("unsupported tokenLimitField %q", cfg.TokenLimitField)
 	}
 	if cfg.MaxOutputTokens <= 0 {
 		cfg.MaxOutputTokens = 2048
@@ -126,24 +147,46 @@ func (c *GrafanaLLMClient) callStructured(
 	schemaName string,
 	schemaBytes []byte,
 ) ([]byte, CompletionMeta, error) {
-	chatReq := openai.ChatCompletionRequest{
-		Messages:            messages,
-		MaxCompletionTokens: c.cfg.MaxOutputTokens,
-		ReasoningEffort:     c.cfg.ReasoningEffort,
-		ResponseFormat: &openai.ChatCompletionResponseFormat{
+	reqMessages := make([]openai.ChatCompletionMessage, len(messages))
+	copy(reqMessages, messages)
+
+	var responseFormat *openai.ChatCompletionResponseFormat
+	if c.cfg.StructuredOutputMode == StructuredOutputJSONObject {
+		// Compatible with OpenAI-compatible providers (e.g., DeepSeek API) that support only
+		// response_format={"type":"json_object"} rather than json_schema. Include the schema in the
+		// system prompt so the model knows the exact IR/Patch contract; Go Backend validates strictly.
+		if len(reqMessages) > 0 && reqMessages[0].Role == openai.ChatMessageRoleSystem {
+			reqMessages[0].Content = reqMessages[0].Content + "\n\nOutput MUST conform to this JSON Schema:\n" + string(schemaBytes)
+		}
+		responseFormat = &openai.ChatCompletionResponseFormat{
+			Type: openai.ChatCompletionResponseFormatTypeJSONObject,
+		}
+	} else {
+		responseFormat = &openai.ChatCompletionResponseFormat{
 			Type: openai.ChatCompletionResponseFormatTypeJSONSchema,
 			JSONSchema: &openai.ChatCompletionResponseFormatJSONSchema{
 				Name:   schemaName,
 				Schema: rawSchemaMarshaler{raw: json.RawMessage(schemaBytes)},
 				// Strict is intentionally false because schemas include optional properties and
 				// grafana-llm-app's go-openai/jsonschema.Definition cannot represent nullable unions;
-				// vLLM still enforces structural JSON Schema + additionalProperties:false + string enums,
+				// OpenAI/vLLM still enforce structural JSON Schema + additionalProperties:false + string enums,
 				// and Go Backend enforces all remaining bounds deterministically.
 				Strict: false,
 			},
-		},
+		}
 	}
-	// Omit Temperature when ReasoningEffort is explicitly specified to avoid conflicts on reasoning models.
+
+	chatReq := openai.ChatCompletionRequest{
+		Messages:        reqMessages,
+		ReasoningEffort: c.cfg.ReasoningEffort,
+		ResponseFormat:  responseFormat,
+	}
+	if c.cfg.TokenLimitField == TokenLimitMaxTokens {
+		chatReq.MaxTokens = c.cfg.MaxOutputTokens
+	} else {
+		chatReq.MaxCompletionTokens = c.cfg.MaxOutputTokens
+	}
+	// Omit Temperature when ReasoningEffort is explicitly specified to avoid HTTP 400 on reasoning models.
 	if c.cfg.ReasoningEffort == "" {
 		chatReq.Temperature = 0.1
 	}
@@ -262,6 +305,9 @@ func isWrappedTransient500(text string) bool {
 	return strings.Contains(lower, "status code: 502") ||
 		strings.Contains(lower, "status code: 503") ||
 		strings.Contains(lower, "status code: 504") ||
+		strings.Contains(lower, "status code: 520") ||
+		strings.Contains(lower, "status code: 522") ||
+		strings.Contains(lower, "status code: 524") ||
 		strings.Contains(lower, "connection reset") ||
 		strings.Contains(lower, "unexpected eof")
 }

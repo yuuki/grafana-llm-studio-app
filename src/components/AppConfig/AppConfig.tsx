@@ -20,6 +20,8 @@ export interface StudioJsonData {
   allowMockInDev?: boolean;
   grafanaUrl?: string;
   modelTier?: 'base' | 'large';
+  structuredOutputMode?: 'json_schema' | 'json_object';
+  tokenLimitField?: 'max_completion_tokens' | 'max_tokens';
   reasoningEffort?: string;
   maxPanels?: number;
   maxRepairAttempts?: number;
@@ -39,7 +41,13 @@ export const AppConfig: React.FC<PluginConfigPageProps<AppPluginMeta<StudioJsonD
   const [allowMockInDev, setAllowMockInDev] = useState(Boolean(jsonData?.allowMockInDev));
   const [grafanaUrl, setGrafanaUrl] = useState(jsonData?.grafanaUrl ?? 'http://localhost:3000');
   const [modelTier, setModelTier] = useState<'base' | 'large'>(jsonData?.modelTier ?? 'base');
-  const [reasoningEffort, setReasoningEffort] = useState(jsonData?.reasoningEffort ?? 'low');
+  const [structuredOutputMode, setStructuredOutputMode] = useState<'json_schema' | 'json_object'>(
+    jsonData?.structuredOutputMode ?? 'json_schema'
+  );
+  const [tokenLimitField, setTokenLimitField] = useState<'max_completion_tokens' | 'max_tokens'>(
+    jsonData?.tokenLimitField ?? 'max_completion_tokens'
+  );
+  const [reasoningEffort, setReasoningEffort] = useState(jsonData?.reasoningEffort ?? '');
   const [maxPanels, setMaxPanels] = useState(jsonData?.maxPanels ?? 6);
   const [maxRepairAttempts, setMaxRepairAttempts] = useState(jsonData?.maxRepairAttempts ?? 2);
   const [maxOutputTokens, setMaxOutputTokens] = useState(jsonData?.maxOutputTokens ?? 2048);
@@ -113,6 +121,8 @@ export const AppConfig: React.FC<PluginConfigPageProps<AppPluginMeta<StudioJsonD
         allowMockInDev: llmMode === 'mock' ? allowMockInDev : false,
         grafanaUrl: grafanaUrl.trim(),
         modelTier,
+        structuredOutputMode,
+        tokenLimitField,
         reasoningEffort: reasoningEffort.trim().toLowerCase(),
         maxPanels: Math.trunc(Number(maxPanels)),
         maxRepairAttempts: Math.trunc(Number(maxRepairAttempts)),
@@ -171,7 +181,9 @@ export const AppConfig: React.FC<PluginConfigPageProps<AppPluginMeta<StudioJsonD
   return (
     <div style={{ maxWidth: 760 }}>
       <Alert title="権限とセキュリティ方針" severity="info">
-        LLM 呼び出しはすべて grafana-llm-app に一本化されます。ここに入力するサービスアカウントトークンは
+        LLM 呼び出しはすべて grafana-llm-app に一本化されます（閉域ローカル vLLM およびインターネット経由の
+        OpenAI / OpenAI 互換 API のいずれを利用する場合も、接続先 URL・API キー・モデル対応付けは
+        grafana-llm-app 側で設定してください）。ここに入力するサービスアカウントトークンは
         secureJsonData として暗号化保存され、LLM 中継以外のデータ取得・ダッシュボード保存には一切流用されません。
       </Alert>
 
@@ -198,7 +210,7 @@ export const AppConfig: React.FC<PluginConfigPageProps<AppPluginMeta<StudioJsonD
         <Field label="LLM モード">
           <Select
             options={[
-              { label: 'grafana-llm-app（本番推奨・ローカル vLLM 中継）', value: 'grafana-llm-app' },
+              { label: 'grafana-llm-app（本番推奨・ローカル vLLM / OpenAI 互換 API 中継）', value: 'grafana-llm-app' },
               { label: 'mock（開発・テスト専用）', value: 'mock' },
             ]}
             value={llmMode}
@@ -242,13 +254,48 @@ export const AppConfig: React.FC<PluginConfigPageProps<AppPluginMeta<StudioJsonD
         </Field>
 
         <Field
-          label="Reasoning Effort（推論トークン抑制用・任意）"
-          description="空欄または low / medium / high。GLM-5.3 等の長考抑制には low を推奨します。"
+          label="Structured Output 形式"
+          description="OpenAI (GPT-4o/4.1/5)・Azure OpenAI・OpenRouter・Gemini OpenAI互換・vLLM は json_schema を推奨。json_schema 非対応の OpenAI 互換 API（DeepSeek API 等）は json_object を選択してください。"
         >
-          <Input
+          <Select
+            options={[
+              { label: 'json_schema（標準・OpenAI / OpenRouter / Gemini互換 / vLLM 推奨）', value: 'json_schema' },
+              { label: 'json_object（json_schema 非対応の OpenAI 互換 API 向け）', value: 'json_object' },
+            ]}
+            value={structuredOutputMode}
+            onChange={(v) => setStructuredOutputMode((v.value as 'json_schema' | 'json_object') ?? 'json_schema')}
+          />
+        </Field>
+
+        <Field
+          label="出力トークン上限パラメータ"
+          description="OpenAI・Azure OpenAI・OpenRouter・Groq・vLLM は max_completion_tokens。旧式/一部サードパーティ OpenAI 互換 API（DeepSeek API 等）は max_tokens を選択してください。"
+        >
+          <Select
+            options={[
+              { label: 'max_completion_tokens（推奨・OpenAI / OpenRouter / Groq / vLLM）', value: 'max_completion_tokens' },
+              { label: 'max_tokens（一部サードパーティ OpenAI 互換 API 向け）', value: 'max_tokens' },
+            ]}
+            value={tokenLimitField}
+            onChange={(v) =>
+              setTokenLimitField((v.value as 'max_completion_tokens' | 'max_tokens') ?? 'max_completion_tokens')
+            }
+          />
+        </Field>
+
+        <Field
+          label="Reasoning Effort（推論モデル向け・任意）"
+          description="通常モデル（GPT-4o / GPT-4.1 / Llama / DeepSeek-Chat 等）は未指定（自動）を選択してください。推論モデル（o3 / GPT-5 / GLM-5.3 等）の長考抑制には low を推奨します。"
+        >
+          <Select
+            options={[
+              { label: '未指定 / 自動（通常 OpenAI・OpenAI 互換モデル推奨）', value: '' },
+              { label: 'low（推論モデル向け・高速）', value: 'low' },
+              { label: 'medium（推論モデル向け・標準）', value: 'medium' },
+              { label: 'high（推論モデル向け・最大）', value: 'high' },
+            ]}
             value={reasoningEffort}
-            onChange={(e) => setReasoningEffort(e.currentTarget.value)}
-            placeholder="low"
+            onChange={(v) => setReasoningEffort(v.value ?? '')}
           />
         </Field>
 

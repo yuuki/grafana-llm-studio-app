@@ -29,9 +29,9 @@ flowchart LR
     LLMCli["llmclient v0.20.0 Adapter\n(Structured Output)"]
   end
 
-  subgraph Infra["Air-Gapped Infrastructure"]
+  subgraph Infra["Inference & Metrics Infrastructure"]
     Prom["Prometheus / VictoriaMetrics\n(Upstream Query Guardrails)"]
-    VLLM["vLLM OpenAI-Compatible Server\n(Revision-Pinned Local Model)"]
+    VLLM["OpenAI-Compatible API (HTTPS)\nor Self-Hosted Local vLLM"]
   end
 
   UI --> Meta --> DSProxy --> Prom

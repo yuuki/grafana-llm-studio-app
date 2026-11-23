@@ -12,6 +12,7 @@ import (
 	"github.com/grafana/grafana-llm-app/llmclient"
 	"github.com/grafana/grafana-plugin-sdk-go/backend"
 	"github.com/yuuki/grafana-llm-studio-app/pkg/ir"
+	"github.com/yuuki/grafana-llm-studio-app/pkg/llm"
 )
 
 const (
@@ -26,6 +27,16 @@ var allowedReasoningEfforts = map[string]bool{
 	"high":   true,
 }
 
+var allowedStructuredOutputModes = map[string]bool{
+	llm.StructuredOutputJSONSchema: true,
+	llm.StructuredOutputJSONObject: true,
+}
+
+var allowedTokenLimitFields = map[string]bool{
+	llm.TokenLimitMaxCompletionTokens: true,
+	llm.TokenLimitMaxTokens:           true,
+}
+
 // JSONSettings holds non-secret admin configuration stored in Grafana plugin jsonData.
 type JSONSettings struct {
 	AllowedDatasourceUIDs []string `json:"allowedDatasourceUids"`
@@ -33,6 +44,8 @@ type JSONSettings struct {
 	AllowMockInDev        bool     `json:"allowMockInDev"`
 	GrafanaURL            string   `json:"grafanaUrl"`
 	ModelTier             string   `json:"modelTier"`
+	StructuredOutputMode  string   `json:"structuredOutputMode,omitempty"`
+	TokenLimitField       string   `json:"tokenLimitField,omitempty"`
 	ReasoningEffort       *string  `json:"reasoningEffort,omitempty"`
 	MaxPanels             int      `json:"maxPanels"`
 	MaxRepairAttempts     *int     `json:"maxRepairAttempts,omitempty"`
@@ -114,8 +127,26 @@ func LoadSettings(appSettings backend.AppInstanceSettings, trustedGrafanaAppURL 
 		js.ModelTier = string(llmclient.ModelBase)
 	}
 
-	// Default ReasoningEffort to "low" (matching docs) when omitted; allow explicit "" to unset.
-	reasoning := "low"
+	js.StructuredOutputMode = strings.TrimSpace(strings.ToLower(js.StructuredOutputMode))
+	if js.StructuredOutputMode == "" {
+		js.StructuredOutputMode = llm.StructuredOutputJSONSchema
+	}
+	if !allowedStructuredOutputModes[js.StructuredOutputMode] {
+		return Settings{}, fmt.Errorf("unsupported structuredOutputMode %q (allowed: json_schema, json_object)", js.StructuredOutputMode)
+	}
+
+	js.TokenLimitField = strings.TrimSpace(strings.ToLower(js.TokenLimitField))
+	if js.TokenLimitField == "" {
+		js.TokenLimitField = llm.TokenLimitMaxCompletionTokens
+	}
+	if !allowedTokenLimitFields[js.TokenLimitField] {
+		return Settings{}, fmt.Errorf("unsupported tokenLimitField %q (allowed: max_completion_tokens, max_tokens)", js.TokenLimitField)
+	}
+
+	// Default ReasoningEffort to "" (omitted) so standard OpenAI and OpenAI-compatible models
+	// (e.g., GPT-4o, GPT-4.1, Llama, DeepSeek-Chat) do not fail with HTTP 400 unsupported parameter.
+	// Reasoning models (e.g., o3, GPT-5, GLM-5.3) can explicitly opt into "low", "medium", or "high".
+	reasoning := ""
 	if js.ReasoningEffort != nil {
 		reasoning = strings.TrimSpace(strings.ToLower(*js.ReasoningEffort))
 	}

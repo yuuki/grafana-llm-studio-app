@@ -1,6 +1,8 @@
-# Air-Gapped Deployment & Operations Guide
+# Air-Gapped / Offline Deployment & Operations Guide
 
-This guide describes how to package, transfer, deploy, and operate `yuuki-llmstudio-app` in an air-gapped (offline) environment with zero runtime access to the internet, external CDNs, Grafana Cloud, or external LLM APIs.
+This guide covers packaging, transferring, deploying, and operating `yuuki-llmstudio-app` in **strictly offline / air-gapped environments** with zero runtime outbound internet access.
+
+> **Using an internet-connected environment?** You can install `grafana-llm-app` normally and connect to hosted OpenAI or OpenAI-compatible APIs — see [`docs/openai-compatible-apis.md`](openai-compatible-apis.md). The upstream Prometheus / VictoriaMetrics query guardrails in [Section 3](#3-upstream-prometheus--victoriametrics-query-limits-final-dos-boundary) apply to all environments.
 
 ## 1. Staging Preparation (Internet-Connected Staging Host)
 

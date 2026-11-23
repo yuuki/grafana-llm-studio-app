@@ -299,6 +299,84 @@ func TestGrafanaLLMApp_To_VLLM_Contract(t *testing.T) {
 		forceStatus.Store(0)
 	})
 
+	t.Run("wrapped HTTP 429 rate limit is NEVER retried (prevents quota burn)", func(t *testing.T) {
+		vllmCalls.Store(0)
+		forceStatus.Store(http.StatusTooManyRequests)
+		_, _, err := client.GenerateIR(context.Background(), llm.GenerateRequest{
+			UserIntent: "Show request rate",
+			Scope:      scope,
+			Catalog:    catalog,
+			MaxPanels:  6,
+		})
+		forceStatus.Store(0)
+		if err == nil {
+			t.Fatal("expected wrapped 429 error")
+		}
+		if got := vllmCalls.Load(); got != 1 {
+			t.Fatalf("expected 1 attempt (no retry) on wrapped 429, got %d", got)
+		}
+	})
+
+	t.Run("internet OpenAI-compatible mode: omits reasoning_effort when empty, supports json_object and max_tokens", func(t *testing.T) {
+		compatClient, err := llm.NewGrafanaLLMClient(llm.GrafanaLLMConfig{
+			GrafanaURL:           grafanaSrv.URL,
+			ServiceAccountToken:  expectedSAToken,
+			ModelTier:            llmclient.ModelBase,
+			StructuredOutputMode: llm.StructuredOutputJSONObject,
+			TokenLimitField:      llm.TokenLimitMaxTokens,
+			MaxOutputTokens:      2048,
+			ReasoningEffort:      "",
+			RequestTimeout:       5 * time.Second,
+			MaxTransportRetries:  1,
+		})
+		if err != nil {
+			t.Fatalf("NewGrafanaLLMClient compat: %v", err)
+		}
+
+		capturedVLLMReq = nil
+		rawIR, _, err := compatClient.GenerateIR(context.Background(), llm.GenerateRequest{
+			UserIntent: "Show request rate",
+			Scope:      scope,
+			Catalog:    catalog,
+			MaxPanels:  6,
+		})
+		if err != nil {
+			t.Fatalf("compat GenerateIR: %v", err)
+		}
+		if len(rawIR) == 0 {
+			t.Fatal("expected non-empty IR bytes")
+		}
+
+		if _, exists := capturedVLLMReq["reasoning_effort"]; exists {
+			t.Fatalf("expected reasoning_effort to be omitted when empty, got %v", capturedVLLMReq["reasoning_effort"])
+		}
+		if temp, ok := capturedVLLMReq["temperature"].(float64); !ok || temp <= 0 {
+			t.Fatalf("expected temperature to be sent when reasoning_effort is empty, got %v", capturedVLLMReq["temperature"])
+		}
+		if mt, ok := capturedVLLMReq["max_tokens"].(float64); !ok || int(mt) != 2048 {
+			t.Fatalf("expected max_tokens=2048, got %v", capturedVLLMReq["max_tokens"])
+		}
+		if _, exists := capturedVLLMReq["max_completion_tokens"]; exists {
+			t.Fatalf("expected max_completion_tokens to be omitted when tokenLimitField=max_tokens, got %v", capturedVLLMReq["max_completion_tokens"])
+		}
+		rf, _ := capturedVLLMReq["response_format"].(map[string]any)
+		if rf["type"] != "json_object" {
+			t.Fatalf("expected response_format.type=json_object, got %v", rf)
+		}
+		msgs, _ := capturedVLLMReq["messages"].([]any)
+		if len(msgs) == 0 {
+			t.Fatal("expected messages in request")
+		}
+		sysMsg, _ := msgs[0].(map[string]any)
+		sysContent, _ := sysMsg["content"].(string)
+		if sysContent == "" || !json.Valid([]byte(rawIR)) {
+			t.Fatal("expected valid JSON output and non-empty system prompt")
+		}
+		if !containsSubstring(sysContent, "JSON Schema") || !containsSubstring(sysContent, "selected_prometheus") {
+			t.Fatalf("expected system prompt in json_object mode to embed JSON Schema, got len=%d", len(sysContent))
+		}
+	})
+
 	t.Run("context cancellation propagates immediately without retry", func(t *testing.T) {
 		vllmCalls.Store(0)
 		ctx, cancel := context.WithCancel(context.Background())
@@ -316,6 +394,19 @@ func TestGrafanaLLMApp_To_VLLM_Contract(t *testing.T) {
 			t.Fatalf("expected 0 upstream calls for pre-cancelled context, got %d", got)
 		}
 	})
+}
+
+func containsSubstring(haystack, needle string) bool {
+	return len(needle) == 0 || (len(haystack) >= len(needle) && indexOf(haystack, needle) >= 0)
+}
+
+func indexOf(s, sub string) int {
+	for i := 0; i+len(sub) <= len(s); i++ {
+		if s[i:i+len(sub)] == sub {
+			return i
+		}
+	}
+	return -1
 }
 
 func jsonReader(b []byte) io.Reader {

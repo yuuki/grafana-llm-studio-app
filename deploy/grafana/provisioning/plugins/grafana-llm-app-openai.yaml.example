@@ -1,0 +1,30 @@
+# Example Grafana plugin provisioning for grafana-llm-app pointing to an internet-hosted
+# OpenAI or OpenAI-compatible API.
+#
+# IMPORTANT:
+# - Never commit real API keys into Git. Use Grafana environment variable expansion ($OPENAI_API_KEY)
+#   or configure credentials through the Grafana UI (stored encrypted in secureJsonData).
+# - All inference traffic still flows exclusively through grafana-llm-app:
+#     Frontend -> yuuki-llmstudio-app Go Backend -> grafana-llm-app -> HTTPS OpenAI-compatible API
+#
+# Copy this file to `grafana-llm-app-openai.yaml` (gitignored if you add secrets) to enable provisioning.
+
+apiVersion: 1
+
+apps:
+  - type: grafana-llm-app
+    org_id: 1
+    disabled: false
+    jsonData:
+      # Use "openai" for api.openai.com, or "custom" for OpenRouter / Groq / DeepSeek / Together / Gemini OpenAI-compat / vLLM.
+      provider: custom
+      openAI:
+        url: ${OPENAI_BASE_URL}
+        apiPath: ${OPENAI_API_PATH}
+      models:
+        default: base
+        mapping:
+          base: ${OPENAI_MODEL_BASE}
+          large: ${OPENAI_MODEL_LARGE}
+    secureJsonData:
+      openAIKey: ${OPENAI_API_KEY}

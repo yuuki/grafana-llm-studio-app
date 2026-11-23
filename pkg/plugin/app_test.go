@@ -42,12 +42,43 @@ func TestLoadSettings_SecurityAndDefaults(t *testing.T) {
 	if err != nil {
 		t.Fatalf("expected matching trusted AppURL origin to pass, got %v", err)
 	}
-	// M-4: reasoningEffort defaults to "low" and explicit maxRepairAttempts=0 is honored.
-	if s.EffectiveReasoningEffort != "low" {
-		t.Fatalf("expected default reasoningEffort=low, got %q", s.EffectiveReasoningEffort)
+	// Default reasoningEffort is "" (compatible with standard OpenAI/OpenAI-compat models),
+	// structuredOutputMode defaults to "json_schema", tokenLimitField defaults to "max_completion_tokens",
+	// and explicit maxRepairAttempts=0 is honored.
+	if s.EffectiveReasoningEffort != "" {
+		t.Fatalf("expected default reasoningEffort=\"\", got %q", s.EffectiveReasoningEffort)
+	}
+	if s.StructuredOutputMode != "json_schema" {
+		t.Fatalf("expected default structuredOutputMode=json_schema, got %q", s.StructuredOutputMode)
+	}
+	if s.TokenLimitField != "max_completion_tokens" {
+		t.Fatalf("expected default tokenLimitField=max_completion_tokens, got %q", s.TokenLimitField)
 	}
 	if s.EffectiveMaxRepairs != 0 {
 		t.Fatalf("expected explicit maxRepairAttempts=0 to be preserved, got %d", s.EffectiveMaxRepairs)
+	}
+
+	// Explicit json_object + max_tokens + reasoningEffort=low are accepted.
+	s2, err := plugin.LoadSettings(backend.AppInstanceSettings{
+		JSONData: []byte(`{"llmMode":"grafana-llm-app","structuredOutputMode":"json_object","tokenLimitField":"max_tokens","reasoningEffort":"low","allowedDatasourceUids":["prom-1"]}`),
+	})
+	if err != nil {
+		t.Fatalf("expected valid OpenAI-compatible overrides to pass, got %v", err)
+	}
+	if s2.StructuredOutputMode != "json_object" || s2.TokenLimitField != "max_tokens" || s2.EffectiveReasoningEffort != "low" {
+		t.Fatalf("unexpected parsed overrides: %+v", s2)
+	}
+
+	// Invalid structuredOutputMode or tokenLimitField MUST be rejected.
+	if _, err := plugin.LoadSettings(backend.AppInstanceSettings{
+		JSONData: []byte(`{"llmMode":"grafana-llm-app","structuredOutputMode":"invalid","allowedDatasourceUids":["prom-1"]}`),
+	}); err == nil {
+		t.Fatal("expected invalid structuredOutputMode to fail")
+	}
+	if _, err := plugin.LoadSettings(backend.AppInstanceSettings{
+		JSONData: []byte(`{"llmMode":"grafana-llm-app","tokenLimitField":"bad_field","allowedDatasourceUids":["prom-1"]}`),
+	}); err == nil {
+		t.Fatal("expected invalid tokenLimitField to fail")
 	}
 
 	// Production mode without token initializes with error, NEVER falls back to mock.

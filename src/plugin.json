@@ -8,7 +8,7 @@
   "executable": "gpx_yuuki_llmstudio_app",
   "info": {
     "keywords": ["app", "llm", "dashboard", "studio", "scenes", "prometheus"],
-    "description": "OSS air-gapped LLM Dashboard Studio powered by grafana-llm-app, Scenes, and Foundation SDK",
+    "description": "OSS LLM Dashboard Studio for self-hosted Grafana powered by grafana-llm-app, Scenes, and Foundation SDK",
     "author": {
       "name": "yuuki"
     },

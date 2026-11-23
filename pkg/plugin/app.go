@@ -70,13 +70,15 @@ func NewApp(ctx context.Context, appSettings backend.AppInstanceSettings) (insta
 		client = &llm.MockClient{}
 	case LLMModeGrafanaLLMApp:
 		client, initErr = llm.NewGrafanaLLMClient(llm.GrafanaLLMConfig{
-			GrafanaURL:          settings.GrafanaURL,
-			ServiceAccountToken: token,
-			ModelTier:           llmclient.Model(settings.ModelTier),
-			MaxOutputTokens:     settings.MaxOutputTokens,
-			ReasoningEffort:     settings.EffectiveReasoningEffort,
-			RequestTimeout:      settings.LLMTimeout(),
-			MaxTransportRetries: 1,
+			GrafanaURL:           settings.GrafanaURL,
+			ServiceAccountToken:  token,
+			ModelTier:            llmclient.Model(settings.ModelTier),
+			StructuredOutputMode: settings.StructuredOutputMode,
+			TokenLimitField:      settings.TokenLimitField,
+			MaxOutputTokens:      settings.MaxOutputTokens,
+			ReasoningEffort:      settings.EffectiveReasoningEffort,
+			RequestTimeout:       settings.LLMTimeout(),
+			MaxTransportRetries:  1,
 		})
 	default:
 		initErr = fmt.Errorf("unsupported llmMode: %s", settings.LLMMode)

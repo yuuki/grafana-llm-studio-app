@@ -1,0 +1,24 @@
+# Optional Docker Compose override for internet-connected OpenAI / OpenAI-compatible API testing
+# strictly routed through grafana-llm-app (no direct LLM connection from yuuki-llmstudio-app).
+#
+# Usage:
+#   1. Copy deploy/grafana/provisioning/plugins/grafana-llm-app-openai.yaml.example
+#      to   deploy/grafana/provisioning/plugins/grafana-llm-app-openai.yaml
+#      (and remove llm-studio-dev.yaml if switching yuuki-llmstudio-app to grafana-llm-app mode).
+#   2. Export OPENAI_API_KEY (and optional OPENAI_BASE_URL / OPENAI_MODEL_BASE / OPENAI_MODEL_LARGE).
+#   3. Run:
+#      docker compose -f deploy/docker-compose.yml -f deploy/docker-compose.openai.yml up -d
+#
+# Do NOT use this override in air-gapped environments (GF_INSTALL_PLUGINS downloads from Grafana.com).
+services:
+  grafana:
+    environment:
+      # Install grafana-llm-app automatically when internet access is available.
+      # For Grafana 13.x: grafana-llm-app 1.2.0; for Grafana 12.4.x: grafana-llm-app 1.0.8
+      GF_INSTALL_PLUGINS: "${GRAFANA_LLM_APP_INSTALL:-grafana-llm-app 1.2.0}"
+      GF_PLUGINS_PUBLIC_KEY_RETRIEVAL_DISABLED: "false"
+      OPENAI_API_KEY: "${OPENAI_API_KEY:?Set OPENAI_API_KEY in your shell or deploy/.env}"
+      OPENAI_BASE_URL: "${OPENAI_BASE_URL:-https://api.openai.com}"
+      OPENAI_API_PATH: "${OPENAI_API_PATH:-/v1}"
+      OPENAI_MODEL_BASE: "${OPENAI_MODEL_BASE:-gpt-4.1-mini}"
+      OPENAI_MODEL_LARGE: "${OPENAI_MODEL_LARGE:-gpt-4.1}"
