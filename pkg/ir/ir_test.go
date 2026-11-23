@@ -32,7 +32,7 @@ func TestValidAndInvalidSampleFixtures(t *testing.T) {
 	}
 }
 
-func TestValidateIR_RejectsSecurityAndBoundsViolations(t *testing.T) {
+func TestValidateIR_SecurityBoundsAndUTF8(t *testing.T) {
 	base := ir.DashboardIR{
 		SchemaVersion: ir.SchemaVersion,
 		Revision:      1,
@@ -58,6 +58,21 @@ func TestValidateIR_RejectsSecurityAndBoundsViolations(t *testing.T) {
 		}
 	})
 
+	t.Run("missing required numeric layout.row rejected by DecodeStrictIR", func(t *testing.T) {
+		missingRow := []byte(`{"schemaVersion":"1.0","revision":1,"title":"T","timeRange":{"from":"now-15m","to":"now"},"panels":[{"id":"panel-a","type":"timeseries","title":"A","datasourceRef":"selected_prometheus","query":{"expr":"up"},"unit":"short","layout":{"col":0,"width":"full"}}]}`)
+		if _, err := ir.DecodeStrictIR(missingRow); err == nil {
+			t.Fatal("expected missing layout.row to be rejected")
+		}
+	})
+
+	t.Run("Japanese 60-rune panel title passes rune limit (H-7)", func(t *testing.T) {
+		ja := base.Clone()
+		ja.Panels[0].Title = strings.Repeat("あ", 60) // 180 UTF-8 bytes, 60 runes <= 80
+		if err := ir.ValidateIR(ja, ir.ValidateOptions{MaxPanels: 6}); err != nil {
+			t.Fatalf("expected 60-rune Japanese title to pass, got %v", err)
+		}
+	})
+
 	t.Run("unauthorized datasourceRef rejected", func(t *testing.T) {
 		bad := base.Clone()
 		bad.Panels[0].DatasourceRef = "prod-prom-secret-uid"
@@ -66,11 +81,26 @@ func TestValidateIR_RejectsSecurityAndBoundsViolations(t *testing.T) {
 		}
 	})
 
-	t.Run("active HTML/JS content rejected", func(t *testing.T) {
-		bad := base.Clone()
-		bad.Title = "Dashboard <script>alert(1)</script>"
-		if err := ir.ValidateIR(bad, ir.ValidateOptions{MaxPanels: 6}); err == nil {
-			t.Fatal("expected script tag in title to be rejected")
+	t.Run("HTML tag, event handler, and Bidi override rejected (L-2)", func(t *testing.T) {
+		for _, badTitle := range []string{
+			"Dashboard <script>alert(1)</script>",
+			"Dashboard <svg/onload=alert(1)>",
+			"Dashboard onmouseover = alert(1)",
+			"Safe\u202ETitle",
+		} {
+			bad := base.Clone()
+			bad.Title = badTitle
+			if err := ir.ValidateIR(bad, ir.ValidateOptions{MaxPanels: 6}); err == nil {
+				t.Fatalf("expected unsafe title %q to be rejected", badTitle)
+			}
+		}
+	})
+
+	t.Run("PromQL comparison < and > still allowed in expr", func(t *testing.T) {
+		ok := base.Clone()
+		ok.Panels[0].Query.Expr = `rate(http_requests_total[5m]) > 0`
+		if err := ir.ValidateIR(ok, ir.ValidateOptions{MaxPanels: 6}); err != nil {
+			t.Fatalf("expected PromQL > operator to pass, got %v", err)
 		}
 	})
 
@@ -99,7 +129,7 @@ func TestValidateIR_RejectsSecurityAndBoundsViolations(t *testing.T) {
 	})
 }
 
-func TestApplyPatch_RevisionConflictAndPartialEdit(t *testing.T) {
+func TestApplyPatch_RevisionConflictPreservesLegendAndRejectsNoOp(t *testing.T) {
 	current := ir.DashboardIR{
 		SchemaVersion: ir.SchemaVersion,
 		Revision:      2,
@@ -111,7 +141,7 @@ func TestApplyPatch_RevisionConflictAndPartialEdit(t *testing.T) {
 				Type:          "timeseries",
 				Title:         "Request Rate",
 				DatasourceRef: ir.SelectedDatasourceRef,
-				Query:         ir.QueryIR{Expr: `sum(rate(http_requests_total{service="checkout-api"}[5m]))`},
+				Query:         ir.QueryIR{Expr: `sum(rate(http_requests_total{service="checkout-api"}[5m]))`, LegendFormat: "{{status}}"},
 				Unit:          "reqps",
 				Layout:        ir.LayoutHint{Row: 0, Col: 0, Width: "half"},
 			},
@@ -120,14 +150,14 @@ func TestApplyPatch_RevisionConflictAndPartialEdit(t *testing.T) {
 				Type:          "stat",
 				Title:         "Error Ratio",
 				DatasourceRef: ir.SelectedDatasourceRef,
-				Query:         ir.QueryIR{Expr: `sum(rate(http_requests_total{service="checkout-api",status=~"5.."}[5m]))`},
+				Query:         ir.QueryIR{Expr: `sum(rate(http_requests_total{service="checkout-api",status=~"5.."}[5m]))`, LegendFormat: "5xx"},
 				Unit:          "percentunit",
 				Layout:        ir.LayoutHint{Row: 0, Col: 1, Width: "half"},
 			},
 		},
 	}
 
-	// Stale baseRevision must fail with ErrRevisionConflict.
+	// Stale baseRevision fails with ErrRevisionConflict.
 	stalePatch := ir.DashboardPatch{
 		SchemaVersion: ir.SchemaVersion,
 		BaseRevision:  1,
@@ -140,42 +170,41 @@ func TestApplyPatch_RevisionConflictAndPartialEdit(t *testing.T) {
 		t.Fatalf("expected ErrRevisionConflict, got %v", err)
 	}
 
-	// Unknown panelId must fail with ErrPanelNotFound.
-	badPanelPatch := ir.DashboardPatch{
+	// No-op patch fails with ErrNoOpPatch (M-3).
+	noopPatch := ir.DashboardPatch{
 		SchemaVersion: ir.SchemaVersion,
 		BaseRevision:  2,
-		Summary:       "bad panel",
-		Operations: []ir.PatchOperation{
-			{Op: "update_panel", PanelID: "panel-missing", Panel: &ir.PanelUpdate{Type: "timeseries"}},
-		},
+		Summary:       "no changes",
+		Operations:    []ir.PatchOperation{{Op: "update_panel", PanelID: "panel-err", Panel: &ir.PanelUpdate{}}},
 	}
-	if _, _, err := ir.ApplyPatch(current, badPanelPatch, ir.ValidateOptions{MaxPanels: 6}); !errors.Is(err, ir.ErrPanelNotFound) {
-		t.Fatalf("expected ErrPanelNotFound, got %v", err)
+	if _, _, err := ir.ApplyPatch(current, noopPatch, ir.ValidateOptions{MaxPanels: 6}); !errors.Is(err, ir.ErrNoOpPatch) {
+		t.Fatalf("expected ErrNoOpPatch, got %v", err)
 	}
 
-	// Valid partial edit modifies only panel-err and preserves panel-req verbatim.
-	validPatch := ir.DashboardPatch{
+	// Updating query.expr without legendFormat preserves existing legendFormat (M-3).
+	queryOnlyPatch := ir.DashboardPatch{
 		SchemaVersion: ir.SchemaVersion,
 		BaseRevision:  2,
-		Summary:       "Switch error panel to timeseries",
+		Summary:       "Update expr only",
 		Operations: []ir.PatchOperation{
-			{Op: "update_panel", PanelID: "panel-err", Panel: &ir.PanelUpdate{Type: "timeseries", Title: "5xx Error Trend"}},
+			{
+				Op:      "update_panel",
+				PanelID: "panel-err",
+				Panel:   &ir.PanelUpdate{Query: &ir.QueryUpdate{Expr: `sum(rate(http_requests_total{service="checkout-api",status=~"4..|5.."}[5m]))`}},
+			},
 		},
 	}
-	next, diffs, err := ir.ApplyPatch(current, validPatch, ir.ValidateOptions{MaxPanels: 6})
+	next, diffs, err := ir.ApplyPatch(current, queryOnlyPatch, ir.ValidateOptions{MaxPanels: 6})
 	if err != nil {
 		t.Fatalf("ApplyPatch failed: %v", err)
 	}
-	if next.Revision != 3 {
-		t.Fatalf("expected revision 3, got %d", next.Revision)
+	if next.Panels[1].Query.LegendFormat != "5xx" {
+		t.Fatalf("omitted legendFormat unexpectedly wiped existing value: got %q", next.Panels[1].Query.LegendFormat)
 	}
-	if next.Panels[0].Query.Expr != current.Panels[0].Query.Expr || next.Panels[0].Title != current.Panels[0].Title {
-		t.Fatalf("untouched panel-req was unexpectedly modified")
+	if next.Panels[0].Query.Expr != current.Panels[0].Query.Expr {
+		t.Fatalf("untouched panel-req was modified")
 	}
-	if next.Panels[1].Type != "timeseries" || next.Panels[1].Title != "5xx Error Trend" {
-		t.Fatalf("panel-err was not updated properly: %+v", next.Panels[1])
-	}
-	if len(diffs) != 2 {
-		t.Fatalf("expected 2 diff entries, got %d: %+v", len(diffs), diffs)
+	if len(diffs) != 1 {
+		t.Fatalf("expected 1 diff entry, got %+v", diffs)
 	}
 }

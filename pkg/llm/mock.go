@@ -4,17 +4,21 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"regexp"
 	"strings"
+	"sync/atomic"
 
 	"github.com/yuuki/grafana-llm-studio-app/pkg/ir"
 )
+
+var validMockLabelName = regexp.MustCompile(`^[a-zA-Z_][a-zA-Z0-9_]*$`)
 
 // MockClient is an EXPLICIT development/test-only deterministic LLM adapter.
 // Production configuration MUST NOT silently fall back to MockClient on real LLM errors.
 type MockClient struct {
 	// InjectSyntaxErrorOnFirstGenerate can be enabled in tests to exercise repair flows.
 	InjectSyntaxErrorOnFirstGenerate bool
-	generateCount                    int
+	generateCount                    atomic.Int64
 }
 
 func (m *MockClient) Enabled(_ context.Context) (bool, error) {
@@ -25,7 +29,7 @@ func (m *MockClient) GenerateIR(ctx context.Context, req GenerateRequest) ([]byt
 	if err := ctx.Err(); err != nil {
 		return nil, CompletionMeta{ProviderMode: "mock"}, err
 	}
-	m.generateCount++
+	count := m.generateCount.Add(1)
 
 	selector := buildScopeMatcher(req.Scope)
 	hasReq, reqMetric := findMetric(req.Catalog, "http_requests_total", "requests_total", "http_server_requests_total")
@@ -40,12 +44,10 @@ func (m *MockClient) GenerateIR(ctx context.Context, req GenerateRequest) ([]byt
 	wantCPU := containsAny(lowerIntent, "cpu")
 	wantMem := containsAny(lowerIntent, "mem", "メモリ")
 
-	// If user asks for a completely unknown domain and no matching metric exists, refuse to fabricate.
 	if len(req.Catalog) == 0 {
 		return nil, CompletionMeta{ProviderMode: "mock"}, ErrInsufficientMetrics
 	}
 	if !hasReq && !hasDur && !hasCPU && !hasMem {
-		// Fall back only if the catalog has at least one metric whose name overlaps an intent token.
 		matched, ok := findAnyOverlappingMetric(req.Catalog, lowerIntent)
 		if !ok {
 			return nil, CompletionMeta{ProviderMode: "mock"}, ErrInsufficientMetrics
@@ -82,10 +84,9 @@ func (m *MockClient) GenerateIR(ctx context.Context, req GenerateRequest) ([]byt
 		maxPanels = ir.DefaultMaxPanels
 	}
 
-	// Default to request rate if intent is general or explicitly asks for requests.
 	if hasReq && (wantReq || (!wantError && !wantLatency && !wantCPU && !wantMem)) {
 		expr := fmt.Sprintf("sum by (status) (rate(%s%s[5m]))", reqMetric.Name, selector)
-		if m.InjectSyntaxErrorOnFirstGenerate && m.generateCount == 1 {
+		if m.InjectSyntaxErrorOnFirstGenerate && count == 1 {
 			expr = fmt.Sprintf("sum by (status) (rate(%s%s[5m]))))", reqMetric.Name, selector)
 		}
 		panels = append(panels, ir.PanelIR{
@@ -166,7 +167,6 @@ func (m *MockClient) GenerateIR(ctx context.Context, req GenerateRequest) ([]byt
 		return nil, CompletionMeta{ProviderMode: "mock"}, ErrInsufficientMetrics
 	}
 
-	// Normalize grid layout cleanly so single-panel or subset outputs never collide.
 	assignCompactGrid(panels)
 
 	doc := ir.DashboardIR{
@@ -188,7 +188,6 @@ func (m *MockClient) GeneratePatch(ctx context.Context, req PatchRequest) ([]byt
 	lower := strings.ToLower(req.EditIntent)
 	targetID := req.TargetPanelID
 	if targetID == "" {
-		// Infer panel from intent keywords.
 		for _, p := range req.CurrentIR.Panels {
 			if (containsAny(lower, "error", "エラー") && strings.Contains(p.ID, "error")) ||
 				(containsAny(lower, "latency", "レイテンシ", "p99", "p95") && strings.Contains(p.ID, "latency")) ||
@@ -225,16 +224,18 @@ func (m *MockClient) GeneratePatch(ctx context.Context, req PatchRequest) ([]byt
 	}
 
 	if containsAny(lower, "p99") && strings.Contains(target.Query.Expr, "0.95") {
-		upd.Query = &ir.QueryIR{
+		legend := "p99"
+		upd.Query = &ir.QueryUpdate{
 			Expr:         strings.Replace(target.Query.Expr, "0.95", "0.99", 1),
-			LegendFormat: "p99",
+			LegendFormat: &legend,
 		}
 		upd.Title = "p99 Request Latency"
 		summary = fmt.Sprintf("Updated %s quantile from p95 to p99", target.ID)
 	} else if containsAny(lower, "4xx") && strings.Contains(target.Query.Expr, `5..`) {
-		upd.Query = &ir.QueryIR{
+		legend := "4xx/5xx ratio"
+		upd.Query = &ir.QueryUpdate{
 			Expr:         strings.Replace(target.Query.Expr, `status=~"5.."`, `status=~"4..|5.."`, 1),
-			LegendFormat: "4xx/5xx ratio",
+			LegendFormat: &legend,
 		}
 		upd.Title = "4xx & 5xx Error Ratio"
 		summary = fmt.Sprintf("Expanded %s error matcher to 4xx and 5xx", target.ID)
@@ -283,7 +284,7 @@ func (m *MockClient) RepairPanels(ctx context.Context, req RepairRequest) ([]byt
 			Op:      "update_panel",
 			PanelID: t.PanelID,
 			Panel: &ir.PanelUpdate{
-				Query: &ir.QueryIR{Expr: repaired, LegendFormat: "{{status}}"},
+				Query: &ir.QueryUpdate{Expr: repaired},
 			},
 		})
 	}
@@ -299,14 +300,14 @@ func (m *MockClient) RepairPanels(ctx context.Context, req RepairRequest) ([]byt
 }
 
 func buildScopeMatcher(scope *ir.ScopeFilter) string {
-	if scope == nil || strings.TrimSpace(scope.LabelName) == "" || strings.TrimSpace(scope.LabelValue) == "" {
+	if scope == nil || !validMockLabelName.MatchString(scope.LabelName) || strings.TrimSpace(scope.LabelValue) == "" {
 		return ""
 	}
 	return fmt.Sprintf(`{%s=%q}`, scope.LabelName, scope.LabelValue)
 }
 
 func buildScopeMatcherWithExtra(scope *ir.ScopeFilter, extra string) string {
-	if scope == nil || strings.TrimSpace(scope.LabelName) == "" || strings.TrimSpace(scope.LabelValue) == "" {
+	if scope == nil || !validMockLabelName.MatchString(scope.LabelName) || strings.TrimSpace(scope.LabelValue) == "" {
 		return fmt.Sprintf("{%s}", extra)
 	}
 	return fmt.Sprintf(`{%s=%q,%s}`, scope.LabelName, scope.LabelValue, extra)

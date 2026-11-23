@@ -5,11 +5,21 @@ import { DashboardSaver, SaveDashboardError } from './saveDashboard';
 
 const mockFetch = jest.fn();
 
+const mockConfig: {
+  namespace?: string;
+  appSubUrl?: string;
+  bootData: { user: { orgId: number } };
+} = {
+  namespace: undefined,
+  appSubUrl: '',
+  bootData: {
+    user: { orgId: 1 },
+  },
+};
+
 jest.mock('@grafana/runtime', () => ({
-  config: {
-    bootData: {
-      user: { orgId: 1 },
-    },
+  get config() {
+    return mockConfig;
   },
   getBackendSrv: () => ({
     fetch: mockFetch,
@@ -39,6 +49,9 @@ describe('Create-only DashboardSaver (Grafana 12.4.15 v1beta1)', () => {
 
   beforeEach(() => {
     mockFetch.mockReset();
+    mockConfig.namespace = undefined;
+    mockConfig.appSubUrl = '';
+    mockConfig.bootData.user.orgId = 1;
   });
 
   test('rejects saving when revision does not match previewedRevision', async () => {
@@ -71,6 +84,24 @@ describe('Create-only DashboardSaver (Grafana 12.4.15 v1beta1)', () => {
     expect(callArg.data.spec.id).toBeNull();
     expect(callArg.data.spec.version).toBe(0);
     expect(callArg.data.spec.refresh).toBe('');
+  });
+
+  test('prefers config.namespace and prefixes returned dashboard URL with config.appSubUrl (M-10)', async () => {
+    mockConfig.namespace = 'org-42';
+    mockConfig.appSubUrl = '/grafana';
+    mockFetch.mockReturnValueOnce(of({ data: { metadata: { name: 'llmstudio-sub1' } } }));
+
+    const saver = new DashboardSaver();
+    const res = await saver.createNewDashboard({
+      spec,
+      previewedRevision: 3,
+      folderUid: '',
+      uidOverride: 'llmstudio-sub1',
+    });
+
+    const callArg = mockFetch.mock.calls[0][0];
+    expect(callArg.url).toBe('/apis/dashboard.grafana.app/v1beta1/namespaces/org-42/dashboards');
+    expect(res.url).toBe('/grafana/d/llmstudio-sub1');
   });
 
   test('on 409 UID conflict, fails safely and NEVER retries with PUT/overwrite', async () => {

@@ -75,12 +75,13 @@ const ROW_HEIGHT_STAT = 6;
  */
 export function normalizeDashboardIR(
   doc: DashboardIR,
-  datasource: ResolvedDatasource
+  datasource: ResolvedDatasource,
+  maxPanels = 6
 ): NormalizedDashboardSpec {
   if (!datasource.uid || datasource.uid.trim() === '') {
     throw new Error('Resolved datasource UID is required');
   }
-  const issues = validateIRClient(doc);
+  const issues = validateIRClient(doc, maxPanels);
   if (issues.length > 0) {
     throw new Error(`Invalid DashboardIR cannot be normalized: ${issues.join('; ')}`);
   }
@@ -90,7 +91,6 @@ export function normalizeDashboardIR(
     uid: datasource.uid.trim(),
   };
 
-  // Sort panels deterministically by (row, col, id) before computing y coordinates.
   const sorted = [...doc.panels].sort((a, b) => {
     if (a.layout.row !== b.layout.row) {
       return a.layout.row - b.layout.row;
@@ -101,7 +101,6 @@ export function normalizeDashboardIR(
     return a.id.localeCompare(b.id);
   });
 
-  // Compute row heights so every row stacks without overlap.
   const rowHeights = new Map<number, number>();
   for (const p of sorted) {
     const h = p.type === 'stat' ? ROW_HEIGHT_STAT : ROW_HEIGHT_TIMESERIES;
@@ -154,12 +153,17 @@ export function normalizeDashboardIR(
       from: doc.timeRange.from,
       to: doc.timeRange.to,
     },
-    refresh: '', // Auto-refresh strictly disabled in MVP
+    refresh: '',
     tags: ['llm-dashboard-studio'],
     panels: normalizedPanels,
   };
 }
 
+/**
+ * Normalizes ascending IR thresholds into Grafana absolute threshold steps.
+ * Preserves non-zero starting thresholds (e.g. [{value: 0.5, color: 'yellow'}]) by
+ * prepending a green base step {value: null, color: 'green'} instead of overwriting 0.5.
+ */
 function normalizeThresholds(
   raw?: Array<{ value: number; color: ThresholdColor }>
 ): NormalizedThresholdStep[] {
@@ -167,10 +171,15 @@ function normalizeThresholds(
     return [{ value: null, color: 'green' }];
   }
   const sorted = [...raw].sort((a, b) => a.value - b.value);
-  // Grafana thresholds require an initial base step with value: null (or -Infinity).
-  const steps: NormalizedThresholdStep[] = [{ value: null, color: sorted[0].color }];
-  for (let i = 1; i < sorted.length; i++) {
-    steps.push({ value: sorted[i].value, color: sorted[i].color });
+  if (sorted[0].value === 0 || sorted[0].color === 'green') {
+    const steps: NormalizedThresholdStep[] = [{ value: null, color: sorted[0].color }];
+    for (let i = 1; i < sorted.length; i++) {
+      steps.push({ value: sorted[i].value, color: sorted[i].color });
+    }
+    return steps;
   }
-  return steps;
+  return [
+    { value: null, color: 'green' },
+    ...sorted.map((s) => ({ value: s.value, color: s.color })),
+  ];
 }

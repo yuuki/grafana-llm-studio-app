@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -17,15 +18,18 @@ import (
 	"github.com/yuuki/grafana-llm-studio-app/pkg/llm"
 )
 
-// TestGrafanaLLMApp_To_VLLM_Contract verifies the full contract:
+// TestGrafanaLLMApp_To_VLLM_Contract verifies the realistic contract:
 // Custom Backend (GrafanaLLMClient) -> official llmclient -> Grafana plugin resource API
-// (grafana-llm-app proxy) -> local vLLM OpenAI-compatible endpoint.
+// (mirroring real grafana-llm-app v1.0.8 error wrapping as HTTP 500 {"error":"..."}) -> local vLLM.
 func TestGrafanaLLMApp_To_VLLM_Contract(t *testing.T) {
 	var capturedVLLMReq map[string]any
 	var vllmCalls atomic.Int32
 	var forceStatus atomic.Int32
 	var forceFinishReason atomic.Value
+	var forceRefusal atomic.Value
+	var wrapWithFence atomic.Bool
 	forceFinishReason.Store("stop")
+	forceRefusal.Store("")
 
 	// 1. Mock local vLLM OpenAI-compatible server.
 	vllmSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -35,7 +39,7 @@ func TestGrafanaLLMApp_To_VLLM_Contract(t *testing.T) {
 			return
 		}
 		if code := forceStatus.Load(); code != 0 {
-			http.Error(w, `{"error":{"message":"simulated upstream failure"}}`, int(code))
+			http.Error(w, fmt.Sprintf(`{"error":{"message":"simulated upstream failure (status %d)"}}`, code), int(code))
 			return
 		}
 		raw, _ := io.ReadAll(r.Body)
@@ -64,13 +68,21 @@ func TestGrafanaLLMApp_To_VLLM_Contract(t *testing.T) {
 			},
 		}
 		contentBytes, _ := json.Marshal(validIR)
+		content := string(contentBytes)
+		if wrapWithFence.Load() {
+			content = "```json\n" + content + "\n```"
+		}
 		resp := openai.ChatCompletionResponse{
 			ID:    "chatcmpl-vllm-test",
 			Model: "zai-org/GLM-5.3-Flash",
 			Choices: []openai.ChatCompletionChoice{
 				{
-					Index:        0,
-					Message:      openai.ChatCompletionMessage{Role: "assistant", Content: string(contentBytes)},
+					Index: 0,
+					Message: openai.ChatCompletionMessage{
+						Role:    "assistant",
+						Content: content,
+						Refusal: forceRefusal.Load().(string),
+					},
 					FinishReason: openai.FinishReason(forceFinishReason.Load().(string)),
 				},
 			},
@@ -81,8 +93,10 @@ func TestGrafanaLLMApp_To_VLLM_Contract(t *testing.T) {
 	}))
 	defer vllmSrv.Close()
 
-	// 2. Mock Grafana server hosting grafana-llm-app resource proxy (mirrors real grafana-llm-app v1.0.8 behavior:
-	//    unmarshals into openai.ChatCompletionRequest, maps "base"/"large" to vLLM served model name, forwards to vLLM).
+	// 2. Mock Grafana server hosting grafana-llm-app v1.0.8 resource proxy.
+	// Faithfully mirrors real grafana-llm-app handleChatCompletions/handleError:
+	// unmarshals into openai.ChatCompletionRequest and wraps ALL upstream errors into
+	// HTTP 500 {"error":"error, status code: <N>, ..."}!
 	const expectedSAToken = "glsa_test_llm_only_token"
 	grafanaSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Header.Get("Authorization") != "Bearer "+expectedSAToken {
@@ -95,7 +109,6 @@ func TestGrafanaLLMApp_To_VLLM_Contract(t *testing.T) {
 			_, _ = w.Write([]byte(`{"details":{"llmProvider":{"configured":true,"ok":true}}}`))
 			return
 		case "/api/plugins/grafana-llm-app/resources/llm/v1/chat/completions":
-			// Mirror grafana-llm-app: decode into openai.ChatCompletionRequest (which drops unknown non-OpenAI fields).
 			var incoming struct {
 				openai.ChatCompletionRequest
 				Model string `json:"model"`
@@ -108,7 +121,6 @@ func TestGrafanaLLMApp_To_VLLM_Contract(t *testing.T) {
 				http.Error(w, `{"error":"unrecognized model"}`, http.StatusBadRequest)
 				return
 			}
-			// Model mapping managed by grafana-llm-app.
 			incoming.ChatCompletionRequest.Model = "zai-org/GLM-5.3-Flash"
 
 			fwdBytes, _ := json.Marshal(incoming.ChatCompletionRequest)
@@ -116,12 +128,23 @@ func TestGrafanaLLMApp_To_VLLM_Contract(t *testing.T) {
 			fwdReq.Header.Set("Content-Type", "application/json")
 			resp, err := http.DefaultClient.Do(fwdReq)
 			if err != nil {
-				http.Error(w, `{"error":"upstream unreachable"}`, http.StatusBadGateway)
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusInternalServerError)
+				_ = json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
 				return
 			}
 			defer resp.Body.Close()
+			if resp.StatusCode != http.StatusOK {
+				// Exact grafana-llm-app v1.0.8 handleError behavior: returns HTTP 500 with string "error".
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusInternalServerError)
+				_ = json.NewEncoder(w).Encode(map[string]string{
+					"error": fmt.Sprintf("error, status code: %d, message: upstream error", resp.StatusCode),
+				})
+				return
+			}
 			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(resp.StatusCode)
+			w.WriteHeader(http.StatusOK)
 			_, _ = io.Copy(w, resp.Body)
 		default:
 			http.Error(w, "not found", http.StatusNotFound)
@@ -147,7 +170,7 @@ func TestGrafanaLLMApp_To_VLLM_Contract(t *testing.T) {
 	}
 	scope := &ir.ScopeFilter{LabelName: "service", LabelValue: "checkout-api"}
 
-	t.Run("structured output JSON schema and parameters reach vLLM intact", func(t *testing.T) {
+	t.Run("structured output JSON schema (strict=false) and parameters reach vLLM intact", func(t *testing.T) {
 		ok, err := client.Enabled(context.Background())
 		if err != nil || !ok {
 			t.Fatalf("Enabled() = (%v, %v), want (true, nil)", ok, err)
@@ -169,7 +192,6 @@ func TestGrafanaLLMApp_To_VLLM_Contract(t *testing.T) {
 			t.Fatalf("returned IR failed strict decode: %v", err)
 		}
 
-		// Verify contract fields received by vLLM.
 		if capturedVLLMReq["model"] != "zai-org/GLM-5.3-Flash" {
 			t.Fatalf("expected mapped model name, got %v", capturedVLLMReq["model"])
 		}
@@ -179,23 +201,20 @@ func TestGrafanaLLMApp_To_VLLM_Contract(t *testing.T) {
 		if capturedVLLMReq["reasoning_effort"] != "low" {
 			t.Fatalf("expected reasoning_effort=low, got %v", capturedVLLMReq["reasoning_effort"])
 		}
+		// When reasoning_effort is set, temperature should be omitted to avoid model conflicts.
+		if _, hasTemp := capturedVLLMReq["temperature"]; hasTemp {
+			t.Fatalf("expected temperature to be omitted when reasoning_effort is set, got %v", capturedVLLMReq["temperature"])
+		}
 		rf, ok := capturedVLLMReq["response_format"].(map[string]any)
 		if !ok || rf["type"] != "json_schema" {
 			t.Fatalf("response_format.type=json_schema did not reach vLLM: %#v", capturedVLLMReq["response_format"])
 		}
 		js, ok := rf["json_schema"].(map[string]any)
-		if !ok || js["name"] != "dashboard_ir" || js["strict"] != true {
-			t.Fatalf("response_format.json_schema contract broken: %#v", rf)
+		if !ok || js["name"] != "dashboard_ir" || js["strict"] == true {
+			t.Fatalf("response_format.json_schema contract broken (strict should be false): %#v", rf)
 		}
-		schemaObj, ok := js["schema"].(map[string]any)
-		if !ok || schemaObj["type"] != "object" || schemaObj["additionalProperties"] != false {
-			t.Fatalf("DashboardIR JSON Schema structure did not survive proxy round-trip: %#v", js["schema"])
-		}
-		props, ok := schemaObj["properties"].(map[string]any)
-		if !ok || props["panels"] == nil || props["schemaVersion"] == nil {
-			t.Fatalf("DashboardIR properties missing after grafana-llm-app proxy round-trip: %#v", schemaObj)
-		}
-		// Verify datasourceRef single-value string enum reaches vLLM intact.
+		schemaObj := js["schema"].(map[string]any)
+		props := schemaObj["properties"].(map[string]any)
 		panelsDef := props["panels"].(map[string]any)
 		itemProps := panelsDef["items"].(map[string]any)["properties"].(map[string]any)
 		dsEnum := itemProps["datasourceRef"].(map[string]any)["enum"].([]any)
@@ -204,25 +223,50 @@ func TestGrafanaLLMApp_To_VLLM_Contract(t *testing.T) {
 		}
 	})
 
-	t.Run("finish_reason=length detected as ErrOutputTruncated", func(t *testing.T) {
-		forceFinishReason.Store("length")
-		defer forceFinishReason.Store("stop")
+	t.Run("strips optional markdown json code fence defensively", func(t *testing.T) {
+		wrapWithFence.Store(true)
+		defer wrapWithFence.Store(false)
+		raw, _, err := client.GenerateIR(context.Background(), llm.GenerateRequest{
+			UserIntent: "Show request rate",
+			Scope:      scope,
+			Catalog:    catalog,
+			MaxPanels:  6,
+		})
+		if err != nil {
+			t.Fatalf("GenerateIR with code fence failed: %v", err)
+		}
+		if _, err := ir.DecodeStrictIR(raw); err != nil {
+			t.Fatalf("fenced JSON failed strict decode: %v", err)
+		}
+	})
 
+	t.Run("finish_reason=length detected as ErrOutputTruncated and Refusal as ErrOutputRefused", func(t *testing.T) {
+		forceFinishReason.Store("length")
 		_, meta, err := client.GenerateIR(context.Background(), llm.GenerateRequest{
 			UserIntent: "Show request rate",
 			Scope:      scope,
 			Catalog:    catalog,
 			MaxPanels:  6,
 		})
-		if !errors.Is(err, llm.ErrOutputTruncated) {
-			t.Fatalf("expected ErrOutputTruncated, got %v", err)
+		forceFinishReason.Store("stop")
+		if !errors.Is(err, llm.ErrOutputTruncated) || meta.FinishReason != "length" {
+			t.Fatalf("expected ErrOutputTruncated, got %v (meta=%+v)", err, meta)
 		}
-		if meta.FinishReason != "length" {
-			t.Fatalf("expected finishReason=length, got %q", meta.FinishReason)
+
+		forceRefusal.Store("cannot comply")
+		_, _, err = client.GenerateIR(context.Background(), llm.GenerateRequest{
+			UserIntent: "Show request rate",
+			Scope:      scope,
+			Catalog:    catalog,
+			MaxPanels:  6,
+		})
+		forceRefusal.Store("")
+		if !errors.Is(err, llm.ErrOutputRefused) {
+			t.Fatalf("expected ErrOutputRefused, got %v", err)
 		}
 	})
 
-	t.Run("transient 503 retries at most once, 400 does not retry", func(t *testing.T) {
+	t.Run("grafana-llm-app HTTP 500 wrapping 503 retries once; wrapped 400 does not retry (H-1)", func(t *testing.T) {
 		vllmCalls.Store(0)
 		forceStatus.Store(http.StatusServiceUnavailable)
 		_, _, err := client.GenerateIR(context.Background(), llm.GenerateRequest{
@@ -232,10 +276,10 @@ func TestGrafanaLLMApp_To_VLLM_Contract(t *testing.T) {
 			MaxPanels:  6,
 		})
 		if err == nil {
-			t.Fatal("expected 503 error")
+			t.Fatal("expected wrapped 503 error")
 		}
 		if got := vllmCalls.Load(); got != 2 {
-			t.Fatalf("expected exactly 2 attempts (1 + 1 transport retry) on 503, got %d", got)
+			t.Fatalf("expected exactly 2 attempts (1 + 1 transport retry) on wrapped 503, got %d", got)
 		}
 
 		vllmCalls.Store(0)
@@ -247,10 +291,10 @@ func TestGrafanaLLMApp_To_VLLM_Contract(t *testing.T) {
 			MaxPanels:  6,
 		})
 		if err == nil {
-			t.Fatal("expected 400 error")
+			t.Fatal("expected wrapped 400 error")
 		}
 		if got := vllmCalls.Load(); got != 1 {
-			t.Fatalf("expected 1 attempt (no retry) on 400, got %d", got)
+			t.Fatalf("expected 1 attempt (no retry) on wrapped 400, got %d", got)
 		}
 		forceStatus.Store(0)
 	})

@@ -12,6 +12,7 @@ import {
   Select,
 } from '@grafana/ui';
 import { lastValueFrom } from 'rxjs';
+import { extractApiError } from '../../api/studioClient';
 
 export interface StudioJsonData {
   allowedDatasourceUids?: string[];
@@ -43,6 +44,8 @@ export const AppConfig: React.FC<PluginConfigPageProps<AppPluginMeta<StudioJsonD
   const [maxRepairAttempts, setMaxRepairAttempts] = useState(jsonData?.maxRepairAttempts ?? 2);
   const [maxOutputTokens, setMaxOutputTokens] = useState(jsonData?.maxOutputTokens ?? 2048);
   const [llmTimeoutSeconds, setLlmTimeoutSeconds] = useState(jsonData?.llmTimeoutSeconds ?? 45);
+  const [jobDeadlineSeconds, setJobDeadlineSeconds] = useState(jsonData?.jobDeadlineSeconds ?? 90);
+  const [maxConcurrentJobs, setMaxConcurrentJobs] = useState(jsonData?.maxConcurrentJobs ?? 4);
   const [validationTimeoutSeconds, setValidationTimeoutSeconds] = useState(
     jsonData?.validationTimeoutSeconds ?? 10
   );
@@ -53,6 +56,7 @@ export const AppConfig: React.FC<PluginConfigPageProps<AppPluginMeta<StudioJsonD
   const [isTokenConfigured, setIsTokenConfigured] = useState(
     Boolean(secureJsonFields?.llmServiceAccountToken)
   );
+  const [wasTokenReset, setWasTokenReset] = useState(false);
   const [llmServiceAccountToken, setLlmServiceAccountToken] = useState('');
 
   const [saving, setSaving] = useState(false);
@@ -60,7 +64,39 @@ export const AppConfig: React.FC<PluginConfigPageProps<AppPluginMeta<StudioJsonD
     null
   );
 
+  const validateBeforeSave = (): string | null => {
+    if (llmMode === 'mock' && !allowMockInDev) {
+      return 'llmMode=mock を保存するには allowMockInDev を明示的に有効化してください。';
+    }
+    const checks: Array<[string, number, number, number]> = [
+      ['最大パネル数', maxPanels, 1, 6],
+      ['自動構文修復の最大回数', maxRepairAttempts, 0, 2],
+      ['LLM 最大出力トークン数', maxOutputTokens, 256, 8192],
+      ['LLM タイムアウト(秒)', llmTimeoutSeconds, 5, 120],
+      ['ジョブ全体期限(秒)', jobDeadlineSeconds, 10, 180],
+      ['LLM 同時実行ジョブ上限', maxConcurrentJobs, 1, 16],
+      ['検証クエリタイムアウト(秒)', validationTimeoutSeconds, 2, 30],
+      ['データソース並列クエリ上限', maxConcurrentQueries, 1, 4],
+    ];
+    for (const [label, val, minVal, maxVal] of checks) {
+      if (!Number.isFinite(val) || val < minVal || val > maxVal) {
+        return `${label} は ${minVal}〜${maxVal} の数値で指定してください。`;
+      }
+    }
+    const normalizedEffort = reasoningEffort.trim().toLowerCase();
+    if (!['', 'low', 'medium', 'high'].includes(normalizedEffort)) {
+      return 'Reasoning Effort は空欄または low / medium / high のいずれかを指定してください。';
+    }
+    return null;
+  };
+
   const handleSave = async () => {
+    const validationErr = validateBeforeSave();
+    if (validationErr) {
+      setStatusMessage({ severity: 'error', text: validationErr });
+      return;
+    }
+
     setSaving(true);
     setStatusMessage(null);
     try {
@@ -69,30 +105,38 @@ export const AppConfig: React.FC<PluginConfigPageProps<AppPluginMeta<StudioJsonD
         .map((s) => s.trim())
         .filter(Boolean);
 
+      // Preserve any existing jsonData fields (H-11) and normalize allowMockInDev=false outside mock mode (M-13).
       const nextJsonData: StudioJsonData = {
+        ...(jsonData ?? {}),
         allowedDatasourceUids,
         llmMode,
-        allowMockInDev,
+        allowMockInDev: llmMode === 'mock' ? allowMockInDev : false,
         grafanaUrl: grafanaUrl.trim(),
         modelTier,
-        reasoningEffort: reasoningEffort.trim() || undefined,
-        maxPanels: Number(maxPanels),
-        maxRepairAttempts: Number(maxRepairAttempts),
-        maxOutputTokens: Number(maxOutputTokens),
-        llmTimeoutSeconds: Number(llmTimeoutSeconds),
-        validationTimeoutSeconds: Number(validationTimeoutSeconds),
-        maxConcurrentQueries: Number(maxConcurrentQueries),
+        reasoningEffort: reasoningEffort.trim().toLowerCase(),
+        maxPanels: Math.trunc(Number(maxPanels)),
+        maxRepairAttempts: Math.trunc(Number(maxRepairAttempts)),
+        maxOutputTokens: Math.trunc(Number(maxOutputTokens)),
+        llmTimeoutSeconds: Math.trunc(Number(llmTimeoutSeconds)),
+        jobDeadlineSeconds: Math.trunc(Number(jobDeadlineSeconds)),
+        maxConcurrentJobs: Math.trunc(Number(maxConcurrentJobs)),
+        validationTimeoutSeconds: Math.trunc(Number(validationTimeoutSeconds)),
+        maxConcurrentQueries: Math.trunc(Number(maxConcurrentQueries)),
       };
 
-      const secureJsonData =
-        llmServiceAccountToken.trim().length > 0
-          ? { llmServiceAccountToken: llmServiceAccountToken.trim() }
-          : undefined;
+      // Explicitly send empty string on reset so Grafana clears the stored encrypted secret (H-11).
+      let secureJsonData: Record<string, string> | undefined;
+      if (llmServiceAccountToken.trim().length > 0) {
+        secureJsonData = { llmServiceAccountToken: llmServiceAccountToken.trim() };
+      } else if (wasTokenReset) {
+        secureJsonData = { llmServiceAccountToken: '' };
+      }
 
       await lastValueFrom(
         getBackendSrv().fetch({
           url: `/api/plugins/${plugin.meta.id}/settings`,
           method: 'POST',
+          showErrorAlert: false,
           data: {
             enabled,
             pinned,
@@ -102,9 +146,13 @@ export const AppConfig: React.FC<PluginConfigPageProps<AppPluginMeta<StudioJsonD
         })
       );
 
-      if (secureJsonData) {
+      if (llmServiceAccountToken.trim().length > 0) {
         setIsTokenConfigured(true);
+        setWasTokenReset(false);
         setLlmServiceAccountToken('');
+      } else if (wasTokenReset) {
+        setIsTokenConfigured(false);
+        setWasTokenReset(false);
       }
       setStatusMessage({
         severity: 'success',
@@ -113,7 +161,7 @@ export const AppConfig: React.FC<PluginConfigPageProps<AppPluginMeta<StudioJsonD
     } catch (err: unknown) {
       setStatusMessage({
         severity: 'error',
-        text: `設定保存に失敗しました: ${err instanceof Error ? err.message : String(err)}`,
+        text: `設定保存に失敗しました: ${extractApiError(err)}`,
       });
     } finally {
       setSaving(false);
@@ -173,7 +221,7 @@ export const AppConfig: React.FC<PluginConfigPageProps<AppPluginMeta<StudioJsonD
 
         <Field
           label="Grafana 内部 URL"
-          description="Go Backend の llmclient が /api/plugins/grafana-llm-app/resources/llm/v1 へ接続する URL です。"
+          description="Go Backend の llmclient が /api/plugins/grafana-llm-app/resources/llm/v1 へ接続する URL です（loopback または Grafana AppURL 同一オリジンのみ許可）。"
         >
           <Input
             value={grafanaUrl}
@@ -195,7 +243,7 @@ export const AppConfig: React.FC<PluginConfigPageProps<AppPluginMeta<StudioJsonD
 
         <Field
           label="Reasoning Effort（推論トークン抑制用・任意）"
-          description="GLM-5.3 等でデフォルト max による長考・トークン上限超過を避ける場合は low を推奨します。"
+          description="空欄または low / medium / high。GLM-5.3 等の長考抑制には low を推奨します。"
         >
           <Input
             value={reasoningEffort}
@@ -206,7 +254,7 @@ export const AppConfig: React.FC<PluginConfigPageProps<AppPluginMeta<StudioJsonD
 
         <Field
           label="LLM 専用サービスアカウントトークン (secureJsonData)"
-          description="Grafana OSS では最小基本ロール Viewer を割り当て、llmclient 専用とします（managed SA が有効な場合は空欄可）。"
+          description="Grafana OSS では最小基本ロール Viewer を割り当て、llmclient 専用とします（リセットして空欄保存すると既存トークンを削除します）。"
         >
           <SecretInput
             isConfigured={isTokenConfigured}
@@ -214,6 +262,7 @@ export const AppConfig: React.FC<PluginConfigPageProps<AppPluginMeta<StudioJsonD
             onChange={(e) => setLlmServiceAccountToken(e.currentTarget.value)}
             onReset={() => {
               setIsTokenConfigured(false);
+              setWasTokenReset(true);
               setLlmServiceAccountToken('');
             }}
             placeholder="glsa_..."
@@ -231,16 +280,16 @@ export const AppConfig: React.FC<PluginConfigPageProps<AppPluginMeta<StudioJsonD
             onChange={(e) => setMaxPanels(Number(e.currentTarget.value))}
           />
         </Field>
-        <Field label="自動構文修復の最大回数 (1..2)">
+        <Field label="自動構文修復の最大回数 (0..2、0で無効)">
           <Input
             type="number"
-            min={1}
+            min={0}
             max={2}
             value={maxRepairAttempts}
             onChange={(e) => setMaxRepairAttempts(Number(e.currentTarget.value))}
           />
         </Field>
-        <Field label="LLM 最大出力トークン数">
+        <Field label="LLM 最大出力トークン数 (256..8192)">
           <Input
             type="number"
             min={256}
@@ -249,7 +298,7 @@ export const AppConfig: React.FC<PluginConfigPageProps<AppPluginMeta<StudioJsonD
             onChange={(e) => setMaxOutputTokens(Number(e.currentTarget.value))}
           />
         </Field>
-        <Field label="LLM リクエストタイムアウト (秒)">
+        <Field label="LLM リクエストタイムアウト (秒, 5..120)">
           <Input
             type="number"
             min={5}
@@ -258,7 +307,25 @@ export const AppConfig: React.FC<PluginConfigPageProps<AppPluginMeta<StudioJsonD
             onChange={(e) => setLlmTimeoutSeconds(Number(e.currentTarget.value))}
           />
         </Field>
-        <Field label="検証クエリタイムアウト (秒)">
+        <Field label="ジョブ全体期限 (秒, 10..180)">
+          <Input
+            type="number"
+            min={10}
+            max={180}
+            value={jobDeadlineSeconds}
+            onChange={(e) => setJobDeadlineSeconds(Number(e.currentTarget.value))}
+          />
+        </Field>
+        <Field label="LLM 同時実行ジョブ上限 (1..16)">
+          <Input
+            type="number"
+            min={1}
+            max={16}
+            value={maxConcurrentJobs}
+            onChange={(e) => setMaxConcurrentJobs(Number(e.currentTarget.value))}
+          />
+        </Field>
+        <Field label="検証クエリタイムアウト (秒, 2..30)">
           <Input
             type="number"
             min={2}

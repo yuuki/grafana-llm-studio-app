@@ -1,14 +1,34 @@
-import React from 'react';
+import React, { useEffect } from 'react';
 import { fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { computeQueryHash } from '../ir/types';
 import { StudioPage } from './StudioPage';
 
+let sceneMountCount = 0;
+let sceneUnmountCount = 0;
+
+const MockSceneComponent: React.FC = () => {
+  useEffect(() => {
+    sceneMountCount += 1;
+    return () => {
+      sceneUnmountCount += 1;
+    };
+  }, []);
+  return <div data-testid="mock-scene-canvas">Scenes Canvas</div>;
+};
+
 const mockBuildPreviewScene = jest.fn((..._args: unknown[]) => ({
-  Component: () => <div data-testid="mock-scene-canvas">Scenes Canvas</div>,
+  Component: MockSceneComponent,
 }));
 
 jest.mock('../spec/toScene', () => ({
   buildPreviewScene: (...args: unknown[]) => mockBuildPreviewScene(...args),
 }));
+
+const mockGenerateDraft = jest.fn();
+const mockPatchDraft = jest.fn();
+const mockRepairDraft = jest.fn();
+const mockUndoDraft = jest.fn();
+const mockCancelDraftJob = jest.fn();
 
 jest.mock('../api/studioClient', () => ({
   fetchPublicConfig: jest.fn(async () => ({
@@ -21,50 +41,27 @@ jest.mock('../api/studioClient', () => ({
     maxConcurrentQueries: 2,
     mockBanner: true,
   })),
-  generateDraft: jest.fn(async () => ({
-    jobId: 'job-1',
-    status: 'awaiting_preview',
-    datasourceUid: 'prom-main',
-    currentIR: {
-      schemaVersion: '1.0',
-      revision: 1,
-      title: 'checkout-api Overview',
-      timeRange: { from: 'now-15m', to: 'now' },
-      panels: [
-        {
-          id: 'panel-req',
-          type: 'timeseries',
-          title: 'Request Rate',
-          datasourceRef: 'selected_prometheus',
-          query: { expr: 'sum(rate(http_requests_total{service="checkout-api"}[5m]))' },
-          unit: 'reqps',
-          layout: { row: 0, col: 0, width: 'full' },
-        },
-      ],
-    },
-    repairAttemptsUsed: 0,
-    maxRepairAttempts: 2,
-    canUndo: false,
-    updatedAt: '2026-11-22T00:00:00Z',
-  })),
-  patchDraft: jest.fn(),
-  repairDraft: jest.fn(),
-  undoDraft: jest.fn(),
-  cancelDraftJob: jest.fn(),
+  generateDraft: (...args: unknown[]) => mockGenerateDraft(...args),
+  patchDraft: (...args: unknown[]) => mockPatchDraft(...args),
+  repairDraft: (...args: unknown[]) => mockRepairDraft(...args),
+  undoDraft: (...args: unknown[]) => mockUndoDraft(...args),
+  cancelDraftJob: (...args: unknown[]) => mockCancelDraftJob(...args),
+  extractApiError: (err: unknown) => (err instanceof Error ? err.message : String(err)),
 }));
 
 jest.mock('../datasource/metadata', () => ({
   fetchScopeLabelValues: jest.fn(async () => ['checkout-api']),
   fetchScopedMetricCatalog: jest.fn(async () => ({
-    items: [{ name: 'http_requests_total', type: 'counter', labels: ['service', 'status'] }],
+    items: [
+      { name: 'http_requests_total', type: 'counter', labels: ['service', 'status'] },
+      { name: 'http_request_duration_seconds_bucket', type: 'histogram', labels: ['service', 'le'] },
+    ],
     truncated: false,
     fetchedAt: '2026-11-22T00:00:00Z',
   })),
 }));
 
-const mockRunDryRunValidation = jest.fn(async (..._args: unknown[]) => [
-  { panelId: 'panel-req', queryHash: 'abc', category: 'ok', seriesCount: 2, durationMs: 12 },
-]);
+const mockRunDryRunValidation = jest.fn();
 
 jest.mock('../datasource/validator', () => ({
   runDryRunValidation: (...args: unknown[]) => mockRunDryRunValidation(...args),
@@ -134,22 +131,78 @@ jest.mock('@grafana/ui', () => ({
   Spinner: () => <span>...</span>,
 }));
 
-describe('StudioPage Scenes anti-re-query behavior', () => {
+const REQ_EXPR = 'sum(rate(http_requests_total{service="checkout-api"}[5m]))';
+const ERR_EXPR_V1 = 'sum(rate(http_requests_total{service="checkout-api",status=~"5.."}[5m]))';
+const ERR_EXPR_V2 = 'sum(rate(http_requests_total{service="checkout-api",status=~"5.."}[1m]))';
+
+function makeTwoPanelJob(jobId: string, revision: number, errExpr: string) {
+  return {
+    jobId,
+    status: 'awaiting_preview',
+    datasourceUid: 'prom-main',
+    currentIR: {
+      schemaVersion: '1.0',
+      revision,
+      title: 'checkout-api Overview',
+      timeRange: { from: 'now-15m', to: 'now' },
+      panels: [
+        {
+          id: 'panel-req',
+          type: 'timeseries',
+          title: 'Request Rate',
+          datasourceRef: 'selected_prometheus',
+          query: { expr: REQ_EXPR },
+          unit: 'reqps',
+          layout: { row: 0, col: 0, width: 'half' },
+        },
+        {
+          id: 'panel-err',
+          type: 'stat',
+          title: 'Error Rate',
+          datasourceRef: 'selected_prometheus',
+          query: { expr: errExpr },
+          unit: 'percentunit',
+          layout: { row: 0, col: 1, width: 'half' },
+        },
+      ],
+    },
+    repairAttemptsUsed: 0,
+    maxRepairAttempts: 2,
+    canUndo: revision > 1,
+    updatedAt: '2026-11-22T00:00:00Z',
+  };
+}
+
+async function setupScopeAndCatalog() {
+  await waitFor(() => expect(screen.getByText('開発・テスト用モックLLMモード')).toBeTruthy());
+  const scopeInput = screen.getByPlaceholderText('checkout-api');
+  fireEvent.change(scopeInput, { target: { value: 'checkout-api' } });
+  fireEvent.click(screen.getByText('スコープのメトリクスを取得'));
+  await waitFor(() => expect(screen.getByText('2')).toBeTruthy());
+}
+
+describe('StudioPage Scenes lifecycle, Dry-Run gating, and partial re-validation', () => {
   beforeEach(() => {
+    sceneMountCount = 0;
+    sceneUnmountCount = 0;
     mockBuildPreviewScene.mockClear();
-    mockRunDryRunValidation.mockClear();
+    mockRunDryRunValidation.mockReset();
+    mockGenerateDraft.mockReset();
+    mockPatchDraft.mockReset();
   });
 
-  test('does not construct Scene on generation, and unrelated re-renders do not recreate Scene or re-run queries', async () => {
+  test('does not construct Scene on generation, and tab switching keeps Scene mounted without unmounting (H-8)', async () => {
+    const reqHash = await computeQueryHash(REQ_EXPR);
+    const errHash = await computeQueryHash(ERR_EXPR_V1);
+
+    mockGenerateDraft.mockResolvedValueOnce(makeTwoPanelJob('job-1', 1, ERR_EXPR_V1));
+    mockRunDryRunValidation.mockResolvedValueOnce([
+      { panelId: 'panel-req', queryHash: reqHash, category: 'ok', seriesCount: 2, durationMs: 12 },
+      { panelId: 'panel-err', queryHash: errHash, category: 'ok', seriesCount: 1, durationMs: 10 },
+    ]);
+
     render(<StudioPage />);
-
-    await waitFor(() => expect(screen.getByText('開発・テスト用モックLLMモード')).toBeTruthy());
-
-    // Enter scope and load scoped catalog.
-    const scopeInput = screen.getByPlaceholderText('checkout-api');
-    fireEvent.change(scopeInput, { target: { value: 'checkout-api' } });
-    fireEvent.click(screen.getByText('スコープのメトリクスを取得'));
-    await waitFor(() => expect(screen.getByText('1')).toBeTruthy());
+    await setupScopeAndCatalog();
 
     // Generate draft -> Scene MUST NOT be constructed or queried yet.
     fireEvent.click(screen.getByText('ダッシュボード案を生成'));
@@ -157,19 +210,134 @@ describe('StudioPage Scenes anti-re-query behavior', () => {
     expect(mockBuildPreviewScene).not.toHaveBeenCalled();
     expect(mockRunDryRunValidation).not.toHaveBeenCalled();
 
-    // Explicit "検証・プレビューを実行" -> runs dry-run once and constructs Scene once.
+    // Explicit "検証・プレビューを実行" -> runs dry-run once and mounts Scene once.
     fireEvent.click(screen.getByText('検証・プレビューを実行'));
     await waitFor(() => expect(screen.getByTestId('mock-scene-canvas')).toBeTruthy());
     expect(mockRunDryRunValidation).toHaveBeenCalledTimes(1);
     expect(mockBuildPreviewScene).toHaveBeenCalledTimes(1);
+    expect(sceneMountCount).toBe(1);
+    expect(sceneUnmountCount).toBe(0);
 
-    // Unrelated UI re-renders (typing in prompt, switching tabs) MUST NOT recreate Scene or re-run queries.
+    // Unrelated UI re-renders and tab switches MUST NOT unmount or recreate Scene (H-8).
     const textarea = screen.getByPlaceholderText(/エラー率のパネルだけ/);
     fireEvent.change(textarea, { target: { value: '別の入力テキスト' } });
     fireEvent.click(screen.getByText('IR JSON'));
+    fireEvent.click(screen.getByText('Foundation SDK JSON'));
     fireEvent.click(screen.getByText('Scenes プレビュー'));
 
     expect(mockBuildPreviewScene).toHaveBeenCalledTimes(1);
     expect(mockRunDryRunValidation).toHaveBeenCalledTimes(1);
+    expect(sceneMountCount).toBe(1);
+    expect(sceneUnmountCount).toBe(0);
+  });
+
+  test('blocks Scenes construction and keeps Save disabled when Dry-Run reports syntax_error (C-2)', async () => {
+    const reqHash = await computeQueryHash(REQ_EXPR);
+    const errHash = await computeQueryHash(ERR_EXPR_V1);
+
+    mockGenerateDraft.mockResolvedValueOnce(makeTwoPanelJob('job-err', 1, ERR_EXPR_V1));
+    mockRunDryRunValidation.mockResolvedValueOnce([
+      { panelId: 'panel-req', queryHash: reqHash, category: 'ok', seriesCount: 2, durationMs: 10 },
+      {
+        panelId: 'panel-err',
+        queryHash: errHash,
+        category: 'syntax_error',
+        errorText: 'parse error: unexpected ")"',
+        durationMs: 8,
+      },
+    ]);
+
+    render(<StudioPage />);
+    await setupScopeAndCatalog();
+
+    fireEvent.click(screen.getByText('ダッシュボード案を生成'));
+    await waitFor(() => expect(screen.getByText('awaiting_preview')).toBeTruthy());
+
+    fireEvent.click(screen.getByText('検証・プレビューを実行'));
+    await waitFor(() => expect(screen.getByText(/Scenes プレビューと保存をブロックしました/)).toBeTruthy());
+
+    expect(mockBuildPreviewScene).not.toHaveBeenCalled();
+    expect(screen.queryByTestId('mock-scene-canvas')).toBeNull();
+    const saveBtn = screen.getByText('新規ダッシュボード保存') as HTMLButtonElement;
+    expect(saveBtn.disabled).toBe(true);
+  });
+
+  test('starting a brand-new draft (__new__) clears previous preview and disables Save until re-validated (C-2)', async () => {
+    const reqHash = await computeQueryHash(REQ_EXPR);
+    const errHash = await computeQueryHash(ERR_EXPR_V1);
+
+    mockGenerateDraft
+      .mockResolvedValueOnce(makeTwoPanelJob('job-1', 1, ERR_EXPR_V1))
+      .mockResolvedValueOnce(makeTwoPanelJob('job-2', 1, ERR_EXPR_V2));
+    mockRunDryRunValidation.mockResolvedValueOnce([
+      { panelId: 'panel-req', queryHash: reqHash, category: 'ok', seriesCount: 2, durationMs: 10 },
+      { panelId: 'panel-err', queryHash: errHash, category: 'ok', seriesCount: 1, durationMs: 10 },
+    ]);
+
+    render(<StudioPage />);
+    await setupScopeAndCatalog();
+
+    fireEvent.click(screen.getByText('ダッシュボード案を生成'));
+    await waitFor(() => expect(screen.getByText('awaiting_preview')).toBeTruthy());
+
+    fireEvent.click(screen.getByText('検証・プレビューを実行'));
+    await waitFor(() => expect(screen.getByTestId('mock-scene-canvas')).toBeTruthy());
+    const saveBtn = screen.getByText('新規ダッシュボード保存') as HTMLButtonElement;
+    expect(saveBtn.disabled).toBe(false);
+
+    // Switch target to "__new__" and generate a brand-new job-2 (also revision 1!)
+    const selects = screen.getAllByRole('combobox');
+    const targetSelect = selects[selects.length - 2]; // target panel select (folder select is last)
+    fireEvent.change(targetSelect, { target: { value: '__new__' } });
+    fireEvent.click(screen.getByText('ダッシュボード案を生成'));
+
+    await waitFor(() => expect(mockGenerateDraft).toHaveBeenCalledTimes(2));
+    expect(screen.queryByTestId('mock-scene-canvas')).toBeNull();
+    expect(saveBtn.disabled).toBe(true);
+  });
+
+  test('partial patch re-validates only changed panels via queryHash and retains untouched panel results (H-9)', async () => {
+    const reqHash = await computeQueryHash(REQ_EXPR);
+    const errHashV1 = await computeQueryHash(ERR_EXPR_V1);
+    const errHashV2 = await computeQueryHash(ERR_EXPR_V2);
+
+    mockGenerateDraft.mockResolvedValueOnce(makeTwoPanelJob('job-1', 1, ERR_EXPR_V1));
+    mockPatchDraft.mockResolvedValueOnce(makeTwoPanelJob('job-1', 2, ERR_EXPR_V2));
+
+    mockRunDryRunValidation
+      .mockResolvedValueOnce([
+        { panelId: 'panel-req', queryHash: reqHash, category: 'ok', seriesCount: 2, durationMs: 10 },
+        { panelId: 'panel-err', queryHash: errHashV1, category: 'ok', seriesCount: 1, durationMs: 10 },
+      ])
+      .mockResolvedValueOnce([
+        { panelId: 'panel-err', queryHash: errHashV2, category: 'ok', seriesCount: 1, durationMs: 9 },
+      ]);
+
+    render(<StudioPage />);
+    await setupScopeAndCatalog();
+
+    // Generate + initial validate (both panels validated)
+    fireEvent.click(screen.getByText('ダッシュボード案を生成'));
+    await waitFor(() => expect(screen.getByText('awaiting_preview')).toBeTruthy());
+    fireEvent.click(screen.getByText('検証・プレビューを実行'));
+    await waitFor(() => expect(screen.getByTestId('mock-scene-canvas')).toBeTruthy());
+    expect(mockRunDryRunValidation).toHaveBeenNthCalledWith(
+      1,
+      expect.anything(),
+      expect.objectContaining({ onlyPanelIds: ['panel-req', 'panel-err'] })
+    );
+
+    // Partial edit changes only panel-err query
+    fireEvent.click(screen.getByText('部分修正を適用'));
+    await waitFor(() => expect(mockPatchDraft).toHaveBeenCalledTimes(1));
+
+    // Re-validate -> MUST ONLY query panel-err (panel-req queryHash unchanged!)
+    fireEvent.click(screen.getByText('検証・プレビューを実行'));
+    await waitFor(() => expect(mockRunDryRunValidation).toHaveBeenCalledTimes(2));
+    expect(mockRunDryRunValidation).toHaveBeenNthCalledWith(
+      2,
+      expect.anything(),
+      expect.objectContaining({ onlyPanelIds: ['panel-err'] })
+    );
   });
 });

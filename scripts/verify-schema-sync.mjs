@@ -1,9 +1,9 @@
 #!/usr/bin/env node
 /**
- * Verifies that schemas/dashboard-ir.schema.json (Single Source of Truth) stays
- * synchronized with Go (pkg/ir/validate.go) and TypeScript (src/ir/types.ts),
- * and that the JSON Schema remains compatible with grafana-llm-app's go-openai
- * jsonschema.Definition (string-only enums, no unsupported numeric enums).
+ * Bidirectional contract verification ensuring schemas/dashboard-ir.schema.json and
+ * schemas/dashboard-patch.schema.json stay strictly synchronized with BOTH
+ * Go (pkg/ir/validate.go) and TypeScript (src/ir/types.ts), and remain compatible
+ * with grafana-llm-app's go-openai jsonschema.Definition (string-only enums).
  */
 import fs from 'node:fs';
 import path from 'node:path';
@@ -36,29 +36,84 @@ function assertStringOnlyEnums(node, trail = '$') {
   }
 }
 
+function extractTsConstArray(source, constName) {
+  const re = new RegExp(`export const ${constName}\\s*=\\s*\\[([\\s\\S]*?)\\]\\s*as const`);
+  const match = source.match(re);
+  if (!match) {
+    throw new Error(`Could not find TS const array ${constName}`);
+  }
+  return Array.from(match[1].matchAll(/'([^']+)'/g), (m) => m[1]);
+}
+
+function extractGoMapKeys(source, mapName) {
+  const re = new RegExp(`${mapName}\\s*=\\s*map\\[string\\]bool\\{([\\s\\S]*?)\\}`);
+  const match = source.match(re);
+  if (!match) {
+    throw new Error(`Could not find Go map ${mapName}`);
+  }
+  return Array.from(match[1].matchAll(/"([^"]+)"\s*:\s*true/g), (m) => m[1]);
+}
+
+function assertExactSetEqual(label, expected, actual, targetName) {
+  const exp = [...new Set(expected)].sort();
+  const act = [...new Set(actual)].sort();
+  if (JSON.stringify(exp) !== JSON.stringify(act)) {
+    throw new Error(
+      `Enum mismatch for ${label} in ${targetName}:\n  schema: ${JSON.stringify(exp)}\n  actual: ${JSON.stringify(act)}`
+    );
+  }
+}
+
 assertStringOnlyEnums(irSchema, 'dashboard-ir');
 assertStringOnlyEnums(patchSchema, 'dashboard-patch');
 
-const units = irSchema.properties.panels.items.properties.unit.enum;
-const panelTypes = irSchema.properties.panels.items.properties.type.enum;
-const timeFrom = irSchema.properties.timeRange.properties.from.enum;
+const irPanelProps = irSchema.properties.panels.items.properties;
+const patchPanelProps = patchSchema.properties.operations.items.properties.panel.properties;
 
-for (const u of units) {
-  if (!tsTypes.includes(`'${u}'`) || !goValidate.includes(`"${u}"`)) {
-    throw new Error(`Unit "${u}" missing in TS or Go validator`);
-  }
-}
-for (const pt of panelTypes) {
-  if (!tsTypes.includes(`'${pt}'`) || !goValidate.includes(`"${pt}"`)) {
-    throw new Error(`Panel type "${pt}" missing in TS or Go validator`);
-  }
-}
-for (const tf of timeFrom) {
-  if (!tsTypes.includes(`'${tf}'`) || !goValidate.includes(`"${tf}"`)) {
-    throw new Error(`timeRange.from "${tf}" missing in TS or Go validator`);
-  }
+const checks = [
+  {
+    label: 'timeRange.from',
+    irEnum: irSchema.properties.timeRange.properties.from.enum,
+    patchEnum: patchSchema.properties.operations.items.properties.timeRange.properties.from.enum,
+    tsConst: 'ALLOWED_TIME_FROM',
+    goMap: 'allowedTimeFrom',
+  },
+  {
+    label: 'panel.type',
+    irEnum: irPanelProps.type.enum,
+    patchEnum: patchPanelProps.type.enum,
+    tsConst: 'ALLOWED_PANEL_TYPES',
+    goMap: 'allowedPanelTypes',
+  },
+  {
+    label: 'panel.unit',
+    irEnum: irPanelProps.unit.enum,
+    patchEnum: patchPanelProps.unit.enum,
+    tsConst: 'ALLOWED_UNITS',
+    goMap: 'allowedUnits',
+  },
+  {
+    label: 'panel.thresholds.color',
+    irEnum: irPanelProps.thresholds.items.properties.color.enum,
+    patchEnum: patchPanelProps.thresholds.items.properties.color.enum,
+    tsConst: 'ALLOWED_THRESHOLD_COLORS',
+    goMap: 'allowedThresholdColors',
+  },
+  {
+    label: 'panel.layout.width',
+    irEnum: irPanelProps.layout.properties.width.enum,
+    patchEnum: patchPanelProps.layout.properties.width.enum,
+    tsConst: 'ALLOWED_WIDTHS',
+    goMap: 'allowedWidths',
+  },
+];
+
+for (const c of checks) {
+  assertExactSetEqual(c.label, c.irEnum, c.patchEnum, 'dashboard-patch.schema.json');
+  assertExactSetEqual(c.label, c.irEnum, extractTsConstArray(tsTypes, c.tsConst), 'src/ir/types.ts');
+  assertExactSetEqual(c.label, c.irEnum, extractGoMapKeys(goValidate, c.goMap), 'pkg/ir/validate.go');
 }
 
 console.log(
-  `Schema sync OK: ${units.length} units, ${panelTypes.length} panel types, ${timeFrom.length} timeRange options, string-only enums verified.`
+  `Bidirectional schema sync OK: ${checks.map((c) => `${c.label}(${c.irEnum.length})`).join(', ')}; string-only enums verified.`
 );

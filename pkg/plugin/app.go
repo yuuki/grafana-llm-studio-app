@@ -38,19 +38,26 @@ type App struct {
 
 // NewApp creates a new App instance from Grafana's AppInstanceSettings.
 func NewApp(ctx context.Context, appSettings backend.AppInstanceSettings) (instancemgmt.Instance, error) {
-	settings, err := LoadSettings(appSettings)
+	var trustedAppURL string
+	var managedSecret string
+	if cfg := backend.GrafanaConfigFromContext(ctx); cfg != nil {
+		if appURL, err := cfg.AppURL(); err == nil {
+			trustedAppURL = strings.TrimSpace(appURL)
+		}
+		if secret, err := cfg.PluginAppClientSecret(); err == nil {
+			managedSecret = strings.TrimSpace(secret)
+		}
+	}
+
+	settings, err := LoadSettings(appSettings, trustedAppURL)
 	if err != nil {
 		return nil, err
 	}
 
-	// Prefer explicit secureJsonData token; fall back to Grafana-managed app service account secret if present.
+	// Prefer explicit secureJsonData token; allow Grafana-managed secret only after grafanaUrl origin validation passed.
 	token := settings.llmServiceAccountToken
-	if token == "" {
-		if cfg := backend.GrafanaConfigFromContext(ctx); cfg != nil {
-			if managedSecret, err := cfg.PluginAppClientSecret(); err == nil && strings.TrimSpace(managedSecret) != "" {
-				token = strings.TrimSpace(managedSecret)
-			}
-		}
+	if token == "" && managedSecret != "" {
+		token = managedSecret
 	}
 
 	var (
@@ -67,7 +74,7 @@ func NewApp(ctx context.Context, appSettings backend.AppInstanceSettings) (insta
 			ServiceAccountToken: token,
 			ModelTier:           llmclient.Model(settings.ModelTier),
 			MaxOutputTokens:     settings.MaxOutputTokens,
-			ReasoningEffort:     settings.ReasoningEffort,
+			ReasoningEffort:     settings.EffectiveReasoningEffort,
 			RequestTimeout:      settings.LLMTimeout(),
 			MaxTransportRetries: 1,
 		})
@@ -82,11 +89,12 @@ func newAppWithClient(settings Settings, client llm.Client, initErr error) *App 
 	var mgr *jobs.Manager
 	if client != nil {
 		mgr = jobs.NewManager(client, jobs.Config{
-			MaxPanels:         settings.MaxPanels,
-			MaxRepairAttempts: settings.MaxRepairAttempts,
-			JobDeadline:       settings.JobDeadline(),
-			MaxConcurrentJobs: settings.MaxConcurrentJobs,
-			AllowedDSUIDs:     settings.AllowedDatasourceUIDs,
+			MaxPanels:            settings.MaxPanels,
+			MaxRepairAttempts:    settings.EffectiveMaxRepairs,
+			MaxRepairAttemptsSet: true,
+			JobDeadline:          settings.JobDeadline(),
+			MaxConcurrentJobs:    settings.MaxConcurrentJobs,
+			AllowedDSUIDs:        settings.AllowedDatasourceUIDs,
 		})
 	}
 	a := &App{
@@ -101,8 +109,12 @@ func newAppWithClient(settings Settings, client llm.Client, initErr error) *App 
 	return a
 }
 
-// Dispose cleans up resources when Grafana recycles the plugin instance.
-func (a *App) Dispose() {}
+// Dispose cancels all active in-flight jobs when Grafana recycles the plugin instance.
+func (a *App) Dispose() {
+	if a.jobManager != nil {
+		a.jobManager.Close()
+	}
+}
 
 // CallResource delegates plugin resource HTTP requests to the internal ServeMux.
 func (a *App) CallResource(ctx context.Context, req *backend.CallResourceRequest, sender backend.CallResourceResponseSender) error {
@@ -133,7 +145,7 @@ func (a *App) CheckHealth(ctx context.Context, _ *backend.CheckHealthRequest) (*
 	if !enabled {
 		return &backend.CheckHealthResult{
 			Status:  backend.HealthStatusError,
-			Message: "grafana-llm-app is installed but no LLM provider is enabled/configured.",
+			Message: "grafana-llm-app is unavailable, unauthorized, or no LLM provider is enabled/configured.",
 		}, nil
 	}
 	return &backend.CheckHealthResult{
@@ -152,6 +164,31 @@ func (a *App) registerRoutes(mux *http.ServeMux) {
 func (a *App) handleHealth(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	pCtx := backend.PluginConfigFromContext(r.Context())
+	if _, err := callerOwnerFromContext(r.Context()); err != nil {
+		writeError(w, http.StatusUnauthorized, err.Error())
+		return
+	}
+	isAdmin := pCtx.User != nil && strings.EqualFold(pCtx.User.Role, "Admin")
+	if a.llmInitErr != nil || a.llmClient == nil || len(a.settings.AllowedDatasourceUIDs) == 0 {
+		msg := "service not ready"
+		if isAdmin && a.llmInitErr != nil {
+			msg = a.llmInitErr.Error()
+		}
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{
+			"status":  "ERROR",
+			"message": msg,
+		})
+		return
+	}
+	// Avoid triggering live LLM test completions on non-admin /health probes;
+	// only Admin probes call CheckHealth.
+	if !isAdmin {
+		writeJSON(w, http.StatusOK, map[string]any{
+			"status": "OK",
+		})
 		return
 	}
 	res, _ := a.CheckHealth(r.Context(), &backend.CheckHealthRequest{})
@@ -184,7 +221,7 @@ func (a *App) handleGenerate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if a.jobManager == nil {
-		writeError(w, http.StatusServiceUnavailable, fmt.Sprintf("LLM client unavailable: %v", a.llmInitErr))
+		writeError(w, http.StatusServiceUnavailable, "LLM client unavailable; check plugin configuration")
 		return
 	}
 	owner, err := callerOwnerFromContext(r.Context())
@@ -209,7 +246,7 @@ func (a *App) handleGenerate(w http.ResponseWriter, r *http.Request) {
 
 func (a *App) handleJobAction(w http.ResponseWriter, r *http.Request) {
 	if a.jobManager == nil {
-		writeError(w, http.StatusServiceUnavailable, fmt.Sprintf("LLM client unavailable: %v", a.llmInitErr))
+		writeError(w, http.StatusServiceUnavailable, "LLM client unavailable; check plugin configuration")
 		return
 	}
 	owner, err := callerOwnerFromContext(r.Context())
@@ -220,13 +257,13 @@ func (a *App) handleJobAction(w http.ResponseWriter, r *http.Request) {
 
 	trimmed := strings.TrimPrefix(r.URL.Path, "/jobs/")
 	parts := strings.Split(strings.Trim(trimmed, "/"), "/")
-	if len(parts) == 0 || parts[0] == "" {
-		writeError(w, http.StatusNotFound, "missing jobId")
+	if len(parts) == 0 || len(parts) > 2 || parts[0] == "" {
+		writeError(w, http.StatusNotFound, "invalid job route")
 		return
 	}
 	jobID := parts[0]
 	action := ""
-	if len(parts) >= 2 {
+	if len(parts) == 2 {
 		action = parts[1]
 	}
 
@@ -316,6 +353,9 @@ func decodeBoundedJSON(body io.Reader, dst any) error {
 	if err := dec.Decode(dst); err != nil {
 		return fmt.Errorf("invalid JSON request: %w", err)
 	}
+	if err := dec.Decode(&struct{}{}); err != io.EOF {
+		return errors.New("unexpected trailing tokens after JSON request body")
+	}
 	return nil
 }
 
@@ -324,18 +364,18 @@ func writeJobError(w http.ResponseWriter, err error, snap jobs.JobSnapshot) {
 	switch {
 	case errors.Is(err, jobs.ErrJobNotFound):
 		status = http.StatusNotFound
-	case errors.Is(err, jobs.ErrForbidden):
+	case errors.Is(err, jobs.ErrForbidden), errors.Is(err, jobs.ErrDatasourceDenied):
 		status = http.StatusForbidden
-	case errors.Is(err, jobs.ErrDatasourceDenied):
-		status = http.StatusForbidden
-	case errors.Is(err, ir.ErrRevisionConflict):
+	case errors.Is(err, ir.ErrRevisionConflict), errors.Is(err, jobs.ErrOperationInProgress), errors.Is(err, jobs.ErrJobCancelled):
 		status = http.StatusConflict
 	case errors.Is(err, jobs.ErrBudgetExhausted), errors.Is(err, jobs.ErrConcurrencyLimited):
 		status = http.StatusTooManyRequests
-	case errors.Is(err, jobs.ErrNotRepairable), errors.Is(err, jobs.ErrNoUndoHistory):
+	case errors.Is(err, jobs.ErrNotRepairable), errors.Is(err, jobs.ErrNoUndoHistory), errors.Is(err, ir.ErrNoOpPatch):
 		status = http.StatusUnprocessableEntity
-	case errors.Is(err, jobs.ErrJobCancelled):
-		status = http.StatusConflict
+	case errors.Is(err, context.DeadlineExceeded):
+		status = http.StatusGatewayTimeout
+	case errors.Is(err, llm.ErrOutputTruncated), errors.Is(err, llm.ErrOutputRefused):
+		status = http.StatusBadGateway
 	}
 	payload := map[string]any{
 		"error": err.Error(),

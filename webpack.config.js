@@ -18,17 +18,22 @@ module.exports = (env, argv) => {
       },
       clean: false,
     },
+    // Strictly aligned with Grafana OSS v12.4.15 sharedDependenciesMap:
+    // - Do NOT externalize @grafana/schema or @grafana/i18n (not exposed in Grafana 12.4.15 SystemJS map)
+    // - Do NOT externalize react-router-dom (Grafana 12.4.15 exposes v5 under react-router-dom, v6 under react-router)
+    // - DO externalize @emotion/react, react/jsx-runtime, and i18next to prevent duplicate runtime instances
     externals: [
       'lodash',
       'react',
       'react-dom',
-      'react-router-dom',
+      'react/jsx-runtime',
+      'react-router',
       'rxjs',
+      'i18next',
       '@emotion/css',
+      '@emotion/react',
       '@grafana/data',
-      '@grafana/i18n',
       '@grafana/runtime',
-      '@grafana/schema',
       '@grafana/ui',
     ],
     resolve: {

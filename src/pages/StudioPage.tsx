@@ -13,6 +13,7 @@ import {
 } from '@grafana/ui';
 import {
   cancelDraftJob,
+  extractApiError,
   fetchPublicConfig,
   generateDraft,
   patchDraft,
@@ -23,6 +24,7 @@ import { selectMetricCandidates } from '../datasource/bm25';
 import { fetchScopedMetricCatalog, fetchScopeLabelValues } from '../datasource/metadata';
 import { runDryRunValidation } from '../datasource/validator';
 import {
+  computeQueryHash,
   JobSnapshot,
   MetricCatalogItem,
   PanelValidationResult,
@@ -46,6 +48,11 @@ interface AllowedDatasourceOption {
   type: string;
 }
 
+interface PreviewMeta {
+  jobId: string;
+  revision: number;
+}
+
 const VALIDATION_BADGE_COLOR: Record<ValidationCategory, 'green' | 'orange' | 'red' | 'blue'> = {
   ok: 'green',
   empty_result: 'blue',
@@ -64,6 +71,22 @@ const VALIDATION_LABEL: Record<ValidationCategory, string> = {
   datasource_error: 'データソースエラー',
 };
 
+const BLOCKING_CATEGORIES = new Set<ValidationCategory>([
+  'syntax_error',
+  'permission_error',
+  'timeout',
+  'datasource_error',
+]);
+
+function isPrometheusCompatibleType(dsType: string): boolean {
+  const lower = (dsType || '').toLowerCase();
+  return lower === 'prometheus' || lower.includes('victoriametrics');
+}
+
+function makeScopeKey(dsUid: string, labelName: string, labelValue: string): string {
+  return `${dsUid}::${labelName}::${labelValue.trim()}`;
+}
+
 export const StudioPage: React.FC = () => {
   const currentOrgId = config.bootData?.user?.orgId ?? 1;
 
@@ -74,8 +97,9 @@ export const StudioPage: React.FC = () => {
   const [scopeLabelValues, setScopeLabelValues] = useState<string[]>([]);
   const [scopeLabelValue, setScopeLabelValue] = useState<string>('');
 
-  // In-memory only scoped metadata (cleared on org/datasource change or unmount).
+  // In-memory only scoped metadata bound to catalogScopeKey (cleared on org/datasource switch or unmount).
   const [catalog, setCatalog] = useState<MetricCatalogItem[]>([]);
+  const [catalogScopeKey, setCatalogScopeKey] = useState<string>('');
   const [catalogTruncated, setCatalogTruncated] = useState(false);
   const [loadingCatalog, setLoadingCatalog] = useState(false);
 
@@ -86,15 +110,15 @@ export const StudioPage: React.FC = () => {
   const [editPanelId, setEditPanelId] = useState<string>('');
   const [job, setJob] = useState<JobSnapshot | null>(null);
   const [busyState, setBusyState] = useState<
-    'idle' | 'generating' | 'patching' | 'validating' | 'repairing' | 'saving'
+    'idle' | 'generating' | 'patching' | 'validating' | 'repairing' | 'undoing' | 'saving'
   >('idle');
   const [uiError, setUiError] = useState<string | null>(null);
 
-  // Dry-run validation and explicit Scenes preview state.
+  // Dry-run validation and explicit Scenes preview state bound to (jobId, revision).
   const [validationResults, setValidationResults] = useState<PanelValidationResult[]>([]);
   const [previewSpec, setPreviewSpec] = useState<NormalizedDashboardSpec | null>(null);
   const [previewScene, setPreviewScene] = useState<EmbeddedScene | null>(null);
-  const [previewedRevision, setPreviewedRevision] = useState<number | null>(null);
+  const [previewMeta, setPreviewMeta] = useState<PreviewMeta | null>(null);
   const [rightTab, setRightTab] = useState<'preview' | 'ir' | 'foundation'>('preview');
 
   // Create-only save state.
@@ -103,26 +127,35 @@ export const StudioPage: React.FC = () => {
   const [savedResult, setSavedResult] = useState<SaveDashboardResult | null>(null);
 
   const abortRef = useRef<AbortController | null>(null);
+  const metadataAbortRef = useRef<AbortController | null>(null);
+  const contextSeqRef = useRef<number>(0);
   const saverRef = useRef<DashboardSaver>(new DashboardSaver());
   const prevContextKeyRef = useRef<string>(`${currentOrgId}:${selectedDsUid}`);
 
   const clearDraftAndMetadata = useCallback(() => {
+    contextSeqRef.current += 1;
     abortRef.current?.abort();
     abortRef.current = null;
+    metadataAbortRef.current?.abort();
+    metadataAbortRef.current = null;
     setCatalog([]);
+    setCatalogScopeKey('');
     setCatalogTruncated(false);
+    setLoadingCatalog(false);
+    setScopeLabelValues([]);
+    setScopeLabelValue('');
     setJob(null);
     setValidationResults([]);
     setPreviewSpec(null);
     setPreviewScene(null);
-    setPreviewedRevision(null);
+    setPreviewMeta(null);
     setSavedResult(null);
     setEditPanelId('');
     setUiError(null);
     setBusyState('idle');
   }, []);
 
-  // Reset draft and in-memory metadata on org or datasource switch (and unmount / logout).
+  // Reset draft and in-memory metadata on org or datasource switch (H-13).
   useEffect(() => {
     const key = `${currentOrgId}:${selectedDsUid}`;
     if (prevContextKeyRef.current !== key) {
@@ -133,16 +166,19 @@ export const StudioPage: React.FC = () => {
 
   useEffect(() => {
     return () => {
+      contextSeqRef.current += 1;
       abortRef.current?.abort();
+      metadataAbortRef.current?.abort();
     };
   }, []);
 
-  // Load secret-free public config, allowlisted datasources, and writable folders.
+  // Load secret-free public config, allowlisted Prometheus datasources, and writable folders independently.
   useEffect(() => {
     let active = true;
+    const initController = new AbortController();
     (async () => {
       try {
-        const cfg = await fetchPublicConfig();
+        const cfg = await fetchPublicConfig(initController.signal);
         if (!active) {
           return;
         }
@@ -151,29 +187,36 @@ export const StudioPage: React.FC = () => {
         const allDs = getDataSourceSrv().getList({ metrics: true });
         const allowSet = new Set(cfg.allowedDatasourceUids);
         const filtered: AllowedDatasourceOption[] = allDs
-          .filter((d) => allowSet.has(d.uid))
+          .filter((d) => allowSet.has(d.uid) && isPrometheusCompatibleType(d.type))
           .map((d) => ({ uid: d.uid, name: d.name, type: d.type }));
         setAllowedDatasources(filtered);
-        if (filtered.length > 0) {
-          setSelectedDsUid(filtered[0].uid);
+        setSelectedDsUid(filtered.length > 0 ? filtered[0].uid : '');
+      } catch (err: unknown) {
+        if (active && !initController.signal.aborted) {
+          setUiError(
+            `初期化に失敗しました（App Config で許可データソースと LLM モードを確認してください）: ${extractApiError(
+              err
+            )}`
+          );
         }
+        return;
+      }
 
+      // Folder listing is best-effort so Viewer roles without folders:read still work (M-10).
+      try {
         const writable = await listWritableFolders();
         if (active) {
           setFolders(writable);
         }
-      } catch (err: unknown) {
+      } catch {
         if (active) {
-          setUiError(
-            `初期化に失敗しました（App Config で許可データソースと LLM モードを確認してください）: ${
-              err instanceof Error ? err.message : String(err)
-            }`
-          );
+          setFolders([{ uid: '', title: 'General (Root)' }]);
         }
       }
     })();
     return () => {
       active = false;
+      initController.abort();
     };
   }, [currentOrgId]);
 
@@ -182,19 +225,50 @@ export const StudioPage: React.FC = () => {
     [allowedDatasources, selectedDsUid]
   );
 
+  const currentScopeKey = makeScopeKey(selectedDsUid, scopeLabelName, scopeLabelValue);
+  const isCatalogFresh = catalog.length > 0 && catalogScopeKey === currentScopeKey;
+
+  const reconcileEditPanelId = (nextJob: JobSnapshot) => {
+    setEditPanelId((prev) => {
+      if (prev === '__new__') {
+        return '';
+      }
+      if (prev && nextJob.currentIR && !nextJob.currentIR.panels.some((p) => p.id === prev)) {
+        return '';
+      }
+      return prev;
+    });
+  };
+
   const handleLoadScopeValues = async () => {
     if (!selectedDsUid) {
       return;
     }
+    metadataAbortRef.current?.abort();
+    const controller = new AbortController();
+    metadataAbortRef.current = controller;
+    const seq = contextSeqRef.current;
+
     setUiError(null);
     try {
-      const vals = await fetchScopeLabelValues(selectedDsUid, scopeLabelName, 3600, 100);
+      const vals = await fetchScopeLabelValues(
+        selectedDsUid,
+        scopeLabelName,
+        3600,
+        100,
+        controller.signal
+      );
+      if (controller.signal.aborted || seq !== contextSeqRef.current) {
+        return;
+      }
       setScopeLabelValues(vals);
       if (vals.length > 0 && !scopeLabelValue) {
         setScopeLabelValue(vals[0]);
       }
     } catch (err: unknown) {
-      setUiError(`スコープ値取得エラー: ${err instanceof Error ? err.message : String(err)}`);
+      if (!controller.signal.aborted && seq === contextSeqRef.current) {
+        setUiError(`スコープ値取得エラー: ${extractApiError(err)}`);
+      }
     }
   };
 
@@ -203,19 +277,34 @@ export const StudioPage: React.FC = () => {
       setUiError('データソースと対象スコープ値（例: checkout-api）を指定してください。');
       return;
     }
+    metadataAbortRef.current?.abort();
+    const controller = new AbortController();
+    metadataAbortRef.current = controller;
+    const seq = contextSeqRef.current;
+    const targetScopeKey = makeScopeKey(selectedDsUid, scopeLabelName, scopeLabelValue);
+
     setLoadingCatalog(true);
     setUiError(null);
     try {
       const res = await fetchScopedMetricCatalog({
         datasourceUid: selectedDsUid,
         scope: { labelName: scopeLabelName, labelValue: scopeLabelValue.trim() },
+        signal: controller.signal,
       });
+      if (controller.signal.aborted || seq !== contextSeqRef.current) {
+        return;
+      }
       setCatalog(res.items);
+      setCatalogScopeKey(targetScopeKey);
       setCatalogTruncated(res.truncated);
     } catch (err: unknown) {
-      setUiError(`メタデータ取得エラー: ${err instanceof Error ? err.message : String(err)}`);
+      if (!controller.signal.aborted && seq === contextSeqRef.current) {
+        setUiError(`メタデータ取得エラー: ${extractApiError(err)}`);
+      }
     } finally {
-      setLoadingCatalog(false);
+      if (metadataAbortRef.current === controller && seq === contextSeqRef.current) {
+        setLoadingCatalog(false);
+      }
     }
   };
 
@@ -224,19 +313,30 @@ export const StudioPage: React.FC = () => {
       setUiError('許可された Prometheus データソースを選択してください。');
       return;
     }
-    if (catalog.length === 0) {
-      setUiError('先に「スコープのメトリクスを取得」を実行し、実在するメトリクス候補を読み込んでください。');
+    if (!isCatalogFresh) {
+      setUiError(
+        '現在のスコープに対応するメトリクス候補を取得してください（「スコープのメトリクスを取得」を実行）。'
+      );
       return;
     }
 
     abortRef.current?.abort();
     const controller = new AbortController();
     abortRef.current = controller;
+    const seq = contextSeqRef.current;
 
     const isPatch = Boolean(job?.currentIR && editPanelId !== '__new__');
     setBusyState(isPatch ? 'patching' : 'generating');
     setUiError(null);
     setSavedResult(null);
+
+    // Starting a brand-new draft MUST clear previous job's preview state immediately (C-2).
+    if (!isPatch) {
+      setPreviewSpec(null);
+      setPreviewScene(null);
+      setPreviewMeta(null);
+      setValidationResults([]);
+    }
 
     const narrowedCatalog = selectMetricCandidates(catalog, promptText, {
       maxItems: 40,
@@ -248,52 +348,70 @@ export const StudioPage: React.FC = () => {
     };
 
     try {
-      const nextJob = isPatch && job?.currentIR
-        ? await patchDraft(
-            job.jobId,
-            {
-              baseRevision: job.currentIR.revision,
-              targetPanelId: editPanelId || undefined,
-              editIntent: promptText,
-              catalog: narrowedCatalog,
-            },
-            controller.signal
-          )
-        : await generateDraft(
-            {
-              datasourceUid: selectedDsUid,
-              scope,
-              userIntent: promptText,
-              catalog: narrowedCatalog,
-            },
-            controller.signal
-          );
+      const nextJob =
+        isPatch && job?.currentIR
+          ? await patchDraft(
+              job.jobId,
+              {
+                baseRevision: job.currentIR.revision,
+                targetPanelId: editPanelId || undefined,
+                editIntent: promptText,
+                catalog: narrowedCatalog,
+              },
+              controller.signal
+            )
+          : await generateDraft(
+              {
+                datasourceUid: selectedDsUid,
+                scope,
+                userIntent: promptText,
+                catalog: narrowedCatalog,
+              },
+              controller.signal
+            );
 
-      if (controller.signal.aborted) {
+      if (controller.signal.aborted || seq !== contextSeqRef.current) {
         return;
       }
       setJob(nextJob);
-      // Do NOT auto-apply to Scene or auto-query Prometheus; require explicit user action.
-      setValidationResults([]);
+      reconcileEditPanelId(nextJob);
+      // Do NOT clear validationResults on patch: queryHash matching in handleValidateAndPreview
+      // retains results for untouched panels and re-validates only changed/missing panels (H-9).
+      if (!isPatch) {
+        setValidationResults([]);
+      }
     } catch (err: unknown) {
-      if (controller.signal.aborted) {
+      if (controller.signal.aborted || seq !== contextSeqRef.current) {
         return;
       }
+      syncJobFromError(err);
       setUiError(extractApiError(err));
     } finally {
-      if (abortRef.current === controller) {
+      if (abortRef.current === controller && seq === contextSeqRef.current) {
         setBusyState('idle');
       }
     }
   };
 
   const handleCancel = async () => {
+    const activeState = busyState;
+    if (activeState === 'idle' || activeState === 'saving') {
+      return;
+    }
     abortRef.current?.abort();
     setBusyState('idle');
-    if (job?.jobId) {
+
+    // Only notify Backend cancel when an LLM backend operation on an existing job was in-flight (M-11).
+    if (
+      (activeState === 'patching' || activeState === 'repairing') &&
+      job?.jobId
+    ) {
+      const seq = contextSeqRef.current;
       try {
         const updated = await cancelDraftJob(job.jobId);
-        setJob(updated);
+        if (seq === contextSeqRef.current) {
+          setJob(updated);
+        }
       } catch {
         // Ignore cancel race errors if job already completed.
       }
@@ -301,83 +419,126 @@ export const StudioPage: React.FC = () => {
   };
 
   const handleUndo = async () => {
-    if (!job?.jobId) {
+    if (!job?.jobId || busyState !== 'idle') {
       return;
     }
+    abortRef.current?.abort();
+    const controller = new AbortController();
+    abortRef.current = controller;
+    const seq = contextSeqRef.current;
+
+    setBusyState('undoing');
     setUiError(null);
     try {
-      const updated = await undoDraft(job.jobId);
+      const updated = await undoDraft(job.jobId, controller.signal);
+      if (controller.signal.aborted || seq !== contextSeqRef.current) {
+        return;
+      }
       setJob(updated);
-      setValidationResults([]);
+      reconcileEditPanelId(updated);
       setSavedResult(null);
     } catch (err: unknown) {
-      setUiError(extractApiError(err));
+      if (!controller.signal.aborted && seq === contextSeqRef.current) {
+        setUiError(extractApiError(err));
+      }
+    } finally {
+      if (abortRef.current === controller && seq === contextSeqRef.current) {
+        setBusyState('idle');
+      }
     }
   };
 
   /**
    * Explicit user action: runs bounded Dry-Run validation (5m, maxDataPoints=10, concurrency<=2)
-   * and then constructs a memoized @grafana/scenes preview ONLY for the verified revision.
+   * ONLY for panels whose queryHash changed or were not previously validated cleanly (H-9).
+   * Blocks Scenes construction and Save if any panel has a blocking error (C-2).
    */
   const handleValidateAndPreview = async () => {
-    if (!job?.currentIR || !selectedDatasource) {
+    if (!job?.currentIR || !selectedDatasource || busyState !== 'idle') {
       return;
     }
 
     abortRef.current?.abort();
     const controller = new AbortController();
     abortRef.current = controller;
+    const seq = contextSeqRef.current;
+    const targetJobId = job.jobId;
+    const targetRevision = job.currentIR.revision;
 
     setBusyState('validating');
     setUiError(null);
 
     try {
-      const normalized = normalizeDashboardIR(job.currentIR, selectedDatasource);
+      const normalized = normalizeDashboardIR(
+        job.currentIR,
+        selectedDatasource,
+        publicCfg?.maxPanels ?? 6
+      );
 
-      // Re-validate only changed panels if a previous revision already validated unchanged panels.
-      const changedIds =
-        previewedRevision !== null && job.lastDiff && job.lastDiff.length > 0
-          ? Array.from(
-              new Set(
-                job.lastDiff
-                  .map((d) => d.panelId)
-                  .filter((id): id is string => Boolean(id))
-              )
-            )
-          : undefined;
+      // Compare queryHash against previously cached validation results for the SAME job (H-9).
+      const prevByPanel = new Map<string, PanelValidationResult>();
+      if (previewMeta?.jobId === targetJobId || validationResults.length > 0) {
+        for (const r of validationResults) {
+          prevByPanel.set(r.panelId, r);
+        }
+      }
 
-      const results = await runDryRunValidation(normalized, {
-        maxConcurrency: publicCfg?.maxConcurrentQueries ?? 2,
-        timeoutMs: (publicCfg?.validationTimeoutSeconds ?? 10) * 1000,
-        from: 'now-5m',
-        to: 'now',
-        maxDataPoints: 10,
-        onlyPanelIds: changedIds && changedIds.length > 0 ? changedIds : undefined,
-        signal: controller.signal,
-      });
+      const panelsNeedingValidation: string[] = [];
+      for (const panel of normalized.panels) {
+        const expectedHash = await computeQueryHash(panel.target.expr);
+        const cached = prevByPanel.get(panel.id);
+        const cachedClean =
+          cached &&
+          cached.queryHash === expectedHash &&
+          !BLOCKING_CATEGORIES.has(cached.category);
+        if (!cachedClean) {
+          panelsNeedingValidation.push(panel.id);
+        }
+      }
 
-      if (controller.signal.aborted) {
+      const freshResults =
+        panelsNeedingValidation.length > 0
+          ? await runDryRunValidation(normalized, {
+              maxConcurrency: publicCfg?.maxConcurrentQueries ?? 2,
+              timeoutMs: (publicCfg?.validationTimeoutSeconds ?? 10) * 1000,
+              from: 'now-5m',
+              to: 'now',
+              maxDataPoints: 10,
+              onlyPanelIds: panelsNeedingValidation,
+              signal: controller.signal,
+            })
+          : [];
+
+      if (controller.signal.aborted || seq !== contextSeqRef.current) {
         return;
       }
 
-      const mergedResults =
-        changedIds && changedIds.length > 0
-          ? mergeValidationResults(validationResults, results, normalized)
-          : results;
+      const mergedResults = mergeValidationResults(validationResults, freshResults, normalized);
       setValidationResults(mergedResults);
 
-      // Build memoized Scenes preview ONCE for this revision (never recreated on unrelated React renders).
+      const hasBlockingErrors = mergedResults.some((r) => BLOCKING_CATEGORIES.has(r.category));
+      if (hasBlockingErrors) {
+        // Do NOT mount Scenes or mark revision as save-ready when Dry-Run failed (C-2).
+        setPreviewSpec(null);
+        setPreviewScene(null);
+        setPreviewMeta(null);
+        setUiError(
+          'Dry-Run 検証でエラー（構文エラー・権限エラー・タイムアウト等）が検出されたため、Scenes プレビューと保存をブロックしました。'
+        );
+        return;
+      }
+
       const scene = buildPreviewScene(normalized, { maxDataPoints: 200 });
       setPreviewSpec(normalized);
       setPreviewScene(scene);
-      setPreviewedRevision(normalized.revision);
+      setPreviewMeta({ jobId: targetJobId, revision: targetRevision });
       setRightTab('preview');
     } catch (err: unknown) {
-      if (!controller.signal.aborted) {
-        setUiError(`検証・プレビューに失敗しました: ${err instanceof Error ? err.message : String(err)}`);
+      if (!controller.signal.aborted && seq === contextSeqRef.current) {
+        setUiError(`検証・プレビューに失敗しました: ${extractApiError(err)}`);
       }
     } finally {
-      if (abortRef.current === controller) {
+      if (abortRef.current === controller && seq === contextSeqRef.current) {
         setBusyState('idle');
       }
     }
@@ -388,13 +549,29 @@ export const StudioPage: React.FC = () => {
     [validationResults]
   );
 
+  const hasBlockingValidationErrors = useMemo(
+    () => validationResults.some((r) => BLOCKING_CATEGORIES.has(r.category)),
+    [validationResults]
+  );
+
+  const syncJobFromError = (err: unknown) => {
+    if (typeof err === 'object' && err !== null) {
+      const maybeJob = (err as { data?: { job?: JobSnapshot } })?.data?.job;
+      if (maybeJob && maybeJob.jobId) {
+        setJob(maybeJob);
+      }
+    }
+  };
+
   const handleRepairSyntaxErrors = async () => {
-    if (!job?.currentIR || syntaxErrors.length === 0) {
+    if (!job?.currentIR || syntaxErrors.length === 0 || busyState !== 'idle') {
       return;
     }
     abortRef.current?.abort();
     const controller = new AbortController();
     abortRef.current = controller;
+    const seq = contextSeqRef.current;
+
     setBusyState('repairing');
     setUiError(null);
 
@@ -412,55 +589,92 @@ export const StudioPage: React.FC = () => {
         },
         controller.signal
       );
-      if (!controller.signal.aborted) {
+      if (!controller.signal.aborted && seq === contextSeqRef.current) {
         setJob(updated);
+        // Clear stale syntax_error results so repaired panels must be re-validated (M-11).
+        setValidationResults((prev) =>
+          prev.filter((r) => !syntaxErrors.some((s) => s.panelId === r.panelId))
+        );
       }
     } catch (err: unknown) {
-      if (!controller.signal.aborted) {
+      if (!controller.signal.aborted && seq === contextSeqRef.current) {
+        // Sync updated repairAttemptsUsed from backend error payload (M-11).
+        syncJobFromError(err);
         setUiError(extractApiError(err));
       }
     } finally {
-      if (abortRef.current === controller) {
+      if (abortRef.current === controller && seq === contextSeqRef.current) {
         setBusyState('idle');
       }
     }
   };
 
   const handleSaveNewDashboard = async () => {
-    if (!previewSpec || previewedRevision === null) {
+    if (!job?.currentIR || !selectedDatasource || !previewSpec || !previewMeta) {
       setUiError('保存前に「検証・プレビューを実行」して最新ドラフトを確認してください。');
       return;
     }
+    if (previewMeta.jobId !== job.jobId || previewMeta.revision !== job.currentIR.revision) {
+      setUiError('最新ドラフトが未検証です。先に「検証・プレビューを実行」を完了してください。');
+      return;
+    }
+    if (hasBlockingValidationErrors) {
+      setUiError('検証エラーが残っているドラフトは保存できません。');
+      return;
+    }
+
+    const seq = contextSeqRef.current;
     setBusyState('saving');
     setUiError(null);
     setSavedResult(null);
     try {
+      // Build spec freshly from current job.currentIR so DashboardSaver verifies real revision match (C-2).
+      const currentSpec = normalizeDashboardIR(
+        job.currentIR,
+        selectedDatasource,
+        publicCfg?.maxPanels ?? 6
+      );
       const res = await saverRef.current.createNewDashboard({
-        spec: previewSpec,
-        previewedRevision,
+        spec: currentSpec,
+        previewedRevision: previewMeta.revision,
         folderUid: selectedFolderUid,
       });
-      setSavedResult(res);
+      if (seq === contextSeqRef.current) {
+        setSavedResult(res);
+      }
     } catch (err: unknown) {
-      setUiError(err instanceof Error ? err.message : String(err));
+      if (seq === contextSeqRef.current) {
+        setUiError(extractApiError(err));
+      }
     } finally {
-      setBusyState('idle');
+      if (seq === contextSeqRef.current) {
+        setBusyState('idle');
+      }
     }
   };
 
   const handleExportJson = () => {
-    if (!previewSpec && (!job?.currentIR || !selectedDatasource)) {
+    if (!job?.currentIR || !selectedDatasource) {
       return;
     }
-    const spec = previewSpec ?? normalizeDashboardIR(job!.currentIR!, selectedDatasource!);
-    const json = buildExportableDashboardJson(spec);
-    const blob = new Blob([json], { type: 'application/json' });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = `dashboard-rev-${spec.revision}.json`;
-    a.click();
-    URL.revokeObjectURL(url);
+    try {
+      // Always export the CURRENT IR revision, never a stale previewSpec (M-10).
+      const spec = normalizeDashboardIR(
+        job.currentIR,
+        selectedDatasource,
+        publicCfg?.maxPanels ?? 6
+      );
+      const json = buildExportableDashboardJson(spec);
+      const blob = new Blob([json], { type: 'application/json' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `dashboard-rev-${spec.revision}.json`;
+      a.click();
+      URL.revokeObjectURL(url);
+    } catch (err: unknown) {
+      setUiError(`JSON エクスポートに失敗しました: ${extractApiError(err)}`);
+    }
   };
 
   const foundationJsonPreview = useMemo(() => {
@@ -468,18 +682,31 @@ export const StudioPage: React.FC = () => {
       return '';
     }
     try {
-      const spec = normalizeDashboardIR(job.currentIR, selectedDatasource);
+      const spec = normalizeDashboardIR(
+        job.currentIR,
+        selectedDatasource,
+        publicCfg?.maxPanels ?? 6
+      );
       return buildExportableDashboardJson(spec);
     } catch {
       return '';
     }
-  }, [job?.currentIR, selectedDatasource]);
+  }, [job?.currentIR, selectedDatasource, publicCfg?.maxPanels]);
 
   const canSave =
     Boolean(previewSpec) &&
+    Boolean(previewMeta) &&
     Boolean(job?.currentIR) &&
-    previewedRevision === job?.currentIR?.revision &&
+    previewMeta?.jobId === job?.jobId &&
+    previewMeta?.revision === job?.currentIR?.revision &&
+    !hasBlockingValidationErrors &&
     busyState === 'idle';
+
+  const canCancel =
+    busyState === 'generating' ||
+    busyState === 'patching' ||
+    busyState === 'validating' ||
+    busyState === 'repairing';
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 12, padding: 16 }}>
@@ -565,6 +792,7 @@ export const StudioPage: React.FC = () => {
           <div style={{ fontSize: 12, color: '#9fa7b3' }}>
             読込済みメトリクス候補（ブラウザメモリのみ）: <strong>{catalog.length}</strong> 件
             {catalogTruncated ? '（上限で打ち切り）' : ''}
+            {catalog.length > 0 && !isCatalogFresh ? '（スコープ変更済み・再取得が必要）' : ''}
           </div>
 
           {job?.currentIR && (
@@ -596,7 +824,7 @@ export const StudioPage: React.FC = () => {
           <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
             <Button
               onClick={handleGenerateOrPatch}
-              disabled={busyState !== 'idle' || catalog.length === 0}
+              disabled={busyState !== 'idle' || !isCatalogFresh}
             >
               {busyState === 'generating' || busyState === 'patching'
                 ? '生成中...'
@@ -604,7 +832,7 @@ export const StudioPage: React.FC = () => {
                 ? '部分修正を適用'
                 : 'ダッシュボード案を生成'}
             </Button>
-            {busyState !== 'idle' && (
+            {canCancel && (
               <Button variant="destructive" size="sm" onClick={handleCancel}>
                 キャンセル
               </Button>
@@ -697,14 +925,14 @@ export const StudioPage: React.FC = () => {
               </div>
               {!canSave && job.currentIR && (
                 <div style={{ fontSize: 12, color: '#9fa7b3' }}>
-                  最新リビジョン (rev {job.currentIR.revision}) の「検証・プレビューを実行」完了後に保存できます。
+                  最新リビジョン (rev {job.currentIR.revision}) の「検証・プレビューを実行」がエラーなしで完了すると保存できます。
                 </div>
               )}
             </div>
           )}
         </div>
 
-        {/* Right Pane: Explicit Validation Trigger + Scenes Preview / IR / Foundation JSON */}
+        {/* Right Pane: Explicit Validation Trigger + Mounted Scenes Preview / IR / Foundation JSON */}
         <div style={{ display: 'flex', flexDirection: 'column', gap: 12, border: '1px solid #2c3235', borderRadius: 6, padding: 12, minHeight: 540 }}>
           <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
             <div style={{ display: 'flex', gap: 8 }}>
@@ -746,19 +974,18 @@ export const StudioPage: React.FC = () => {
             </Button>
           </div>
 
-          {rightTab === 'preview' && (
-            <div style={{ minHeight: 460 }}>
-              {previewScene ? (
-                <previewScene.Component model={previewScene} />
-              ) : (
-                <div style={{ padding: 32, textAlign: 'center', color: '#9fa7b3' }}>
-                  {job?.currentIR
-                    ? `ドラフト rev ${job.currentIR.revision} の IR 検査が完了しています。「検証・プレビューを実行」を押すとクエリ検証と Scenes 描画を行います（自動更新は無効です）。`
-                    : '左ペインでデータソースとスコープのメトリクスを読み込み、ダッシュボード案を生成してください。'}
-                </div>
-              )}
-            </div>
-          )}
+          {/* Keep Scenes container mounted via CSS display so tab switching NEVER unmounts/re-activates SceneQueryRunner (H-8). */}
+          <div style={{ display: rightTab === 'preview' ? 'block' : 'none', minHeight: 460 }}>
+            {previewScene ? (
+              <previewScene.Component model={previewScene} />
+            ) : (
+              <div style={{ padding: 32, textAlign: 'center', color: '#9fa7b3' }}>
+                {job?.currentIR
+                  ? `ドラフト rev ${job.currentIR.revision} の IR 検査が完了しています。「検証・プレビューを実行」を押すとクエリ検証と Scenes 描画を行います（自動更新は無効です）。`
+                  : '左ペインでデータソースとスコープのメトリクスを読み込み、ダッシュボード案を生成してください。'}
+              </div>
+            )}
+          </div>
 
           {rightTab === 'ir' && (
             <pre style={{ margin: 0, padding: 12, background: '#111217', borderRadius: 4, overflow: 'auto', maxHeight: 520, fontSize: 12 }}>
@@ -792,12 +1019,4 @@ function mergeValidationResults(
   return spec.panels
     .map((p) => byId.get(p.id))
     .filter((r): r is PanelValidationResult => Boolean(r));
-}
-
-function extractApiError(err: unknown): string {
-  if (typeof err === 'object' && err !== null) {
-    const e = err as { data?: { error?: string; message?: string }; message?: string };
-    return e.data?.error || e.data?.message || e.message || 'リクエストに失敗しました';
-  }
-  return String(err);
 }

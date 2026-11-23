@@ -7,6 +7,7 @@ import {
   SceneQueryRunner,
   SceneTimeRange,
 } from '@grafana/scenes';
+import { LegendDisplayMode } from '@grafana/schema';
 import { NormalizedDashboardSpec, NormalizedPanelSpec } from './normalize';
 
 export interface SceneAdapterOptions {
@@ -19,9 +20,9 @@ export interface SceneAdapterOptions {
 /**
  * Thin adapter converting NormalizedDashboardSpec into a public-API @grafana/scenes EmbeddedScene.
  * - Uses ONLY public @grafana/scenes APIs (never internal DashboardScene).
- * - Disables auto-refresh (no SceneRefreshPicker) and fixes grid geometry.
- * - Callers MUST invoke this ONLY after explicit user "検証・プレビュー" action and memoize
- *   by (jobId, revision, previewToken) so React re-renders never trigger unintended re-queries.
+ * - Disables auto-refresh AND disables refreshOnActivate ({}) so re-activation never
+ *   silently re-evaluates relative timeRange or re-issues Prometheus queries (H-8).
+ * - Mirrors timeseries legend and stat reduceOptions identically to toFoundation.ts (H-12).
  */
 export function buildPreviewScene(
   spec: NormalizedDashboardSpec,
@@ -35,6 +36,7 @@ export function buildPreviewScene(
     $timeRange: new SceneTimeRange({
       from: spec.timeRange.from,
       to: spec.timeRange.to,
+      refreshOnActivate: {},
     }),
     body: new SceneGridLayout({
       isDraggable: false,
@@ -63,20 +65,43 @@ function buildGridItem(panel: NormalizedPanelSpec, maxDataPoints: number): Scene
     color: step.color,
   }));
 
-  const vizBuilder =
-    panel.type === 'stat' ? PanelBuilders.stat() : PanelBuilders.timeseries();
-
-  vizBuilder
-    .setTitle(panel.title)
-    .setData(queryRunner)
-    .setUnit(panel.unit)
-    .setThresholds({
-      mode: ThresholdsMode.Absolute,
-      steps: thresholdSteps,
-    });
-
-  if (panel.description) {
-    vizBuilder.setDescription(panel.description);
+  let body;
+  if (panel.type === 'stat') {
+    const statBuilder = PanelBuilders.stat()
+      .setTitle(panel.title)
+      .setData(queryRunner)
+      .setUnit(panel.unit)
+      .setThresholds({
+        mode: ThresholdsMode.Absolute,
+        steps: thresholdSteps,
+      })
+      .setOption('reduceOptions', {
+        calcs: ['lastNotNull'],
+        values: false,
+      });
+    if (panel.description) {
+      statBuilder.setDescription(panel.description);
+    }
+    body = statBuilder.build();
+  } else {
+    const tsBuilder = PanelBuilders.timeseries()
+      .setTitle(panel.title)
+      .setData(queryRunner)
+      .setUnit(panel.unit)
+      .setThresholds({
+        mode: ThresholdsMode.Absolute,
+        steps: thresholdSteps,
+      })
+      .setOption('legend', {
+        showLegend: true,
+        displayMode: LegendDisplayMode.List,
+        placement: 'bottom',
+        calcs: [],
+      });
+    if (panel.description) {
+      tsBuilder.setDescription(panel.description);
+    }
+    body = tsBuilder.build();
   }
 
   return new SceneGridItem({
@@ -87,6 +112,6 @@ function buildGridItem(panel: NormalizedPanelSpec, maxDataPoints: number): Scene
     height: panel.gridPos.h,
     isDraggable: false,
     isResizable: false,
-    body: vizBuilder.build(),
+    body,
   });
 }

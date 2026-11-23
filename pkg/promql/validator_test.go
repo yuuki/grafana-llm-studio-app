@@ -38,8 +38,10 @@ func TestValidateExpr_PolicyAndGrounding(t *testing.T) {
 
 	validCases := []string{
 		`sum by (status) (rate(http_requests_total{service="checkout-api"}[5m]))`,
+		`sum(rate(http_requests_total{service="checkout-api",status=~"5.."}[5m])) or vector(0)`,
 		`histogram_quantile(0.95, sum by (le) (rate(http_request_duration_seconds_bucket{service="checkout-api"}[5m])))`,
 		`avg(process_resident_memory_bytes{service="checkout-api"})`,
+		`max_over_time(rate(http_requests_total{service="checkout-api"}[5m])[30m:1m])`,
 	}
 	for _, expr := range validCases {
 		if _, err := promql.ValidateExpr(expr, cat, scope, pol); err != nil {
@@ -63,6 +65,21 @@ func TestValidateExpr_PolicyAndGrounding(t *testing.T) {
 			wantError: promql.ErrPolicyViolation,
 		},
 		{
+			name:      "omitted subquery step rejected (H-2)",
+			expr:      `max_over_time(rate(http_requests_total{service="checkout-api"}[5m])[30m:])`,
+			wantError: promql.ErrPolicyViolation,
+		},
+		{
+			name:      "nested subquery rejected (H-2)",
+			expr:      `max_over_time(max_over_time(rate(http_requests_total{service="checkout-api"}[5m])[15m:1m])[15m:1m])`,
+			wantError: promql.ErrPolicyViolation,
+		},
+		{
+			name:      "negative offset rejected (H-2)",
+			expr:      `rate(http_requests_total{service="checkout-api"}[5m] offset -365d)`,
+			wantError: promql.ErrPolicyViolation,
+		},
+		{
 			name:      "excessive offset",
 			expr:      `rate(http_requests_total{service="checkout-api"}[5m] offset 7d)`,
 			wantError: promql.ErrPolicyViolation,
@@ -73,6 +90,41 @@ func TestValidateExpr_PolicyAndGrounding(t *testing.T) {
 			wantError: promql.ErrPolicyViolation,
 		},
 		{
+			name:      "parenthesized catch-all regex bypass rejected (H-3)",
+			expr:      `rate(http_requests_total{service="checkout-api",status=~"(.*)"}[5m])`,
+			wantError: promql.ErrPolicyViolation,
+		},
+		{
+			name:      "non-greedy catch-all regex bypass rejected (H-3)",
+			expr:      `rate(http_requests_total{service="checkout-api",status=~".*?"}[5m])`,
+			wantError: promql.ErrPolicyViolation,
+		},
+		{
+			name:      "quantifier range catch-all regex bypass rejected (H-3)",
+			expr:      `rate(http_requests_total{service="checkout-api",status=~".{0,}"}[5m])`,
+			wantError: promql.ErrPolicyViolation,
+		},
+		{
+			name:      "alternation catch-all regex bypass rejected (H-3)",
+			expr:      `rate(http_requests_total{service="checkout-api",status=~"500|.*"}[5m])`,
+			wantError: promql.ErrPolicyViolation,
+		},
+		{
+			name:      "negative empty regex catch-all rejected (H-3)",
+			expr:      `rate(http_requests_total{service="checkout-api",status!~"^$"}[5m])`,
+			wantError: promql.ErrPolicyViolation,
+		},
+		{
+			name:      "negative empty inequality rejected (H-3)",
+			expr:      `rate(http_requests_total{service="checkout-api",status!=""}[5m])`,
+			wantError: promql.ErrPolicyViolation,
+		},
+		{
+			name:      "nested quantifier regex rejected (H-3)",
+			expr:      `rate(http_requests_total{service="checkout-api",status=~"([a-z]+)+"}[5m])`,
+			wantError: promql.ErrPolicyViolation,
+		},
+		{
 			name:      "many-to-one join blocked",
 			expr:      `rate(http_requests_total{service="checkout-api"}[5m]) * on(service) group_left() process_resident_memory_bytes{service="checkout-api"}`,
 			wantError: promql.ErrPolicyViolation,
@@ -80,6 +132,26 @@ func TestValidateExpr_PolicyAndGrounding(t *testing.T) {
 		{
 			name:      "rate on gauge rejected",
 			expr:      `rate(process_resident_memory_bytes{service="checkout-api"}[5m])`,
+			wantError: promql.ErrPolicyViolation,
+		},
+		{
+			name:      "rate on parenthesized gauge rejected (M-2)",
+			expr:      `rate((process_resident_memory_bytes{service="checkout-api"}[5m]))`,
+			wantError: promql.ErrPolicyViolation,
+		},
+		{
+			name:      "rate on subquery gauge rejected (M-2)",
+			expr:      `rate(process_resident_memory_bytes{service="checkout-api"}[5m:15s])`,
+			wantError: promql.ErrPolicyViolation,
+		},
+		{
+			name:      "count_values aggregation rejected (M-2)",
+			expr:      `count_values("val", process_resident_memory_bytes{service="checkout-api"})`,
+			wantError: promql.ErrPolicyViolation,
+		},
+		{
+			name:      "label_replace rejected (M-2)",
+			expr:      `label_replace(process_resident_memory_bytes{service="checkout-api"}, "service", "other", "service", "checkout-api")`,
 			wantError: promql.ErrPolicyViolation,
 		},
 		{

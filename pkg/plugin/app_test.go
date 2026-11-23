@@ -20,16 +20,37 @@ func (c *captureSender) Send(resp *backend.CallResourceResponse) error {
 	return nil
 }
 
-func TestLoadSettings_NoSilentMockFallback(t *testing.T) {
+func TestLoadSettings_SecurityAndDefaults(t *testing.T) {
 	// llmMode=mock without allowMockInDev MUST fail.
-	_, err := plugin.LoadSettings(backend.AppInstanceSettings{
+	if _, err := plugin.LoadSettings(backend.AppInstanceSettings{
 		JSONData: []byte(`{"llmMode":"mock","allowedDatasourceUids":["prom-1"]}`),
-	})
-	if err == nil {
+	}); err == nil {
 		t.Fatal("expected llmMode=mock without allowMockInDev=true to fail")
 	}
 
-	// Default production mode (grafana-llm-app) without token initializes with error, NEVER falls back to mock.
+	// C-1: Arbitrary non-loopback grafanaUrl MUST be rejected (SSRF protection).
+	if _, err := plugin.LoadSettings(backend.AppInstanceSettings{
+		JSONData: []byte(`{"llmMode":"grafana-llm-app","grafanaUrl":"http://attacker.invalid:8080","allowedDatasourceUids":["prom-1"]}`),
+	}, "https://grafana.internal"); err == nil {
+		t.Fatal("expected untrusted external grafanaUrl to be rejected")
+	}
+
+	// C-1: Matching trusted AppURL origin is allowed.
+	s, err := plugin.LoadSettings(backend.AppInstanceSettings{
+		JSONData: []byte(`{"llmMode":"grafana-llm-app","grafanaUrl":"https://grafana.internal","maxRepairAttempts":0,"allowedDatasourceUids":["prom-1"]}`),
+	}, "https://grafana.internal/subpath")
+	if err != nil {
+		t.Fatalf("expected matching trusted AppURL origin to pass, got %v", err)
+	}
+	// M-4: reasoningEffort defaults to "low" and explicit maxRepairAttempts=0 is honored.
+	if s.EffectiveReasoningEffort != "low" {
+		t.Fatalf("expected default reasoningEffort=low, got %q", s.EffectiveReasoningEffort)
+	}
+	if s.EffectiveMaxRepairs != 0 {
+		t.Fatalf("expected explicit maxRepairAttempts=0 to be preserved, got %d", s.EffectiveMaxRepairs)
+	}
+
+	// Production mode without token initializes with error, NEVER falls back to mock.
 	inst, err := plugin.NewApp(context.Background(), backend.AppInstanceSettings{
 		JSONData: []byte(`{"llmMode":"grafana-llm-app","allowedDatasourceUids":["prom-1"]}`),
 	})
@@ -37,13 +58,14 @@ func TestLoadSettings_NoSilentMockFallback(t *testing.T) {
 		t.Fatalf("NewApp returned unexpected error: %v", err)
 	}
 	app := inst.(*plugin.App)
+	defer app.Dispose()
 	health, _ := app.CheckHealth(context.Background(), &backend.CheckHealthRequest{})
 	if health.Status != backend.HealthStatusError {
 		t.Fatalf("expected HealthStatusError when grafana-llm-app token missing, got %v (%s)", health.Status, health.Message)
 	}
 }
 
-func TestApp_AuthContextAndNoSecretLeak(t *testing.T) {
+func TestApp_AuthContextHealthAndStrictRouting(t *testing.T) {
 	inst, err := plugin.NewApp(context.Background(), backend.AppInstanceSettings{
 		JSONData: []byte(`{"llmMode":"mock","allowMockInDev":true,"allowedDatasourceUids":["prom-1"]}`),
 		DecryptedSecureJSONData: map[string]string{
@@ -54,22 +76,26 @@ func TestApp_AuthContextAndNoSecretLeak(t *testing.T) {
 		t.Fatalf("NewApp: %v", err)
 	}
 	app := inst.(*plugin.App)
+	defer app.Dispose()
 
-	// Unauthenticated request (no PluginContext.User) must get 401.
-	sender := &captureSender{}
-	_ = app.CallResource(context.Background(), &backend.CallResourceRequest{
-		Path:   "config/public",
-		Method: http.MethodGet,
-	}, sender)
-	if sender.resp == nil || sender.resp.Status != http.StatusUnauthorized {
-		t.Fatalf("expected 401 for unauthenticated caller, got %+v", sender.resp)
+	// Unauthenticated /config/public and /health MUST return 401 (M-1).
+	for _, p := range []string{"config/public", "health"} {
+		sender := &captureSender{}
+		_ = app.CallResource(context.Background(), &backend.CallResourceRequest{
+			Path:   p,
+			Method: http.MethodGet,
+		}, sender)
+		if sender.resp == nil || sender.resp.Status != http.StatusUnauthorized {
+			t.Fatalf("expected 401 for unauthenticated /%s, got %+v", p, sender.resp)
+		}
 	}
 
-	// Authenticated request returns public config WITHOUT secret token.
 	authPluginCtx := backend.PluginContext{
 		OrgID: 1,
 		User:  &backend.User{Login: "alice", Role: "Editor"},
 	}
+
+	// Authenticated /config/public returns public config WITHOUT secret token.
 	sender2 := &captureSender{}
 	_ = app.CallResource(context.Background(), &backend.CallResourceRequest{
 		PluginContext: authPluginCtx,
@@ -83,16 +109,27 @@ func TestApp_AuthContextAndNoSecretLeak(t *testing.T) {
 		t.Fatal("secret llmServiceAccountToken leaked in /config/public")
 	}
 
-	// Client-supplied spoofed orgId field in JSON body is rejected by DisallowUnknownFields.
-	sender3 := &captureSender{}
+	// Trailing JSON tokens rejected (L-1).
+	senderTrail := &captureSender{}
 	_ = app.CallResource(context.Background(), &backend.CallResourceRequest{
 		PluginContext: authPluginCtx,
 		Path:          "jobs/generate",
 		Method:        http.MethodPost,
-		Body:          []byte(`{"orgId":999,"datasourceUid":"prom-1","userIntent":"hello","catalog":[]}`),
-	}, sender3)
-	if sender3.resp == nil || sender3.resp.Status != http.StatusBadRequest {
-		t.Fatalf("expected 400 when client injects spoofed orgId field, got %+v", sender3.resp)
+		Body:          []byte(`{"datasourceUid":"prom-1","userIntent":"hello","catalog":[]}{"extra":1}`),
+	}, senderTrail)
+	if senderTrail.resp == nil || senderTrail.resp.Status != http.StatusBadRequest {
+		t.Fatalf("expected 400 on trailing JSON tokens, got %+v", senderTrail.resp)
+	}
+
+	// Extra path segments rejected (L-1).
+	senderExtraPath := &captureSender{}
+	_ = app.CallResource(context.Background(), &backend.CallResourceRequest{
+		PluginContext: authPluginCtx,
+		Path:          "jobs/job-123/cancel/extra",
+		Method:        http.MethodPost,
+	}, senderExtraPath)
+	if senderExtraPath.resp == nil || senderExtraPath.resp.Status != http.StatusNotFound {
+		t.Fatalf("expected 404 on extra job path segments, got %+v", senderExtraPath.resp)
 	}
 
 	var cfg plugin.PublicConfig

@@ -61,22 +61,33 @@ export function generateDashboardUid(): string {
 
 /**
  * Derives the Grafana v12.4.15 API namespace for the active organization.
- * Org 1 maps to "default"; other orgs map to "org-<orgId>".
+ * Prefers Grafana's config.namespace when present (M-10).
  */
 export function getOrgNamespace(orgId?: number): string {
+  if (orgId === undefined && typeof config.namespace === 'string' && config.namespace.trim() !== '') {
+    return config.namespace.trim();
+  }
   const id = orgId ?? config.bootData?.user?.orgId ?? 1;
   return id === 1 ? 'default' : `org-${id}`;
 }
 
 /**
  * Lists folders visible to the logged-in user via Grafana's Folder API.
- * Includes the root "General" folder (empty folder annotation).
+ * Uses showErrorAlert: false so Viewer accounts without folders:read do not see spurious error toasts (M-10).
  */
 export async function listWritableFolders(): Promise<GrafanaFolderOption[]> {
-  const folders = await getBackendSrv().get<Array<{ uid: string; title: string }>>('/api/folders', {
-    limit: 100,
-    permission: 'Edit',
-  });
+  const res = await lastValueFrom(
+    getBackendSrv().fetch<Array<{ uid: string; title: string }>>({
+      url: '/api/folders',
+      method: 'GET',
+      params: {
+        limit: 100,
+        permission: 'Edit',
+      },
+      showErrorAlert: false,
+    })
+  );
+  const folders = res.data;
   const list: GrafanaFolderOption[] = [{ uid: '', title: 'General (Root)' }];
   if (Array.isArray(folders)) {
     for (const f of folders) {
@@ -97,7 +108,7 @@ export async function listWritableFolders(): Promise<GrafanaFolderOption[]> {
  * - Verifies saved revision === previewedRevision before sending.
  * - Guards against double-clicks via per-instance in-flight lock.
  * - Create-only POST: on 409 Conflict (UID collision), NEVER switches to PUT/overwrite.
- * - Never embeds chat history, credentials, unnecessary label values, or raw query data.
+ * - Prepends config.appSubUrl for subpath Grafana deployments (M-10).
  */
 export class DashboardSaver {
   private inFlight = false;
@@ -152,9 +163,10 @@ export class DashboardSaver {
       );
 
       const savedUid = response.data?.metadata?.name || uid;
+      const subUrl = (config.appSubUrl ?? '').replace(/\/+$/, '');
       return {
         uid: savedUid,
-        url: `/d/${encodeURIComponent(savedUid)}`,
+        url: `${subUrl}/d/${encodeURIComponent(savedUid)}`,
         folderUid: req.folderUid,
         revision: req.spec.revision,
       };
@@ -172,7 +184,6 @@ export class DashboardSaver {
         );
       }
       if (status === 409 || status === 412) {
-        // NEVER auto-retry as PUT / overwrite=true!
         throw new SaveDashboardError(
           `UID 衝突のため新規作成を中止しました。既存ダッシュボードは上書きされていません (HTTP ${status}): ${msg}`,
           'UID_CONFLICT'

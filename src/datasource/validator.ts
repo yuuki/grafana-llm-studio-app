@@ -49,12 +49,17 @@ interface GrafanaDSQueryResponse {
  * Executes real bounded dry-run validation queries from the Frontend using the
  * logged-in user's Grafana session (/api/ds/query).
  * - Enforces concurrency cap (default 2) and per-query timeout (default 10s).
- * - Classifies every panel into ok, empty_result, syntax_error, permission_error, timeout, or datasource_error.
+ * - Properly extracts inner /api/ds/query FetchError.data.results[refId] errors (H-10).
+ * - Propagates external AbortSignal cancellation without misclassifying as timeout (M-12).
  */
 export async function runDryRunValidation(
   spec: NormalizedDashboardSpec,
   options: DryRunOptions = {}
 ): Promise<PanelValidationResult[]> {
+  if (options.signal?.aborted) {
+    throw new DOMException('Aborted', 'AbortError');
+  }
+
   const maxConcurrency = Math.max(1, Math.min(options.maxConcurrency ?? 2, 4));
   const timeoutMs = Math.max(1000, Math.min(options.timeoutMs ?? 10000, 30000));
   const from = options.from ?? 'now-5m';
@@ -71,7 +76,7 @@ export async function runDryRunValidation(
   const worker = async () => {
     while (cursor < targetPanels.length) {
       if (options.signal?.aborted) {
-        return;
+        throw new DOMException('Aborted', 'AbortError');
       }
       const idx = cursor++;
       results[idx] = await validateSinglePanel(
@@ -101,26 +106,53 @@ async function validateSinglePanel(
   timeoutMs: number,
   outerSignal?: AbortSignal
 ): Promise<PanelValidationResult> {
+  if (outerSignal?.aborted) {
+    throw new DOMException('Aborted', 'AbortError');
+  }
+
   const queryHash = await computeQueryHash(panel.target.expr);
   const started = Date.now();
 
+  let timedOut = false;
+  let externallyAborted = false;
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(new Error('timeout')), timeoutMs);
-  const onOuterAbort = () => controller.abort(outerSignal?.reason);
+  const timer = setTimeout(() => {
+    timedOut = true;
+    controller.abort(new Error('timeout'));
+  }, timeoutMs);
+  const onOuterAbort = () => {
+    externallyAborted = true;
+    controller.abort(outerSignal?.reason);
+  };
   outerSignal?.addEventListener('abort', onOuterAbort, { once: true });
 
   try {
     const responseData = await new Promise<GrafanaDSQueryResponse>((resolve, reject) => {
+      if (outerSignal?.aborted || externallyAborted) {
+        reject(new DOMException('Aborted', 'AbortError'));
+        return;
+      }
       if (controller.signal.aborted) {
         reject(new Error('timeout'));
         return;
       }
+      let settled = false;
       let sub: { unsubscribe: () => void } | undefined;
       const onAbort = () => {
+        if (settled) {
+          return;
+        }
+        settled = true;
         sub?.unsubscribe();
-        reject(new Error('timeout'));
+        controller.signal.removeEventListener('abort', onAbort);
+        if (externallyAborted || outerSignal?.aborted) {
+          reject(new DOMException('Aborted', 'AbortError'));
+        } else {
+          reject(new Error('timeout'));
+        }
       };
       controller.signal.addEventListener('abort', onAbort, { once: true });
+
       sub = getBackendSrv()
         .fetch<GrafanaDSQueryResponse>({
           url: '/api/ds/query',
@@ -145,12 +177,27 @@ async function validateSinglePanel(
         })
         .subscribe({
           next: (res) => {
+            if (settled) {
+              return;
+            }
+            settled = true;
             controller.signal.removeEventListener('abort', onAbort);
             resolve(res.data);
           },
           error: (err) => {
+            if (settled) {
+              return;
+            }
+            settled = true;
             controller.signal.removeEventListener('abort', onAbort);
             reject(err);
+          },
+          complete: () => {
+            if (!settled) {
+              settled = true;
+              controller.signal.removeEventListener('abort', onAbort);
+              resolve({});
+            }
           },
         });
     });
@@ -201,11 +248,21 @@ async function validateSinglePanel(
       durationMs,
     };
   } catch (err: unknown) {
+    if (externallyAborted || outerSignal?.aborted) {
+      throw new DOMException('Aborted', 'AbortError');
+    }
     const durationMs = Date.now() - started;
-    const { status, message } = extractErrorInfo(err);
-    const category = controller.signal.aborted && !outerSignal?.aborted
-      ? 'timeout'
-      : classifyDatasourceError(status, message);
+    if (timedOut) {
+      return {
+        panelId: panel.id,
+        queryHash,
+        category: 'timeout',
+        errorText: `検証クエリがタイムアウトしました (${Math.round(timeoutMs / 1000)}s)`,
+        durationMs,
+      };
+    }
+    const { status, message } = extractErrorInfo(err, panel.target.refId);
+    const category = classifyDatasourceError(status, message);
 
     return {
       panelId: panel.id,
@@ -239,8 +296,7 @@ export function classifyDatasourceError(
     status === 408 ||
     status === 504 ||
     lower.includes('timeout') ||
-    lower.includes('deadline exceeded') ||
-    lower.includes('aborted')
+    lower.includes('deadline exceeded')
   ) {
     return 'timeout';
   }
@@ -258,14 +314,29 @@ export function classifyDatasourceError(
   return 'datasource_error';
 }
 
-function extractErrorInfo(err: unknown): { status?: number; message: string } {
+function extractErrorInfo(
+  err: unknown,
+  refId: string
+): { status?: number; message: string } {
   if (typeof err === 'object' && err !== null) {
     const e = err as {
       status?: number;
       statusText?: string;
       message?: string;
-      data?: { message?: string; error?: string };
+      data?: {
+        message?: string;
+        error?: string;
+        results?: Record<string, { status?: number; error?: string }>;
+      };
     };
+    // Prioritize inner /api/ds/query results[refId] error and status (H-10).
+    const inner = e.data?.results?.[refId];
+    if (inner?.error) {
+      return {
+        status: inner.status ?? e.status,
+        message: String(inner.error),
+      };
+    }
     const msg =
       e.data?.message ||
       e.data?.error ||

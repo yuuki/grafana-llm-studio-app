@@ -9,10 +9,14 @@ import (
 	"math"
 	"regexp"
 	"strings"
+	"unicode"
+	"unicode/utf8"
 )
 
 var (
-	panelIDPattern = regexp.MustCompile(`^panel-[a-z0-9][a-z0-9-]{0,31}$`)
+	panelIDPattern   = regexp.MustCompile(`^panel-[a-z0-9][a-z0-9-]{0,31}$`)
+	htmlTagPattern   = regexp.MustCompile(`<[^>]*>`)
+	eventAttrPattern = regexp.MustCompile(`(?i)\bon[a-z]+\s*=`)
 
 	allowedTimeFrom = map[string]bool{
 		"now-5m":  true,
@@ -59,10 +63,10 @@ var (
 		"<script",
 		"</script",
 		"<iframe",
+		"<svg",
+		"<object",
 		"javascript:",
 		"vbscript:",
-		"onerror=",
-		"onload=",
 		"data:text/html",
 	}
 )
@@ -76,8 +80,24 @@ func (e *ValidationError) Error() string {
 	return fmt.Sprintf("IR validation failed (%d issue(s)): %s", len(e.Issues), strings.Join(e.Issues, "; "))
 }
 
+// rawPanelRequiredCheck ensures required numeric fields (layout.row, layout.col, thresholds[].value)
+// are explicitly present in JSON rather than silently defaulted to Go zero values.
+type rawIRRequiredCheck struct {
+	Revision *int `json:"revision"`
+	Panels   []struct {
+		ID         string `json:"id"`
+		Thresholds []struct {
+			Value *float64 `json:"value"`
+		} `json:"thresholds"`
+		Layout *struct {
+			Row *int `json:"row"`
+			Col *int `json:"col"`
+		} `json:"layout"`
+	} `json:"panels"`
+}
+
 // DecodeStrictIR parses JSON bytes into DashboardIR, rejecting unknown fields,
-// trailing garbage, or oversized payloads.
+// missing required numeric fields, trailing garbage, or oversized payloads.
 func DecodeStrictIR(raw []byte) (DashboardIR, error) {
 	if len(raw) == 0 {
 		return DashboardIR{}, errors.New("empty IR payload")
@@ -94,6 +114,24 @@ func DecodeStrictIR(raw []byte) (DashboardIR, error) {
 	}
 	if err := dec.Decode(&struct{}{}); err != io.EOF {
 		return DashboardIR{}, errors.New("unexpected trailing tokens after IR JSON object")
+	}
+
+	var req rawIRRequiredCheck
+	if err := json.Unmarshal(raw, &req); err != nil {
+		return DashboardIR{}, fmt.Errorf("IR required field inspection failed: %w", err)
+	}
+	if req.Revision == nil {
+		return DashboardIR{}, errors.New("missing required field: revision")
+	}
+	for i, p := range req.Panels {
+		if p.Layout == nil || p.Layout.Row == nil || p.Layout.Col == nil {
+			return DashboardIR{}, fmt.Errorf("panels[%d]: missing required layout.row or layout.col", i)
+		}
+		for ti, th := range p.Thresholds {
+			if th.Value == nil {
+				return DashboardIR{}, fmt.Errorf("panels[%d].thresholds[%d]: missing required value", i, ti)
+			}
+		}
 	}
 	return doc, nil
 }
@@ -140,11 +178,11 @@ func ValidateIR(doc DashboardIR, opts ValidateOptions) error {
 	if doc.Revision < 1 || doc.Revision > MaxRevision {
 		issues = append(issues, fmt.Sprintf("revision must be between 1 and %d, got %d", MaxRevision, doc.Revision))
 	}
-	if err := validateSafeText("title", doc.Title, 1, MaxTitleLen); err != nil {
+	if err := validatePlainText("title", doc.Title, 1, MaxTitleLen); err != nil {
 		issues = append(issues, err.Error())
 	}
 	if doc.Description != "" {
-		if err := validateSafeText("description", doc.Description, 0, MaxDescLen); err != nil {
+		if err := validatePlainText("description", doc.Description, 0, MaxDescLen); err != nil {
 			issues = append(issues, err.Error())
 		}
 	}
@@ -178,22 +216,22 @@ func ValidateIR(doc DashboardIR, opts ValidateOptions) error {
 		if !allowedPanelTypes[p.Type] {
 			issues = append(issues, fmt.Sprintf("%s.type %q is not allowed (allowed: timeseries, stat)", prefix, p.Type))
 		}
-		if err := validateSafeText(prefix+".title", p.Title, 1, MaxPanelTitleLen); err != nil {
+		if err := validatePlainText(prefix+".title", p.Title, 1, MaxPanelTitleLen); err != nil {
 			issues = append(issues, err.Error())
 		}
 		if p.Description != "" {
-			if err := validateSafeText(prefix+".description", p.Description, 0, MaxPanelDescLen); err != nil {
+			if err := validatePlainText(prefix+".description", p.Description, 0, MaxPanelDescLen); err != nil {
 				issues = append(issues, err.Error())
 			}
 		}
 		if p.DatasourceRef != SelectedDatasourceRef {
 			issues = append(issues, fmt.Sprintf("%s.datasourceRef must be %q, got %q", prefix, SelectedDatasourceRef, p.DatasourceRef))
 		}
-		if err := validateSafeText(prefix+".query.expr", p.Query.Expr, 1, MaxExprLen); err != nil {
+		if err := validateExprText(prefix+".query.expr", p.Query.Expr, 1, MaxExprLen); err != nil {
 			issues = append(issues, err.Error())
 		}
 		if p.Query.LegendFormat != "" {
-			if err := validateSafeText(prefix+".query.legendFormat", p.Query.LegendFormat, 0, MaxLegendLen); err != nil {
+			if err := validatePlainText(prefix+".query.legendFormat", p.Query.LegendFormat, 0, MaxLegendLen); err != nil {
 				issues = append(issues, err.Error())
 			}
 		}
@@ -250,13 +288,24 @@ func ValidateIR(doc DashboardIR, opts ValidateOptions) error {
 	return nil
 }
 
-func validateSafeText(field, val string, minLen, maxLen int) error {
+// validatePlainText validates Unicode rune length, valid UTF-8, absence of control/Bidi chars,
+// and absence of HTML tags / event handler attributes / active schemes.
+func validatePlainText(field, val string, minRunes, maxRunes int) error {
+	if !utf8.ValidString(val) {
+		return fmt.Errorf("%s contains invalid UTF-8", field)
+	}
 	trimmed := strings.TrimSpace(val)
-	if len(trimmed) < minLen {
+	if utf8.RuneCountInString(trimmed) < minRunes {
 		return fmt.Errorf("%s must not be empty", field)
 	}
-	if len(val) > maxLen {
-		return fmt.Errorf("%s length %d exceeds max %d", field, len(val), maxLen)
+	if utf8.RuneCountInString(val) > maxRunes {
+		return fmt.Errorf("%s length %d runes exceeds max %d", field, utf8.RuneCountInString(val), maxRunes)
+	}
+	if err := checkForbiddenRunes(field, val); err != nil {
+		return err
+	}
+	if htmlTagPattern.MatchString(val) || eventAttrPattern.MatchString(val) {
+		return fmt.Errorf("%s must not contain HTML markup or event handlers", field)
 	}
 	lower := strings.ToLower(val)
 	for _, frag := range forbiddenMarkupFragments {
@@ -265,4 +314,47 @@ func validateSafeText(field, val string, minLen, maxLen int) error {
 		}
 	}
 	return nil
+}
+
+// validateExprText validates PromQL expression string length (runes) and forbids control/Bidi/active markup
+// while allowing PromQL comparison operators (<, >).
+func validateExprText(field, val string, minRunes, maxRunes int) error {
+	if !utf8.ValidString(val) {
+		return fmt.Errorf("%s contains invalid UTF-8", field)
+	}
+	trimmed := strings.TrimSpace(val)
+	if utf8.RuneCountInString(trimmed) < minRunes {
+		return fmt.Errorf("%s must not be empty", field)
+	}
+	if utf8.RuneCountInString(val) > maxRunes {
+		return fmt.Errorf("%s length %d runes exceeds max %d", field, utf8.RuneCountInString(val), maxRunes)
+	}
+	if err := checkForbiddenRunes(field, val); err != nil {
+		return err
+	}
+	lower := strings.ToLower(val)
+	for _, frag := range forbiddenMarkupFragments {
+		if strings.Contains(lower, frag) {
+			return fmt.Errorf("%s contains forbidden active content %q", field, frag)
+		}
+	}
+	return nil
+}
+
+func checkForbiddenRunes(field, val string) error {
+	for _, r := range val {
+		if unicode.IsControl(r) {
+			return fmt.Errorf("%s contains forbidden control character U+%04X", field, r)
+		}
+		if isBidiControl(r) {
+			return fmt.Errorf("%s contains forbidden bidirectional control character U+%04X", field, r)
+		}
+	}
+	return nil
+}
+
+func isBidiControl(r rune) bool {
+	return r == 0x200E || r == 0x200F ||
+		(r >= 0x202A && r <= 0x202E) ||
+		(r >= 0x2066 && r <= 0x2069)
 }

@@ -169,6 +169,9 @@ const PANEL_ID_REGEX = /^panel-[a-z0-9][a-z0-9-]{0,31}$/;
  */
 export function validateIRClient(doc: DashboardIR, maxPanels = 6): string[] {
   const issues: string[] = [];
+  if (!doc || typeof doc !== 'object') {
+    return ['DashboardIR must be an object'];
+  }
   if (doc.schemaVersion !== IR_SCHEMA_VERSION) {
     issues.push(`Unsupported schemaVersion: ${doc.schemaVersion}`);
   }
@@ -178,14 +181,16 @@ export function validateIRClient(doc: DashboardIR, maxPanels = 6): string[] {
   if (!doc.title || doc.title.trim().length === 0 || doc.title.length > 120) {
     issues.push('Dashboard title must be 1..120 characters');
   }
-  if (!ALLOWED_TIME_FROM.includes(doc.timeRange.from) || doc.timeRange.to !== 'now') {
-    issues.push(`Unsupported timeRange: ${doc.timeRange.from}..${doc.timeRange.to}`);
+  if (!doc.timeRange || !ALLOWED_TIME_FROM.includes(doc.timeRange.from) || doc.timeRange.to !== 'now') {
+    issues.push(`Unsupported timeRange: ${doc.timeRange?.from}..${doc.timeRange?.to}`);
   }
-  if (!Array.isArray(doc.panels) || doc.panels.length < 1 || doc.panels.length > Math.min(maxPanels, 6)) {
-    issues.push(`Panel count must be between 1 and ${Math.min(maxPanels, 6)}`);
+  const cap = Math.max(1, Math.min(maxPanels, 6));
+  if (!Array.isArray(doc.panels) || doc.panels.length < 1 || doc.panels.length > cap) {
+    issues.push(`Panel count must be between 1 and ${cap}`);
   }
 
   const seenIds = new Set<string>();
+  const occupiedCells = new Set<string>();
   for (const p of doc.panels ?? []) {
     if (!PANEL_ID_REGEX.test(p.id) || seenIds.has(p.id)) {
       issues.push(`Invalid or duplicate panel id: ${p.id}`);
@@ -193,6 +198,9 @@ export function validateIRClient(doc: DashboardIR, maxPanels = 6): string[] {
     seenIds.add(p.id);
     if (!ALLOWED_PANEL_TYPES.includes(p.type)) {
       issues.push(`Unsupported panel type: ${p.type}`);
+    }
+    if (!p.title || p.title.trim().length === 0 || p.title.length > 80) {
+      issues.push(`Invalid panel title on ${p.id}`);
     }
     if (p.datasourceRef !== SELECTED_DATASOURCE_REF) {
       issues.push(`Forbidden datasourceRef on ${p.id}: ${p.datasourceRef}`);
@@ -202,6 +210,42 @@ export function validateIRClient(doc: DashboardIR, maxPanels = 6): string[] {
     }
     if (!ALLOWED_UNITS.includes(p.unit)) {
       issues.push(`Unsupported unit on ${p.id}: ${p.unit}`);
+    }
+    if (p.thresholds) {
+      if (p.thresholds.length > 4) {
+        issues.push(`Too many thresholds on ${p.id}`);
+      }
+      let prev = -Infinity;
+      for (const th of p.thresholds) {
+        if (!Number.isFinite(th.value) || th.value < -1e9 || th.value > 1e9) {
+          issues.push(`Threshold value out of range on ${p.id}`);
+        }
+        if (th.value < prev) {
+          issues.push(`Thresholds must be ascending on ${p.id}`);
+        }
+        prev = th.value;
+        if (!ALLOWED_THRESHOLD_COLORS.includes(th.color)) {
+          issues.push(`Unsupported threshold color on ${p.id}: ${th.color}`);
+        }
+      }
+    }
+    if (!p.layout || !Number.isInteger(p.layout.row) || p.layout.row < 0 || p.layout.row > 5) {
+      issues.push(`Invalid layout.row on ${p.id}`);
+    } else if (p.layout.col !== 0 && p.layout.col !== 1) {
+      issues.push(`Invalid layout.col on ${p.id}`);
+    } else if (!ALLOWED_WIDTHS.includes(p.layout.width)) {
+      issues.push(`Invalid layout.width on ${p.id}`);
+    } else if (p.layout.width === 'full' && p.layout.col !== 0) {
+      issues.push(`Full-width panel ${p.id} must have col=0`);
+    } else {
+      const cols = p.layout.width === 'full' ? [0, 1] : [p.layout.col];
+      for (const c of cols) {
+        const key = `${p.layout.row}:${c}`;
+        if (occupiedCells.has(key)) {
+          issues.push(`Layout overlap on ${p.id} at row=${p.layout.row}, col=${c}`);
+        }
+        occupiedCells.add(key);
+      }
     }
   }
   return issues;

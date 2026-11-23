@@ -11,6 +11,8 @@ import (
 var (
 	// ErrOutputTruncated indicates finish_reason == "length" and output JSON may be incomplete.
 	ErrOutputTruncated = errors.New("LLM output truncated (finish_reason=length)")
+	// ErrOutputRefused indicates the LLM refused the request or triggered a content filter.
+	ErrOutputRefused = errors.New("LLM refused generation or triggered content filter")
 	// ErrInsufficientMetrics indicates no relevant metrics exist in the scoped catalog.
 	ErrInsufficientMetrics = errors.New("insufficient matching metrics in scoped catalog")
 	// ErrLLMUnavailable indicates grafana-llm-app is disabled or unconfigured.

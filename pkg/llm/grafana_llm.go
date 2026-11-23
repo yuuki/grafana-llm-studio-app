@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"strings"
@@ -23,7 +24,7 @@ type GrafanaLLMConfig struct {
 	ServiceAccountToken string
 	ModelTier           llmclient.Model // "base" or "large"
 	MaxOutputTokens     int
-	ReasoningEffort     string // optional: "low", "medium", "high"
+	ReasoningEffort     string // optional: "", "low", "medium", "high"
 	RequestTimeout      time.Duration
 	MaxTransportRetries int // strictly transport-level retries (max 1), never nested with semantic repair
 	HTTPClient          *http.Client
@@ -70,7 +71,13 @@ func NewGrafanaLLMClient(cfg GrafanaLLMConfig) (*GrafanaLLMClient, error) {
 
 	httpClient := cfg.HTTPClient
 	if httpClient == nil {
-		httpClient = &http.Client{Timeout: cfg.RequestTimeout}
+		httpClient = &http.Client{
+			Timeout: cfg.RequestTimeout,
+			// Never follow HTTP 3xx redirects so Bearer SA tokens cannot be redirected to unintended hosts.
+			CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
+				return http.ErrUseLastResponse
+			},
+		}
 	}
 	provider := llmclient.NewLLMProviderWithClient(cfg.GrafanaURL, cfg.ServiceAccountToken, httpClient)
 	return &GrafanaLLMClient{provider: provider, cfg: cfg}, nil
@@ -78,7 +85,9 @@ func NewGrafanaLLMClient(cfg GrafanaLLMConfig) (*GrafanaLLMClient, error) {
 
 // Enabled checks whether grafana-llm-app is enabled and configured in Grafana.
 func (c *GrafanaLLMClient) Enabled(ctx context.Context) (bool, error) {
-	return c.provider.Enabled(ctx)
+	checkCtx, cancel := context.WithTimeout(ctx, minDuration(c.cfg.RequestTimeout, 15*time.Second))
+	defer cancel()
+	return c.provider.Enabled(checkCtx)
 }
 
 func (c *GrafanaLLMClient) GenerateIR(ctx context.Context, req GenerateRequest) ([]byte, CompletionMeta, error) {
@@ -117,22 +126,31 @@ func (c *GrafanaLLMClient) callStructured(
 	schemaName string,
 	schemaBytes []byte,
 ) ([]byte, CompletionMeta, error) {
-	req := llmclient.ChatCompletionRequest{
-		Model: c.cfg.ModelTier,
-		ChatCompletionRequest: openai.ChatCompletionRequest{
-			Messages:            messages,
-			MaxCompletionTokens: c.cfg.MaxOutputTokens,
-			Temperature:         0.1,
-			ReasoningEffort:     c.cfg.ReasoningEffort,
-			ResponseFormat: &openai.ChatCompletionResponseFormat{
-				Type: openai.ChatCompletionResponseFormatTypeJSONSchema,
-				JSONSchema: &openai.ChatCompletionResponseFormatJSONSchema{
-					Name:   schemaName,
-					Schema: rawSchemaMarshaler{raw: json.RawMessage(schemaBytes)},
-					Strict: true,
-				},
+	chatReq := openai.ChatCompletionRequest{
+		Messages:            messages,
+		MaxCompletionTokens: c.cfg.MaxOutputTokens,
+		ReasoningEffort:     c.cfg.ReasoningEffort,
+		ResponseFormat: &openai.ChatCompletionResponseFormat{
+			Type: openai.ChatCompletionResponseFormatTypeJSONSchema,
+			JSONSchema: &openai.ChatCompletionResponseFormatJSONSchema{
+				Name:   schemaName,
+				Schema: rawSchemaMarshaler{raw: json.RawMessage(schemaBytes)},
+				// Strict is intentionally false because schemas include optional properties and
+				// grafana-llm-app's go-openai/jsonschema.Definition cannot represent nullable unions;
+				// vLLM still enforces structural JSON Schema + additionalProperties:false + string enums,
+				// and Go Backend enforces all remaining bounds deterministically.
+				Strict: false,
 			},
 		},
+	}
+	// Omit Temperature when ReasoningEffort is explicitly specified to avoid conflicts on reasoning models.
+	if c.cfg.ReasoningEffort == "" {
+		chatReq.Temperature = 0.1
+	}
+
+	req := llmclient.ChatCompletionRequest{
+		Model:                 c.cfg.ModelTier,
+		ChatCompletionRequest: chatReq,
 	}
 
 	var (
@@ -144,11 +162,15 @@ func (c *GrafanaLLMClient) callStructured(
 		if ctx.Err() != nil {
 			return nil, CompletionMeta{ProviderMode: "grafana-llm-app"}, ctx.Err()
 		}
-		resp, lastErr = c.provider.ChatCompletions(ctx, req)
+		attemptCtx, cancel := context.WithTimeout(ctx, c.cfg.RequestTimeout)
+		resp, lastErr = c.provider.ChatCompletions(attemptCtx, req)
+		attemptTimedOut := errors.Is(attemptCtx.Err(), context.DeadlineExceeded)
+		cancel()
+
 		if lastErr == nil {
 			break
 		}
-		if !isRetryableTransportError(ctx, lastErr) || attempt+1 >= attempts {
+		if attemptTimedOut || !isRetryableTransportError(ctx, lastErr) || attempt+1 >= attempts {
 			return nil, CompletionMeta{ProviderMode: "grafana-llm-app"}, fmt.Errorf("grafana-llm-app chat completion failed: %w", lastErr)
 		}
 		select {
@@ -171,10 +193,20 @@ func (c *GrafanaLLMClient) callStructured(
 		ProviderMode:     "grafana-llm-app",
 	}
 
+	if strings.TrimSpace(choice.Message.Refusal) != "" {
+		return nil, meta, fmt.Errorf("%w: %s", ErrOutputRefused, choice.Message.Refusal)
+	}
 	if choice.FinishReason == openai.FinishReasonLength {
 		return nil, meta, ErrOutputTruncated
 	}
-	content := strings.TrimSpace(choice.Message.Content)
+	if choice.FinishReason == openai.FinishReasonContentFilter {
+		return nil, meta, ErrOutputRefused
+	}
+	if choice.FinishReason != "" && choice.FinishReason != openai.FinishReasonStop {
+		return nil, meta, fmt.Errorf("unexpected LLM finish_reason %q", choice.FinishReason)
+	}
+
+	content := stripJSONCodeFence(strings.TrimSpace(choice.Message.Content))
 	if content == "" {
 		return nil, meta, errors.New("LLM returned empty content")
 	}
@@ -182,8 +214,9 @@ func (c *GrafanaLLMClient) callStructured(
 }
 
 // isRetryableTransportError strictly limits transport retries to transient network errors
-// or gateway 502/503/504 responses. It never retries context cancellation, timeouts,
-// auth errors (401/403), bad requests (400/422), or semantic/schema errors.
+// or 502/503/504 responses (including grafana-llm-app v1.0.8 HTTP 500 wrappers containing
+// explicit upstream 502/503/504 or transient connection reset errors).
+// Never retries context cancellation, timeouts, 4xx errors, or semantic errors.
 func isRetryableTransportError(ctx context.Context, err error) bool {
 	if err == nil || ctx.Err() != nil {
 		return false
@@ -191,18 +224,72 @@ func isRetryableTransportError(ctx context.Context, err error) bool {
 	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 		return false
 	}
+	// Check *openai.RequestError BEFORE *openai.APIError: when grafana-llm-app returns
+	// HTTP 500 {"error":"<string>"}, go-openai wraps an empty *openai.APIError (HTTPStatusCode=0)
+	// inside RequestError.Err, so checking APIError first would unwrap and miss RequestError.Body.
+	var reqErr *openai.RequestError
+	if errors.As(err, &reqErr) {
+		if isTransientGatewayStatus(reqErr.HTTPStatusCode) {
+			return true
+		}
+		if reqErr.HTTPStatusCode == http.StatusInternalServerError {
+			return isWrappedTransient500(string(reqErr.Body) + " " + reqErr.Error())
+		}
+		return false
+	}
 	var apiErr *openai.APIError
 	if errors.As(err, &apiErr) {
-		switch apiErr.HTTPStatusCode {
-		case http.StatusBadGateway, http.StatusServiceUnavailable, http.StatusGatewayTimeout:
+		if isTransientGatewayStatus(apiErr.HTTPStatusCode) {
 			return true
-		default:
-			return false
 		}
+		if apiErr.HTTPStatusCode == http.StatusInternalServerError {
+			return isWrappedTransient500(apiErr.Message + " " + err.Error())
+		}
+		return false
+	}
+	if errors.Is(err, io.ErrUnexpectedEOF) {
+		return true
 	}
 	var netErr net.Error
 	if errors.As(err, &netErr) {
 		return !netErr.Timeout()
 	}
 	return false
+}
+
+func isWrappedTransient500(text string) bool {
+	lower := strings.ToLower(text)
+	return strings.Contains(lower, "status code: 502") ||
+		strings.Contains(lower, "status code: 503") ||
+		strings.Contains(lower, "status code: 504") ||
+		strings.Contains(lower, "connection reset") ||
+		strings.Contains(lower, "unexpected eof")
+}
+
+func isTransientGatewayStatus(code int) bool {
+	return code == http.StatusBadGateway ||
+		code == http.StatusServiceUnavailable ||
+		code == http.StatusGatewayTimeout
+}
+
+func stripJSONCodeFence(s string) string {
+	if !strings.HasPrefix(s, "```") {
+		return s
+	}
+	firstNL := strings.IndexByte(s, '\n')
+	if firstNL < 0 {
+		return s
+	}
+	rest := strings.TrimSpace(s[firstNL+1:])
+	if strings.HasSuffix(rest, "```") {
+		return strings.TrimSpace(strings.TrimSuffix(rest, "```"))
+	}
+	return s
+}
+
+func minDuration(a, b time.Duration) time.Duration {
+	if a < b {
+		return a
+	}
+	return b
 }

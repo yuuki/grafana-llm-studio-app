@@ -10,18 +10,19 @@ const (
 	SchemaVersion         = "1.0"
 	SelectedDatasourceRef = "selected_prometheus"
 
-	DefaultMaxPanels = 6
-	MaxPanelsHardCap = 6
+	DefaultMaxPanels   = 6
+	MaxPanelsHardCap   = 6
 	MaxQueriesPerPanel = 1
-	MaxTitleLen      = 120
-	MaxDescLen       = 400
-	MaxPanelTitleLen = 80
-	MaxPanelDescLen  = 240
-	MaxExprLen       = 512
-	MaxLegendLen     = 80
-	MaxThresholds    = 4
-	MaxRevision      = 10000
-	MaxIRPayloadBytes = 64 * 1024
+	MaxTitleLen        = 120
+	MaxDescLen         = 400
+	MaxPanelTitleLen   = 80
+	MaxPanelDescLen    = 240
+	MaxExprLen         = 512
+	MaxLegendLen       = 80
+	MaxSummaryLen      = 240
+	MaxThresholds      = 4
+	MaxRevision        = 10000
+	MaxIRPayloadBytes  = 64 * 1024
 )
 
 // DashboardIR is the restricted intermediate representation produced by the LLM.
@@ -59,6 +60,12 @@ type QueryIR struct {
 	LegendFormat string `json:"legendFormat,omitempty"`
 }
 
+// QueryUpdate carries patch query updates; pointer LegendFormat distinguishes omitted from explicit clear.
+type QueryUpdate struct {
+	Expr         string  `json:"expr"`
+	LegendFormat *string `json:"legendFormat,omitempty"`
+}
+
 // ThresholdIR defines an absolute threshold step.
 type ThresholdIR struct {
 	Value float64 `json:"value"`
@@ -85,7 +92,7 @@ type PatchOperation struct {
 	Op          string       `json:"op"`
 	PanelID     string       `json:"panelId,omitempty"`
 	Title       string       `json:"title,omitempty"`
-	Description string       `json:"description,omitempty"`
+	Description *string      `json:"description,omitempty"`
 	TimeRange   *TimeRange   `json:"timeRange,omitempty"`
 	Panel       *PanelUpdate `json:"panel,omitempty"`
 }
@@ -97,7 +104,7 @@ type PanelUpdate struct {
 	Title         string         `json:"title,omitempty"`
 	Description   *string        `json:"description,omitempty"`
 	DatasourceRef string         `json:"datasourceRef,omitempty"`
-	Query         *QueryIR       `json:"query,omitempty"`
+	Query         *QueryUpdate   `json:"query,omitempty"`
 	Unit          string         `json:"unit,omitempty"`
 	Thresholds    *[]ThresholdIR `json:"thresholds,omitempty"`
 	Layout        *LayoutHint    `json:"layout,omitempty"`
@@ -142,15 +149,15 @@ const (
 // PanelValidationResult is submitted by the Frontend after running a bounded dry-run query.
 // Backend treats this as untrusted input and binds it to jobId, revision, panelId, and queryHash.
 type PanelValidationResult struct {
-	PanelID    string             `json:"panelId"`
-	QueryHash  string             `json:"queryHash"`
-	Category   ValidationCategory `json:"category"`
-	ErrorText  string             `json:"errorText,omitempty"`
-	SeriesCount int               `json:"seriesCount,omitempty"`
-	DurationMs int64              `json:"durationMs,omitempty"`
+	PanelID     string             `json:"panelId"`
+	QueryHash   string             `json:"queryHash"`
+	Category    ValidationCategory `json:"category"`
+	ErrorText   string             `json:"errorText,omitempty"`
+	SeriesCount int                `json:"seriesCount,omitempty"`
+	DurationMs  int64              `json:"durationMs,omitempty"`
 }
 
-// QueryHash returns a deterministic SHA-256 hex digest of a normalized PromQL expression.
+// QueryHash returns a deterministic SHA-256 hex digest (first 16 bytes) of a normalized PromQL expression.
 func QueryHash(expr string) string {
 	sum := sha256.Sum256([]byte(strings.TrimSpace(expr)))
 	return hex.EncodeToString(sum[:16])

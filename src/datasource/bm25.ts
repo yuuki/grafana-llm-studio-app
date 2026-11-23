@@ -66,7 +66,6 @@ export function selectMetricCandidates(
     for (const qt of queryTokens) {
       const freq = tf.get(qt) ?? 0;
       if (freq === 0) {
-        // Also allow prefix lexical match (e.g. "req" -> "requests").
         for (const [docTok, docFreq] of tf.entries()) {
           if (qt.length >= 3 && docTok.startsWith(qt)) {
             const idf = Math.log(1 + (N - (df.get(docTok) ?? 0) + 0.5) / ((df.get(docTok) ?? 0) + 0.5));
@@ -111,7 +110,8 @@ function trimToBudget(
     }
     const serializedLen = JSON.stringify(item).length;
     if (chars + serializedLen > maxTotalChars) {
-      break;
+      // Skip oversized item instead of prematurely aborting smaller high-scoring candidates (L-3).
+      continue;
     }
     chars += serializedLen;
     out.push(item);
@@ -119,12 +119,16 @@ function trimToBudget(
   return out;
 }
 
+/**
+ * Separates ASCII words/numbers and Japanese runs so mixed phrases like
+ * "5xxエラー率", "gRPCレイテンシ", and "CPU使用率" match English metric names (L-3).
+ */
 export function tokenize(input: string): string[] {
-  return input
-    .toLowerCase()
-    .split(/[^a-z0-9\u3040-\u30ff\u4e00-\u9faf]+/)
-    .map((t) => t.trim())
-    .filter((t) => t.length >= 2);
+  const matches = input.toLowerCase().match(/[a-z0-9]+|[\u3040-\u30ff\u4e00-\u9faf]+/g);
+  if (!matches) {
+    return [];
+  }
+  return matches.filter((t) => t.length >= 2);
 }
 
 const JA_SYNONYMS: Record<string, string[]> = {

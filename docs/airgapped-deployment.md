@@ -58,31 +58,63 @@ allow_loading_unsigned_plugins = yuuki-llmstudio-app
 GF_PLUGINS_ALLOW_LOADING_UNSIGNED_PLUGINS=yuuki-llmstudio-app
 ```
 
-外部通信・テレメトリも無効化する:
+外部通信・テレメトリ・公開鍵オンライン取得・プラグインカタログ・外部スナップショットもすべて無効化する:
 ```ini
 [analytics]
 reporting_enabled = false
 check_for_updates = false
 check_for_plugin_updates = false
+
+[plugins]
+public_key_retrieval_disabled = true
+plugin_admin_enabled = false
+
+[news]
+news_feed_enabled = false
+
+[security]
+disable_gravatar = true
+
+[snapshots]
+external_enabled = false
 ```
+
+対応する環境変数一覧:
+```bash
+GF_ANALYTICS_REPORTING_ENABLED=false
+GF_ANALYTICS_CHECK_FOR_UPDATES=false
+GF_ANALYTICS_CHECK_FOR_PLUGIN_UPDATES=false
+GF_PLUGINS_PUBLIC_KEY_RETRIEVAL_DISABLED=true
+GF_PLUGINS_PLUGIN_ADMIN_ENABLED=false
+GF_NEWS_NEWS_FEED_ENABLED=false
+GF_SECURITY_DISABLE_GRAVATAR=true
+GF_SNAPSHOTS_EXTERNAL_ENABLED=false
+```
+
+> **注意**: 開発用プロビジョニング定義 (`deploy/grafana/provisioning/plugins/llm-studio-dev.yaml`) および `sample-metrics` はローカル検証専用であり、本番閉域環境には配備しない。コンテナイメージは `image@sha256:...` のダイジェスト固定で配備する。
 
 ### 2.2 `grafana-llm-app` のローカル vLLM 接続設定
 - Provider: `Custom OpenAI-compatible` (`provider: "custom"`)
-- URL: 閉域内 vLLM エンドポイント（例: `http://vllm.internal:8000`、API path `/v1`）
+- URL: 閉域内 vLLM エンドポイント（例: `https://vllm.internal:8000`、API path `/v1`）
+- 通信保護: 閉域内であっても vLLM 前段または vLLM 本体に TLS と `--api-key`（Bearer 認証）を設定し、`grafana-llm-app` 側の `secureJsonData` に登録する。
 - Model Mapping:
   - `base` -> vLLM の `--served-model-name`（例: `glm-5.3-flash-local`）
   - `large` -> 高精度モデル名（単一モデル運用の場合は同一名）
 - **モデル固有の vLLM 起動設定例**:
   - `HF_HUB_OFFLINE=1`, `TRANSFORMERS_OFFLINE=1`
+  - コンテナイメージはダイジェスト (`vllm/vllm-openai@sha256:...`) で固定
   - `--served-model-name <fixed-name>`
+  - `--api-key <internal-secret>`（または前段リバースプロキシでの mTLS / Bearer 検証）
   - `--max-num-seqs <env-limit>`（推論サーバー全体の同時実行保護）
   - Structured Outputs バックエンド明示（例: `--structured-outputs-config.backend auto`）
+  - 推論モデル（GLM / DeepSeek / Kimi 系等）を利用する場合は `--reasoning-parser <model-parser>` を明示し、`message.content` に思考過程が混入しないよう分離する。
   - GLM-5.3 系のように chat template 既定値調整が必要な場合は、vLLM 側の `--default-chat-template-kwargs` 等で `clear_thinking` を配備設定として固定する（`grafana-llm-app` が `extra_body` を中継しないため）。
 
 ### 2.3 LLM 専用サービスアカウント権限（Grafana OSS 12.4.15）
 1. Grafana OSS において `yuuki-llmstudio-app` の App Config に設定するサービスアカウントを作成し、基本ロールに **`Viewer`** を割り当てる（OSS で `plugins.app:access` を含む最小基本ロール。`Editor` / `Admin` は絶対に付与しない）。
-2. トークンは `secureJsonData` (`llmServiceAccountToken`) に保存し、環境変数ファイルや Git リポジトリに平文でコミットしない。
-3. **LLM 基盤全体の利用制限**: アプリ内予算制御（`maxConcurrentJobs`, `maxRepairAttempts`, `maxOutputTokens`）は本プラグイン経由の制御に留まる。同一 `grafana-llm-app` を他プラグインや別経路から利用する場合、リバースプロキシ（Nginx / Envoy）または vLLM 側で IP/Token ごとのレート制限・同時実行数制限・タイムアウトを併用する。
+2. App Config の `grafanaUrl` は、SSRF およびトークン漏洩防止のため、Go Backend 側で **loopback (`localhost` / `127.0.0.1` / `::1`) または Grafana 自身の `AppURL` と同一オリジン** に制限され、HTTP リダイレクトも禁止されている。
+3. トークンは `secureJsonData` (`llmServiceAccountToken`) に保存し、環境変数ファイルや Git リポジトリに平文でコミットしない。
+4. **LLM 基盤全体の利用制限**: アプリ内予算制御（`maxConcurrentJobs`, `maxRepairAttempts`, `maxOutputTokens`）は本プラグイン経由の制御に留まる。同一 `grafana-llm-app` を他プラグインや別経路から利用する場合、リバースプロキシ（Nginx / Envoy）または vLLM 側で IP/Token ごとのレート制限・同時実行数制限・タイムアウトを併用する。
 
 ## 3. Prometheus / VictoriaMetrics 上流クエリ上限（DoS 防御の最終境界）
 

@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
+	"net/url"
 	"strings"
 	"time"
 
@@ -17,6 +19,13 @@ const (
 	LLMModeMock          = "mock"
 )
 
+var allowedReasoningEfforts = map[string]bool{
+	"":       true,
+	"low":    true,
+	"medium": true,
+	"high":   true,
+}
+
 // JSONSettings holds non-secret admin configuration stored in Grafana plugin jsonData.
 type JSONSettings struct {
 	AllowedDatasourceUIDs []string `json:"allowedDatasourceUids"`
@@ -24,9 +33,9 @@ type JSONSettings struct {
 	AllowMockInDev        bool     `json:"allowMockInDev"`
 	GrafanaURL            string   `json:"grafanaUrl"`
 	ModelTier             string   `json:"modelTier"`
-	ReasoningEffort       string   `json:"reasoningEffort,omitempty"`
+	ReasoningEffort       *string  `json:"reasoningEffort,omitempty"`
 	MaxPanels             int      `json:"maxPanels"`
-	MaxRepairAttempts     int      `json:"maxRepairAttempts"`
+	MaxRepairAttempts     *int     `json:"maxRepairAttempts,omitempty"`
 	MaxOutputTokens       int      `json:"maxOutputTokens"`
 	LLMTimeoutSeconds     int      `json:"llmTimeoutSeconds"`
 	JobDeadlineSeconds    int      `json:"jobDeadlineSeconds"`
@@ -38,6 +47,8 @@ type JSONSettings struct {
 // Settings combines validated jsonData and decrypted secureJsonData.
 type Settings struct {
 	JSONSettings
+	EffectiveReasoningEffort string
+	EffectiveMaxRepairs      int
 	// llmServiceAccountToken is strictly scoped for llmclient calls to grafana-llm-app ONLY.
 	// It MUST NEVER be reused for datasource queries or dashboard persistence.
 	llmServiceAccountToken string
@@ -63,14 +74,16 @@ func (s Settings) Public() PublicConfig {
 		LLMMode:                  s.LLMMode,
 		ModelTier:                s.ModelTier,
 		MaxPanels:                s.MaxPanels,
-		MaxRepairAttempts:        s.MaxRepairAttempts,
+		MaxRepairAttempts:        s.EffectiveMaxRepairs,
 		ValidationTimeoutSeconds: s.ValidationTimeoutSec,
 		MaxConcurrentQueries:     s.MaxConcurrentQueries,
 		MockBanner:               s.LLMMode == LLMModeMock,
 	}
 }
 
-func LoadSettings(appSettings backend.AppInstanceSettings) (Settings, error) {
+// LoadSettings validates plugin configuration against trustedGrafanaAppURL (from GrafanaConfig.AppURL)
+// to prevent SSRF and SA token exfiltration via arbitrary grafanaUrl values.
+func LoadSettings(appSettings backend.AppInstanceSettings, trustedGrafanaAppURL ...string) (Settings, error) {
 	var js JSONSettings
 	if len(appSettings.JSONData) > 0 {
 		if err := json.Unmarshal(appSettings.JSONData, &js); err != nil {
@@ -78,22 +91,54 @@ func LoadSettings(appSettings backend.AppInstanceSettings) (Settings, error) {
 		}
 	}
 
-	// Apply safe defaults.
+	trustedAppURL := ""
+	if len(trustedGrafanaAppURL) > 0 {
+		trustedAppURL = strings.TrimSpace(trustedGrafanaAppURL[0])
+	}
+
 	if strings.TrimSpace(js.LLMMode) == "" {
 		js.LLMMode = LLMModeGrafanaLLMApp
 	}
 	if strings.TrimSpace(js.GrafanaURL) == "" {
-		js.GrafanaURL = "http://localhost:3000"
+		if trustedAppURL != "" {
+			js.GrafanaURL = trustedAppURL
+		} else {
+			js.GrafanaURL = "http://localhost:3000"
+		}
 	}
+	if err := validateGrafanaURL(js.GrafanaURL, trustedAppURL); err != nil {
+		return Settings{}, err
+	}
+
 	if js.ModelTier != string(llmclient.ModelBase) && js.ModelTier != string(llmclient.ModelLarge) {
 		js.ModelTier = string(llmclient.ModelBase)
 	}
+
+	// Default ReasoningEffort to "low" (matching docs) when omitted; allow explicit "" to unset.
+	reasoning := "low"
+	if js.ReasoningEffort != nil {
+		reasoning = strings.TrimSpace(strings.ToLower(*js.ReasoningEffort))
+	}
+	if !allowedReasoningEfforts[reasoning] {
+		return Settings{}, fmt.Errorf("unsupported reasoningEffort %q (allowed: \"\", low, medium, high)", reasoning)
+	}
+
 	if js.MaxPanels <= 0 || js.MaxPanels > ir.MaxPanelsHardCap {
 		js.MaxPanels = ir.DefaultMaxPanels
 	}
-	if js.MaxRepairAttempts <= 0 || js.MaxRepairAttempts > 2 {
-		js.MaxRepairAttempts = 2
+
+	// Support explicit maxRepairAttempts=0 to disable automatic syntax repair.
+	effectiveRepairs := 2
+	if js.MaxRepairAttempts != nil {
+		effectiveRepairs = *js.MaxRepairAttempts
+		if effectiveRepairs < 0 {
+			effectiveRepairs = 0
+		}
+		if effectiveRepairs > 2 {
+			effectiveRepairs = 2
+		}
 	}
+
 	if js.MaxOutputTokens <= 0 || js.MaxOutputTokens > 8192 {
 		js.MaxOutputTokens = 2048
 	}
@@ -113,7 +158,6 @@ func LoadSettings(appSettings backend.AppInstanceSettings) (Settings, error) {
 		js.MaxConcurrentQueries = 2
 	}
 
-	// Clean allowed datasource UIDs.
 	cleaned := make([]string, 0, len(js.AllowedDatasourceUIDs))
 	for _, uid := range js.AllowedDatasourceUIDs {
 		u := strings.TrimSpace(uid)
@@ -136,9 +180,45 @@ func LoadSettings(appSettings backend.AppInstanceSettings) (Settings, error) {
 	}
 
 	return Settings{
-		JSONSettings:           js,
-		llmServiceAccountToken: token,
+		JSONSettings:             js,
+		EffectiveReasoningEffort: reasoning,
+		EffectiveMaxRepairs:      effectiveRepairs,
+		llmServiceAccountToken:   token,
 	}, nil
+}
+
+// validateGrafanaURL restricts llmclient target URLs to http/https matching either the
+// trusted Grafana AppURL origin or loopback, preventing SSRF and Bearer token exfiltration.
+func validateGrafanaURL(rawURL, trustedAppURL string) error {
+	u, err := url.Parse(strings.TrimSpace(rawURL))
+	if err != nil {
+		return fmt.Errorf("invalid grafanaUrl: %w", err)
+	}
+	if u.Scheme != "http" && u.Scheme != "https" {
+		return fmt.Errorf("grafanaUrl scheme must be http or https, got %q", u.Scheme)
+	}
+	if u.Host == "" || u.User != nil {
+		return errors.New("grafanaUrl must have a valid host and must not embed credentials")
+	}
+	if isLoopbackHost(u.Hostname()) {
+		return nil
+	}
+	if trustedAppURL != "" {
+		tu, err := url.Parse(trustedAppURL)
+		if err == nil && strings.EqualFold(u.Scheme, tu.Scheme) && strings.EqualFold(u.Host, tu.Host) {
+			return nil
+		}
+	}
+	return fmt.Errorf("grafanaUrl host %q is not loopback and does not match trusted Grafana AppURL origin", u.Host)
+}
+
+func isLoopbackHost(host string) bool {
+	h := strings.TrimSpace(strings.ToLower(host))
+	if h == "localhost" {
+		return true
+	}
+	ip := net.ParseIP(h)
+	return ip != nil && ip.IsLoopback()
 }
 
 func (s Settings) LLMTimeout() time.Duration {

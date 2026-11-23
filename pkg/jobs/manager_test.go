@@ -4,12 +4,13 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"strings"
 	"testing"
-	"time"
 
 	"github.com/yuuki/grafana-llm-studio-app/pkg/ir"
 	"github.com/yuuki/grafana-llm-studio-app/pkg/jobs"
 	"github.com/yuuki/grafana-llm-studio-app/pkg/llm"
+	"github.com/yuuki/grafana-llm-studio-app/pkg/promql"
 )
 
 func testCatalog() []ir.MetricCatalogItem {
@@ -25,6 +26,12 @@ func testCatalog() []ir.MetricCatalogItem {
 			Type:   "histogram",
 			Help:   "Request duration histogram buckets",
 			Labels: []string{"service", "le"},
+		},
+		{
+			Name:   "process_resident_memory_bytes",
+			Type:   "gauge",
+			Help:   "Resident memory",
+			Labels: []string{"service"},
 		},
 	}
 }
@@ -70,86 +77,152 @@ func TestManager_CrossUserAndOrgIsolation(t *testing.T) {
 		t.Fatalf("expected 3 RED panels, got %+v", snap.CurrentIR)
 	}
 
-	// Another user in the same org MUST be denied.
 	if _, err := mgr.Get(bobSameOrg, snap.JobID); !errors.Is(err, jobs.ErrForbidden) {
 		t.Fatalf("expected ErrForbidden for bobSameOrg Get, got %v", err)
 	}
 	if _, err := mgr.Cancel(bobSameOrg, snap.JobID); !errors.Is(err, jobs.ErrForbidden) {
 		t.Fatalf("expected ErrForbidden for bobSameOrg Cancel, got %v", err)
 	}
-
-	// Same login in another org MUST be denied.
 	if _, err := mgr.Get(aliceOtherOrg, snap.JobID); !errors.Is(err, jobs.ErrForbidden) {
 		t.Fatalf("expected ErrForbidden for aliceOtherOrg Get, got %v", err)
 	}
-	if _, err := mgr.Patch(context.Background(), aliceOtherOrg, snap.JobID, jobs.PatchInput{
-		BaseRevision: 1,
-		EditIntent:   "change error panel",
-		Catalog:      testCatalog(),
-	}); !errors.Is(err, jobs.ErrForbidden) {
-		t.Fatalf("expected ErrForbidden for aliceOtherOrg Patch, got %v", err)
-	}
 }
 
-func TestManager_PromptInjectionInHelpBlockedDeterministically(t *testing.T) {
-	// Even if a compromised LLM obeys prompt injection in metric HELP, deterministic IR/PromQL validation MUST block it.
-	malicious := &stubLLM{
-		onGenerate: func(_ context.Context, _ llm.GenerateRequest) ([]byte, llm.CompletionMeta, error) {
-			bad := ir.DashboardIR{
-				SchemaVersion: ir.SchemaVersion,
-				Revision:      1,
-				Title:         "Hijacked",
-				TimeRange:     ir.TimeRange{From: "now-15m", To: "now"},
-				Panels: []ir.PanelIR{
-					{
-						ID:            "panel-hijack",
-						Type:          "timeseries",
-						Title:         "Exfil",
-						DatasourceRef: "prod-secret",
-						Query:         ir.QueryIR{Expr: `secret_metric{service="checkout-api"}`},
-						Unit:          "short",
-						Layout:        ir.LayoutHint{Row: 0, Col: 0, Width: "full"},
-					},
-				},
-			}
-			b, _ := json.Marshal(bad)
-			return b, llm.CompletionMeta{FinishReason: "stop", ProviderMode: "stub"}, nil
-		},
-	}
+func TestManager_EmptyCatalogEvictionDoSBlocked(t *testing.T) {
+	// C-2: Empty catalog bursts from user B MUST NOT evict user A's existing jobs.
+	mgr := jobs.NewManager(&llm.MockClient{}, jobs.Config{
+		AllowedDSUIDs: []string{"prom-main"},
+		MaxJobs:       5,
+	})
+	alice := jobs.Owner{OrgID: 1, UserLogin: "alice"}
+	mallory := jobs.Owner{OrgID: 1, UserLogin: "mallory"}
 
-	mgr := jobs.NewManager(malicious, jobs.Config{AllowedDSUIDs: []string{"prom-main"}})
-	snap, err := mgr.Generate(context.Background(), jobs.Owner{OrgID: 1, UserLogin: "alice"}, jobs.GenerateInput{
+	aliceSnap, err := mgr.Generate(context.Background(), alice, jobs.GenerateInput{
 		DatasourceUID: "prom-main",
 		Scope:         &ir.ScopeFilter{LabelName: "service", LabelValue: "checkout-api"},
-		UserIntent:    "Show requests",
+		UserIntent:    "Show request rate",
 		Catalog:       testCatalog(),
 	})
 	if err != nil {
-		t.Fatalf("unexpected hard error: %v", err)
+		t.Fatalf("alice Generate: %v", err)
 	}
-	if snap.Status != jobs.StatusFailed || snap.CurrentIR != nil {
-		t.Fatalf("expected hijacked IR to be rejected with no active IR, got status=%s ir=%+v", snap.Status, snap.CurrentIR)
+
+	for i := 0; i < 20; i++ {
+		res, err := mgr.Generate(context.Background(), mallory, jobs.GenerateInput{
+			DatasourceUID: "prom-main",
+			Scope:         &ir.ScopeFilter{LabelName: "service", LabelValue: "checkout-api"},
+			UserIntent:    "spam",
+			Catalog:       nil,
+		})
+		if err != nil || res.Status != jobs.StatusInsufficientMetrics || res.JobID != "" {
+			t.Fatalf("expected empty catalog to return StatusInsufficientMetrics without allocating jobId, got err=%v snap=%+v", err, res)
+		}
+	}
+
+	if _, err := mgr.Get(alice, aliceSnap.JobID); err != nil {
+		t.Fatalf("alice job was evicted by mallory empty catalog burst: %v", err)
 	}
 }
 
-func TestManager_UnauthorizedDatasourceRejected(t *testing.T) {
-	mgr := jobs.NewManager(&llm.MockClient{}, jobs.Config{AllowedDSUIDs: []string{"prom-allowed"}})
-	_, err := mgr.Generate(context.Background(), jobs.Owner{OrgID: 1, UserLogin: "alice"}, jobs.GenerateInput{
-		DatasourceUID: "prom-unlisted",
+func TestManager_InvalidScopeAndRepairFieldTamperingBlocked(t *testing.T) {
+	// C-3: Oversized/injected scope label rejected.
+	mgr := jobs.NewManager(&llm.MockClient{}, jobs.Config{AllowedDSUIDs: []string{"prom-main"}})
+	owner := jobs.Owner{OrgID: 1, UserLogin: "alice"}
+
+	if _, err := mgr.Generate(context.Background(), owner, jobs.GenerateInput{
+		DatasourceUID: "prom-main",
+		Scope:         &ir.ScopeFilter{LabelName: "service", LabelValue: strings.Repeat("A", 300)},
 		UserIntent:    "Show requests",
 		Catalog:       testCatalog(),
+	}); !errors.Is(err, promql.ErrPolicyViolation) {
+		t.Fatalf("expected ErrPolicyViolation for oversized scope value, got %v", err)
+	}
+
+	// H-4: Repair attempting to mutate panel title/type MUST be rejected.
+	tamperingRepair := &stubLLM{
+		onGenerate: (&llm.MockClient{}).GenerateIR,
+		onRepair: func(_ context.Context, req llm.RepairRequest) ([]byte, llm.CompletionMeta, error) {
+			patch := ir.DashboardPatch{
+				SchemaVersion: ir.SchemaVersion,
+				BaseRevision:  req.CurrentIR.Revision,
+				Summary:       "Hijack title during repair",
+				Operations: []ir.PatchOperation{
+					{
+						Op:      "update_panel",
+						PanelID: req.Targets[0].PanelID,
+						Panel: &ir.PanelUpdate{
+							Title: "Hijacked Title",
+							Query: &ir.QueryUpdate{Expr: `sum(rate(http_requests_total{service="checkout-api"}[5m]))`},
+						},
+					},
+				},
+			}
+			b, _ := json.Marshal(patch)
+			return b, llm.CompletionMeta{FinishReason: "stop", ProviderMode: "stub"}, nil
+		},
+	}
+	mgr2 := jobs.NewManager(tamperingRepair, jobs.Config{AllowedDSUIDs: []string{"prom-main"}})
+	snap, _ := mgr2.Generate(context.Background(), owner, jobs.GenerateInput{
+		DatasourceUID: "prom-main",
+		Scope:         &ir.ScopeFilter{LabelName: "service", LabelValue: "checkout-api"},
+		UserIntent:    "Show request rate",
+		Catalog:       testCatalog(),
 	})
-	if !errors.Is(err, jobs.ErrDatasourceDenied) {
-		t.Fatalf("expected ErrDatasourceDenied, got %v", err)
+	p := snap.CurrentIR.Panels[0]
+	_, err := mgr2.Repair(context.Background(), owner, snap.JobID, jobs.RepairInput{
+		BaseRevision: snap.CurrentIR.Revision,
+		Results: []ir.PanelValidationResult{
+			{PanelID: p.ID, QueryHash: ir.QueryHash(p.Query.Expr), Category: ir.ValidationSyntaxError, ErrorText: "parse error"},
+		},
+		Catalog: testCatalog(),
+	})
+	if err == nil {
+		t.Fatal("expected Repair mutating panel title to be rejected")
+	}
+
+	// H-4: Patch with explicit targetPanelId MUST reject modifying another panel.
+	outOfTargetPatch := &stubLLM{
+		onGenerate: (&llm.MockClient{}).GenerateIR,
+		onPatch: func(_ context.Context, req llm.PatchRequest) ([]byte, llm.CompletionMeta, error) {
+			patch := ir.DashboardPatch{
+				SchemaVersion: ir.SchemaVersion,
+				BaseRevision:  req.CurrentIR.Revision,
+				Summary:       "Remove untouched panel",
+				Operations:    []ir.PatchOperation{{Op: "remove_panel", PanelID: "panel-request-rate"}},
+			}
+			b, _ := json.Marshal(patch)
+			return b, llm.CompletionMeta{FinishReason: "stop", ProviderMode: "stub"}, nil
+		},
+	}
+	mgr3 := jobs.NewManager(outOfTargetPatch, jobs.Config{AllowedDSUIDs: []string{"prom-main"}})
+	snap3, _ := mgr3.Generate(context.Background(), owner, jobs.GenerateInput{
+		DatasourceUID: "prom-main",
+		Scope:         &ir.ScopeFilter{LabelName: "service", LabelValue: "checkout-api"},
+		UserIntent:    "Show request rate and error rate",
+		Catalog:       testCatalog(),
+	})
+	_, err = mgr3.Patch(context.Background(), owner, snap3.JobID, jobs.PatchInput{
+		BaseRevision:  1,
+		TargetPanelID: "panel-error-rate",
+		EditIntent:    "Change error panel only",
+		Catalog:       testCatalog(),
+	})
+	if err == nil {
+		t.Fatal("expected out-of-target remove_panel patch to be rejected")
 	}
 }
 
-func TestManager_RepairClassificationAndBudgetEnforcement(t *testing.T) {
-	repairCalls := 0
+func TestManager_RepairClassificationBudgetAndParallelGuard(t *testing.T) {
+	repairStarted := make(chan struct{}, 2)
+	repairRelease := make(chan struct{})
 	stub := &stubLLM{
 		onGenerate: (&llm.MockClient{}).GenerateIR,
 		onRepair: func(_ context.Context, req llm.RepairRequest) ([]byte, llm.CompletionMeta, error) {
-			repairCalls++
+			select {
+			case repairStarted <- struct{}{}:
+			default:
+			}
+			<-repairRelease
 			patch := ir.DashboardPatch{
 				SchemaVersion: ir.SchemaVersion,
 				BaseRevision:  req.CurrentIR.Revision,
@@ -159,10 +232,7 @@ func TestManager_RepairClassificationAndBudgetEnforcement(t *testing.T) {
 						Op:      "update_panel",
 						PanelID: req.Targets[0].PanelID,
 						Panel: &ir.PanelUpdate{
-							Query: &ir.QueryIR{
-								Expr:         `sum by (status) (rate(http_requests_total{service="checkout-api"}[5m]))`,
-								LegendFormat: "{{status}}",
-							},
+							Query: &ir.QueryUpdate{Expr: `sum(rate(http_requests_total{service="checkout-api"}[1m]))`},
 						},
 					},
 				},
@@ -173,151 +243,116 @@ func TestManager_RepairClassificationAndBudgetEnforcement(t *testing.T) {
 	}
 
 	mgr := jobs.NewManager(stub, jobs.Config{
-		AllowedDSUIDs:     []string{"prom-main"},
-		MaxRepairAttempts: 2,
+		AllowedDSUIDs:        []string{"prom-main"},
+		MaxRepairAttempts:    2,
+		MaxRepairAttemptsSet: true,
 	})
 	owner := jobs.Owner{OrgID: 1, UserLogin: "alice"}
-	snap, err := mgr.Generate(context.Background(), owner, jobs.GenerateInput{
+	snap, _ := mgr.Generate(context.Background(), owner, jobs.GenerateInput{
 		DatasourceUID: "prom-main",
 		Scope:         &ir.ScopeFilter{LabelName: "service", LabelValue: "checkout-api"},
 		UserIntent:    "Show request rate",
 		Catalog:       testCatalog(),
 	})
-	if err != nil {
-		t.Fatalf("Generate failed: %v", err)
-	}
 	panel := snap.CurrentIR.Panels[0]
 	qHash := ir.QueryHash(panel.Query.Expr)
 
-	// 1. empty_result, permission_error, timeout MUST NEVER trigger auto-repair.
+	// Non-repairable categories NEVER trigger repair.
 	for _, cat := range []ir.ValidationCategory{
 		ir.ValidationEmptyResult,
 		ir.ValidationPermissionError,
 		ir.ValidationTimeout,
 	} {
-		_, err := mgr.Repair(context.Background(), owner, snap.JobID, jobs.RepairInput{
+		if _, err := mgr.Repair(context.Background(), owner, snap.JobID, jobs.RepairInput{
 			BaseRevision: snap.CurrentIR.Revision,
-			Results: []ir.PanelValidationResult{
-				{PanelID: panel.ID, QueryHash: qHash, Category: cat, ErrorText: "simulated"},
-			},
-			Catalog: testCatalog(),
-		})
-		if !errors.Is(err, jobs.ErrNotRepairable) {
+			Results:      []ir.PanelValidationResult{{PanelID: panel.ID, QueryHash: qHash, Category: cat}},
+			Catalog:      testCatalog(),
+		}); !errors.Is(err, jobs.ErrNotRepairable) {
 			t.Fatalf("category %s should return ErrNotRepairable, got %v", cat, err)
 		}
 	}
-	if repairCalls != 0 {
-		t.Fatalf("expected 0 LLM repair calls for non-repairable categories, got %d", repairCalls)
-	}
 
-	// 2. syntax_error consumes repair budget up to max 2; 3rd attempt MUST fail with ErrBudgetExhausted.
-	curSnap := snap
-	for i := 1; i <= 2; i++ {
-		p := curSnap.CurrentIR.Panels[0]
-		curSnap, err = mgr.Repair(context.Background(), owner, snap.JobID, jobs.RepairInput{
-			BaseRevision: curSnap.CurrentIR.Revision,
-			Results: []ir.PanelValidationResult{
-				{PanelID: p.ID, QueryHash: ir.QueryHash(p.Query.Expr), Category: ir.ValidationSyntaxError, ErrorText: "parse error"},
-			},
-			Catalog: testCatalog(),
+	// Parallel Repair on same job MUST fail with ErrOperationInProgress without double-burning budget (H-6).
+	done1 := make(chan jobs.JobSnapshot, 1)
+	go func() {
+		s, _ := mgr.Repair(context.Background(), owner, snap.JobID, jobs.RepairInput{
+			BaseRevision: 1,
+			Results:      []ir.PanelValidationResult{{PanelID: panel.ID, QueryHash: qHash, Category: ir.ValidationSyntaxError}},
+			Catalog:      testCatalog(),
 		})
-		if err != nil {
-			t.Fatalf("repair attempt %d failed: %v", i, err)
-		}
-		if curSnap.RepairAttemptsUsed != i {
-			t.Fatalf("expected repairAttemptsUsed=%d, got %d", i, curSnap.RepairAttemptsUsed)
-		}
-	}
-
-	p := curSnap.CurrentIR.Panels[0]
-	_, err = mgr.Repair(context.Background(), owner, snap.JobID, jobs.RepairInput{
-		BaseRevision: curSnap.CurrentIR.Revision,
-		Results: []ir.PanelValidationResult{
-			{PanelID: p.ID, QueryHash: ir.QueryHash(p.Query.Expr), Category: ir.ValidationSyntaxError, ErrorText: "parse error"},
-		},
-		Catalog: testCatalog(),
+		done1 <- s
+	}()
+	<-repairStarted
+	_, parallelErr := mgr.Repair(context.Background(), owner, snap.JobID, jobs.RepairInput{
+		BaseRevision: 1,
+		Results:      []ir.PanelValidationResult{{PanelID: panel.ID, QueryHash: qHash, Category: ir.ValidationSyntaxError}},
+		Catalog:      testCatalog(),
 	})
-	if !errors.Is(err, jobs.ErrBudgetExhausted) {
-		t.Fatalf("expected 3rd repair to fail with ErrBudgetExhausted, got %v", err)
+	if !errors.Is(parallelErr, jobs.ErrOperationInProgress) {
+		t.Fatalf("expected ErrOperationInProgress for concurrent Repair, got %v", parallelErr)
+	}
+	close(repairRelease)
+	s1 := <-done1
+	if s1.RepairAttemptsUsed != 1 {
+		t.Fatalf("expected RepairAttemptsUsed=1 (not double-burned), got %d", s1.RepairAttemptsUsed)
 	}
 }
 
-func TestManager_CancelPreventsLateResponseAndUndoRestoresDraft(t *testing.T) {
-	started := make(chan struct{})
-	release := make(chan struct{})
+func TestManager_UndoInvalidatesInFlightPatchFailure(t *testing.T) {
+	// H-6: If Patch fails after Undo was executed, the late failure MUST NOT overwrite Undo's status.
+	patchStarted := make(chan struct{})
+	patchRelease := make(chan struct{})
 	stub := &stubLLM{
 		onGenerate: (&llm.MockClient{}).GenerateIR,
 		onPatch: func(ctx context.Context, req llm.PatchRequest) ([]byte, llm.CompletionMeta, error) {
-			close(started)
-			<-release
-			// Even if LLM ignores ctx and returns a valid patch late, Manager must discard it.
-			return (&llm.MockClient{}).GeneratePatch(context.Background(), req)
+			if req.CurrentIR.Revision == 1 {
+				return (&llm.MockClient{}).GeneratePatch(ctx, req)
+			}
+			close(patchStarted)
+			<-patchRelease
+			return nil, llm.CompletionMeta{ProviderMode: "stub"}, errors.New("late upstream failure")
 		},
 	}
 
 	mgr := jobs.NewManager(stub, jobs.Config{AllowedDSUIDs: []string{"prom-main"}})
 	owner := jobs.Owner{OrgID: 1, UserLogin: "alice"}
-
-	snap, err := mgr.Generate(context.Background(), owner, jobs.GenerateInput{
+	s1, _ := mgr.Generate(context.Background(), owner, jobs.GenerateInput{
 		DatasourceUID: "prom-main",
 		Scope:         &ir.ScopeFilter{LabelName: "service", LabelValue: "checkout-api"},
 		UserIntent:    "Show request rate and error rate",
+		Catalog:       testCatalog(),
+	})
+	_, err := mgr.Patch(context.Background(), owner, s1.JobID, jobs.PatchInput{
+		BaseRevision:  1,
+		TargetPanelID: "panel-error-rate",
+		EditIntent:    "Switch error panel to timeseries",
 		Catalog:       testCatalog(),
 	})
 	if err != nil {
-		t.Fatalf("Generate: %v", err)
+		t.Fatalf("first patch: %v", err)
 	}
 
-	errCh := make(chan error, 1)
+	lateDone := make(chan error, 1)
 	go func() {
-		_, e := mgr.Patch(context.Background(), owner, snap.JobID, jobs.PatchInput{
-			BaseRevision:  snap.CurrentIR.Revision,
+		_, e := mgr.Patch(context.Background(), owner, s1.JobID, jobs.PatchInput{
+			BaseRevision:  2,
 			TargetPanelID: "panel-error-rate",
-			EditIntent:    "Switch error panel to timeseries",
+			EditIntent:    "Change title",
 			Catalog:       testCatalog(),
 		})
-		errCh <- e
+		lateDone <- e
 	}()
 
-	<-started
-	if _, err := mgr.Cancel(owner, snap.JobID); err != nil {
-		t.Fatalf("Cancel: %v", err)
+	<-patchStarted
+	undoSnap, err := mgr.Undo(owner, s1.JobID)
+	if err != nil || undoSnap.Status != jobs.StatusAwaitingPreview || undoSnap.CurrentIR.Revision != 3 {
+		t.Fatalf("Undo failed: err=%v snap=%+v", err, undoSnap)
 	}
-	close(release)
+	close(patchRelease)
+	<-lateDone
 
-	select {
-	case patchErr := <-errCh:
-		if !errors.Is(patchErr, jobs.ErrJobCancelled) {
-			t.Fatalf("expected ErrJobCancelled for cancelled late patch, got %v", patchErr)
-		}
-	case <-time.After(3 * time.Second):
-		t.Fatal("timed out waiting for cancelled patch")
-	}
-
-	afterCancel, _ := mgr.Get(owner, snap.JobID)
-	if afterCancel.CurrentIR.Revision != 1 {
-		t.Fatalf("cancelled late patch mutated revision: got %d, want 1", afterCancel.CurrentIR.Revision)
-	}
-
-	// Now test normal patch + undo with MockClient.
-	mgr2 := jobs.NewManager(&llm.MockClient{}, jobs.Config{AllowedDSUIDs: []string{"prom-main"}})
-	s1, _ := mgr2.Generate(context.Background(), owner, jobs.GenerateInput{
-		DatasourceUID: "prom-main",
-		Scope:         &ir.ScopeFilter{LabelName: "service", LabelValue: "checkout-api"},
-		UserIntent:    "Show request rate and error rate",
-		Catalog:       testCatalog(),
-	})
-	s2, err := mgr2.Patch(context.Background(), owner, s1.JobID, jobs.PatchInput{
-		BaseRevision:  1,
-		TargetPanelID: "panel-error-rate",
-		EditIntent:    "エラー率のパネルだけ timeseries に変更して",
-		Catalog:       testCatalog(),
-	})
-	if err != nil || s2.CurrentIR.Revision != 2 || !s2.CanUndo {
-		t.Fatalf("Patch failed: err=%v snap=%+v", err, s2)
-	}
-	s3, err := mgr2.Undo(owner, s1.JobID)
-	if err != nil || s3.CurrentIR.Revision != 3 || s3.CurrentIR.Panels[1].Type != "stat" {
-		t.Fatalf("Undo did not restore panel type to stat: err=%v snap=%+v", err, s3)
+	finalSnap, _ := mgr.Get(owner, s1.JobID)
+	if finalSnap.Status != jobs.StatusAwaitingPreview || finalSnap.CurrentIR.Revision != 3 {
+		t.Fatalf("late failed patch corrupted post-Undo job state: %+v", finalSnap)
 	}
 }

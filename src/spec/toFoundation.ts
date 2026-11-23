@@ -1,3 +1,4 @@
+import * as common from '@grafana/grafana-foundation-sdk/common';
 import * as dashboard from '@grafana/grafana-foundation-sdk/dashboard';
 import * as prometheus from '@grafana/grafana-foundation-sdk/prometheus';
 import * as stat from '@grafana/grafana-foundation-sdk/stat';
@@ -15,7 +16,8 @@ export interface FoundationBuildOptions {
 /**
  * Thin adapter converting NormalizedDashboardSpec into a Grafana Classic JSON Dashboard
  * via the official @grafana/grafana-foundation-sdk (v0.0.22, schemaVersion 42).
- * - Guarantees identical queries, units, thresholds, datasource refs, and gridPos as Scenes preview.
+ * - Guarantees identical queries, units, thresholds, panel IDs, legend/reduce options,
+ *   datasource refs, and gridPos as Scenes preview (H-12).
  * - Never embeds chat history, credentials, unnecessary label values, or raw query data.
  * - Forces id=null, version=0, refresh="" so saved/exported JSON is always create-only and static.
  */
@@ -71,10 +73,35 @@ function buildFoundationPanel(panel: NormalizedPanelSpec) {
       }))
     );
 
-  const panelBuilder =
-    panel.type === 'stat' ? new stat.PanelBuilder() : new timeseries.PanelBuilder();
+  if (panel.type === 'stat') {
+    const statBuilder = new stat.PanelBuilder()
+      .id(panel.numericId)
+      .title(panel.title)
+      .datasource({
+        type: panel.datasource.type,
+        uid: panel.datasource.uid,
+      })
+      .unit(panel.unit)
+      .thresholds(thresholdsBuilder)
+      .reduceOptions(
+        new common.ReduceDataOptionsBuilder().calcs(['lastNotNull']).values(false)
+      )
+      .gridPos({
+        x: panel.gridPos.x,
+        y: panel.gridPos.y,
+        w: panel.gridPos.w,
+        h: panel.gridPos.h,
+      })
+      .withTarget(queryBuilder);
 
-  panelBuilder
+    if (panel.description) {
+      statBuilder.description(panel.description);
+    }
+    return statBuilder;
+  }
+
+  const tsBuilder = new timeseries.PanelBuilder()
+    .id(panel.numericId)
     .title(panel.title)
     .datasource({
       type: panel.datasource.type,
@@ -82,6 +109,13 @@ function buildFoundationPanel(panel: NormalizedPanelSpec) {
     })
     .unit(panel.unit)
     .thresholds(thresholdsBuilder)
+    .legend(
+      new common.VizLegendOptionsBuilder()
+        .showLegend(true)
+        .displayMode(common.LegendDisplayMode.List)
+        .placement(common.LegendPlacement.Bottom)
+        .calcs([])
+    )
     .gridPos({
       x: panel.gridPos.x,
       y: panel.gridPos.y,
@@ -91,8 +125,7 @@ function buildFoundationPanel(panel: NormalizedPanelSpec) {
     .withTarget(queryBuilder);
 
   if (panel.description) {
-    panelBuilder.description(panel.description);
+    tsBuilder.description(panel.description);
   }
-
-  return panelBuilder;
+  return tsBuilder;
 }
