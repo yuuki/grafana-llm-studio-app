@@ -1,0 +1,24 @@
+apiVersion: 1
+
+apps:
+  # 開発・ローカル検証用プロビジョニング例（本番では llmMode: grafana-llm-app に変更し、
+  # allowMockInDev を削除、LLM 専用 SA トークンは Grafana UI / 秘密管理基盤の secureJsonData に設定する）
+  - type: yuuki-llmstudio-app
+    org_id: 1
+    disabled: false
+    jsonData:
+      allowedDatasourceUids:
+        - prom-main
+      llmMode: mock
+      allowMockInDev: true
+      grafanaUrl: http://localhost:3000
+      modelTier: base
+      reasoningEffort: low
+      maxPanels: 6
+      maxRepairAttempts: 2
+      maxOutputTokens: 2048
+      llmTimeoutSeconds: 45
+      jobDeadlineSeconds: 90
+      maxConcurrentJobs: 4
+      validationTimeoutSeconds: 10
+      maxConcurrentQueries: 2

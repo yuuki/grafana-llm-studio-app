@@ -1,0 +1,45 @@
+services:
+  grafana:
+    image: grafana/grafana-oss:12.4.15
+    ports:
+      - "3000:3000"
+    environment:
+      # 未署名 Custom App Plugin は対象 ID のみを明示許可する
+      GF_PLUGINS_ALLOW_LOADING_UNSIGNED_PLUGINS: "yuuki-llmstudio-app"
+      GF_SECURITY_ADMIN_USER: "${GF_SECURITY_ADMIN_USER:-admin}"
+      GF_SECURITY_ADMIN_PASSWORD: "${GF_SECURITY_ADMIN_PASSWORD:-change-me-local-dev}"
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+      GF_ANALYTICS_CHECK_FOR_UPDATES: "false"
+      GF_ANALYTICS_CHECK_FOR_PLUGIN_UPDATES: "false"
+    volumes:
+      - ../dist:/var/lib/grafana/plugins/yuuki-llmstudio-app:ro
+      - ./grafana/provisioning/datasources:/etc/grafana/provisioning/datasources:ro
+      - ./grafana/provisioning/plugins:/etc/grafana/provisioning/plugins:ro
+      # 実 LLM 接続テスト時はオフライン搬入した grafana-llm-app v1.0.8 を以下へマウントする:
+      # - ./offline-plugins/grafana-llm-app:/var/lib/grafana/plugins/grafana-llm-app:ro
+    depends_on:
+      - prometheus
+
+  prometheus:
+    image: prom/prometheus:v3.5.0
+    ports:
+      - "9090:9090"
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--query.timeout=15s"
+      - "--query.max-concurrency=10"
+      - "--query.max-samples=10000000"
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    depends_on:
+      - sample-metrics
+
+  # ローカル開発・検証用サンプルメトリクス（RED + リソースメトリクスを /metrics で公開）
+  sample-metrics:
+    image: python:3.12-slim
+    working_dir: /app
+    command: ["python3", "/app/exporter.py"]
+    volumes:
+      - ./prometheus/exporter.py:/app/exporter.py:ro
+    ports:
+      - "9108:9108"

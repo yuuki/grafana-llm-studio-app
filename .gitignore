@@ -1,0 +1,8 @@
+node_modules/
+dist/
+coverage/
+deploy/.env
+deploy/offline-plugins/
+*.tar
+*.tar.gz
+__pycache__/

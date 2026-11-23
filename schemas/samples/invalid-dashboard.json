@@ -1,0 +1,27 @@
+{
+  "schemaVersion": "1.0",
+  "revision": 1,
+  "title": "Invalid Dashboard Example <script>alert(1)</script>",
+  "timeRange": {
+    "from": "now-30d",
+    "to": "now"
+  },
+  "panels": [
+    {
+      "id": "bad id!",
+      "type": "table",
+      "title": "Unauthorized Datasource & Unbounded Query",
+      "datasourceRef": "prod-secret-prom-uid",
+      "query": {
+        "expr": "rate(fabricated_metric_total{job=~\".*\"}[30d])"
+      },
+      "unit": "reqps",
+      "layout": {
+        "row": 0,
+        "col": 0,
+        "width": "half"
+      },
+      "unknownField": "should-fail-additionalProperties"
+    }
+  ]
+}

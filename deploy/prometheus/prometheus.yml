@@ -1,0 +1,8 @@
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+scrape_configs:
+  - job_name: "sample-services"
+    static_configs:
+      - targets: ["sample-metrics:9108"]

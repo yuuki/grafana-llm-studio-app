@@ -1,0 +1,176 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/yuuki/grafana-llm-studio-app/schemas/dashboard-patch.schema.json",
+  "title": "DashboardPatch",
+  "description": "Restricted typed patch operations targeting stable panel IDs and requiring baseRevision.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion",
+    "baseRevision",
+    "summary",
+    "operations"
+  ],
+  "properties": {
+    "schemaVersion": {
+      "type": "string",
+      "enum": ["1.0"]
+    },
+    "baseRevision": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 10000,
+      "description": "Must match the current draft revision to prevent stale overwrites."
+    },
+    "summary": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 240,
+      "description": "Short explanation of the intended partial edit."
+    },
+    "operations": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 6,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["op"],
+        "properties": {
+          "op": {
+            "type": "string",
+            "enum": ["update_panel", "add_panel", "remove_panel", "update_meta"]
+          },
+          "panelId": {
+            "type": "string",
+            "pattern": "^panel-[a-z0-9][a-z0-9-]{0,31}$"
+          },
+          "title": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 120
+          },
+          "description": {
+            "type": "string",
+            "maxLength": 400
+          },
+          "timeRange": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["from", "to"],
+            "properties": {
+              "from": {
+                "type": "string",
+                "enum": ["now-5m", "now-15m", "now-30m", "now-1h", "now-3h", "now-6h"]
+              },
+              "to": {
+                "type": "string",
+                "enum": ["now"]
+              }
+            }
+          },
+          "panel": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "id": {
+                "type": "string",
+                "pattern": "^panel-[a-z0-9][a-z0-9-]{0,31}$"
+              },
+              "type": {
+                "type": "string",
+                "enum": ["timeseries", "stat"]
+              },
+              "title": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 80
+              },
+              "description": {
+                "type": "string",
+                "maxLength": 240
+              },
+              "datasourceRef": {
+                "type": "string",
+                "enum": ["selected_prometheus"]
+              },
+              "query": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["expr"],
+                "properties": {
+                  "expr": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 512
+                  },
+                  "legendFormat": {
+                    "type": "string",
+                    "maxLength": 80
+                  }
+                }
+              },
+              "unit": {
+                "type": "string",
+                "enum": [
+                  "short",
+                  "none",
+                  "percent",
+                  "percentunit",
+                  "reqps",
+                  "ops",
+                  "s",
+                  "ms",
+                  "bytes",
+                  "decbytes",
+                  "Bps"
+                ]
+              },
+              "thresholds": {
+                "type": "array",
+                "maxItems": 4,
+                "items": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": ["value", "color"],
+                  "properties": {
+                    "value": {
+                      "type": "number",
+                      "minimum": -1000000000,
+                      "maximum": 1000000000
+                    },
+                    "color": {
+                      "type": "string",
+                      "enum": ["green", "yellow", "orange", "red", "blue"]
+                    }
+                  }
+                }
+              },
+              "layout": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["row", "col", "width"],
+                "properties": {
+                  "row": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 5
+                  },
+                  "col": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 1
+                  },
+                  "width": {
+                    "type": "string",
+                    "enum": ["half", "full"]
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}

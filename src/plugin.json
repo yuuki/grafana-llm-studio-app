@@ -1,0 +1,51 @@
+{
+  "$schema": "https://raw.githubusercontent.com/grafana/grafana/master/docs/sources/developers/plugins/plugin.schema.json",
+  "type": "app",
+  "name": "LLM Dashboard Studio",
+  "id": "yuuki-llmstudio-app",
+  "autoEnabled": false,
+  "backend": true,
+  "executable": "gpx_yuuki_llmstudio_app",
+  "info": {
+    "keywords": ["app", "llm", "dashboard", "studio", "scenes", "prometheus"],
+    "description": "OSS air-gapped LLM Dashboard Studio powered by grafana-llm-app, Scenes, and Foundation SDK",
+    "author": {
+      "name": "yuuki"
+    },
+    "logos": {
+      "small": "img/logo.svg",
+      "large": "img/logo.svg"
+    },
+    "version": "0.1.0",
+    "updated": "2026-11-22"
+  },
+  "includes": [
+    {
+      "type": "page",
+      "name": "Studio",
+      "path": "/a/yuuki-llmstudio-app",
+      "role": "Viewer",
+      "addToNav": true,
+      "defaultNav": true
+    }
+  ],
+  "dependencies": {
+    "grafanaDependency": ">=12.4.0 <13.0.0",
+    "plugins": [
+      {
+        "type": "app",
+        "id": "grafana-llm-app",
+        "name": "LLM",
+        "version": ">=1.0.8"
+      }
+    ]
+  },
+  "iam": {
+    "permissions": [
+      {
+        "action": "plugins.app:access",
+        "scope": "plugins:grafana-llm-app"
+      }
+    ]
+  }
+}

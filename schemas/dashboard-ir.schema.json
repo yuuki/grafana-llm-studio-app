@@ -1,0 +1,179 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/yuuki/grafana-llm-studio-app/schemas/dashboard-ir.schema.json",
+  "title": "DashboardIR",
+  "description": "Restricted intermediate representation (IR) for LLM-generated Grafana dashboards in LLM Dashboard Studio MVP.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion",
+    "revision",
+    "title",
+    "timeRange",
+    "panels"
+  ],
+  "properties": {
+    "schemaVersion": {
+      "type": "string",
+      "enum": ["1.0"],
+      "description": "Fixed IR schema version."
+    },
+    "revision": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 10000,
+      "description": "Monotonically increasing draft revision managed by the backend."
+    },
+    "title": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 120,
+      "description": "Dashboard title (plain text, no HTML/JS)."
+    },
+    "description": {
+      "type": "string",
+      "maxLength": 400,
+      "description": "Optional short dashboard summary."
+    },
+    "timeRange": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["from", "to"],
+      "properties": {
+        "from": {
+          "type": "string",
+          "enum": ["now-5m", "now-15m", "now-30m", "now-1h", "now-3h", "now-6h"],
+          "description": "Bounded relative start time. Initial preview defaults to now-15m."
+        },
+        "to": {
+          "type": "string",
+          "enum": ["now"],
+          "description": "Relative end time fixed to now."
+        }
+      }
+    },
+    "panels": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 6,
+      "description": "MVP allows 1 to 6 panels.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "id",
+          "type",
+          "title",
+          "datasourceRef",
+          "query",
+          "unit",
+          "layout"
+        ],
+        "properties": {
+          "id": {
+            "type": "string",
+            "pattern": "^panel-[a-z0-9][a-z0-9-]{0,31}$",
+            "description": "Stable panel identifier used for partial edits and diffs."
+          },
+          "type": {
+            "type": "string",
+            "enum": ["timeseries", "stat"],
+            "description": "MVP supports timeseries and stat panel types only."
+          },
+          "title": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 80
+          },
+          "description": {
+            "type": "string",
+            "maxLength": 240
+          },
+          "datasourceRef": {
+            "type": "string",
+            "enum": ["selected_prometheus"],
+            "description": "Logical reference bound to the admin-allowlisted, user-selected Prometheus datasource. Arbitrary UIDs or URLs are forbidden."
+          },
+          "query": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["expr"],
+            "properties": {
+              "expr": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 512,
+                "description": "Single PromQL expression validated deterministically against syntax, policy, and scoped catalog."
+              },
+              "legendFormat": {
+                "type": "string",
+                "maxLength": 80
+              }
+            }
+          },
+          "unit": {
+            "type": "string",
+            "enum": [
+              "short",
+              "none",
+              "percent",
+              "percentunit",
+              "reqps",
+              "ops",
+              "s",
+              "ms",
+              "bytes",
+              "decbytes",
+              "Bps"
+            ],
+            "description": "Allowlisted Grafana standard unit identifier."
+          },
+          "thresholds": {
+            "type": "array",
+            "maxItems": 4,
+            "description": "Optional ascending absolute threshold steps.",
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["value", "color"],
+              "properties": {
+                "value": {
+                  "type": "number",
+                  "minimum": -1000000000,
+                  "maximum": 1000000000
+                },
+                "color": {
+                  "type": "string",
+                  "enum": ["green", "yellow", "orange", "red", "blue"]
+                }
+              }
+            }
+          },
+          "layout": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["row", "col", "width"],
+            "properties": {
+              "row": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 5
+              },
+              "col": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 1,
+                "description": "Two-column grid hint (0 = left, 1 = right)."
+              },
+              "width": {
+                "type": "string",
+                "enum": ["half", "full"],
+                "description": "Grid width hint normalized to 12 (half) or 24 (full) columns."
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
