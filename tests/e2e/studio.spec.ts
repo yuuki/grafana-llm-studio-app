@@ -189,18 +189,21 @@ test.describe('LLM Dashboard Studio live E2E', () => {
         queriesBeforeTabs
       );
 
+      const studio = page.getByTestId('studio-page');
+      const undoBtn = studio.getByRole('button', { name: 'Undo', exact: true });
+
       // 6. Partial panel edit (patch) — updates only panel-error-rate and re-validates only changed panel
-      const promptArea = page.getByPlaceholder(/Change only the error rate panel/);
+      const promptArea = studio.getByPlaceholder(/Change only the error rate panel/);
       await promptArea.fill('Change the error rate panel to a timeseries covering both 4xx and 5xx');
 
-      await page.getByRole('button', { name: 'Apply Partial Edit' }).click();
+      await studio.getByRole('button', { name: 'Apply Partial Edit', exact: true }).click();
       await expect(page.getByTestId('studio-job-revision')).toHaveText('rev 2');
       await expect(page.getByTestId('studio-job-diff')).toContainText('panel-error-rate');
-      await expect(page.getByRole('button', { name: 'Undo' })).toBeVisible();
-      await expect(page.getByRole('button', { name: 'Save New Dashboard' })).toBeDisabled();
+      await expect(undoBtn).toBeVisible();
+      await expect(studio.getByRole('button', { name: 'Save New Dashboard', exact: true })).toBeDisabled();
 
       const queriesBeforePatchValidate = dsQueries.count();
-      await page.getByRole('button', { name: 'Validate & Preview' }).click();
+      await studio.getByRole('button', { name: 'Validate & Preview', exact: true }).click();
       await expect(previewPane.getByText('4xx & 5xx Error Ratio')).toBeVisible();
       await expect(page.getByTestId('studio-validation-row-panel-error-rate')).toContainText('OK');
 
@@ -212,19 +215,19 @@ test.describe('LLM Dashboard Studio live E2E', () => {
       expect(patchDryRuns[0].queries[0]?.expr).toContain('4..|5..');
 
       // 7. Undo — restores rev 1 panels as monotonic rev 3
-      await page.getByRole('button', { name: 'Undo' }).click();
+      await undoBtn.click();
       await expect(page.getByTestId('studio-job-revision')).toHaveText('rev 3');
       await expect(page.getByTestId('studio-job-diff')).toContainText('restored from rev 1 as rev 3');
-      await expect(page.getByRole('button', { name: 'Save New Dashboard' })).toBeDisabled();
+      await expect(studio.getByRole('button', { name: 'Save New Dashboard', exact: true })).toBeDisabled();
 
       // Re-validate rev 3 so it is save-ready
-      await page.getByRole('button', { name: 'Validate & Preview' }).click();
+      await studio.getByRole('button', { name: 'Validate & Preview', exact: true }).click();
       await expect(previewPane.getByText('5xx Error Ratio')).toBeVisible();
-      await expect(page.getByRole('button', { name: 'Save New Dashboard' })).toBeEnabled();
+      await expect(studio.getByRole('button', { name: 'Save New Dashboard', exact: true })).toBeEnabled();
 
       // 8. JSON Export — downloads clean Foundation SDK Dashboard JSON without UID
       const downloadPromise = page.waitForEvent('download');
-      await page.getByRole('button', { name: 'Export JSON' }).click();
+      await studio.getByRole('button', { name: 'Export JSON', exact: true }).click();
       const download = await downloadPromise;
       expect(download.suggestedFilename()).toBe('dashboard-rev-3.json');
 
@@ -256,7 +259,7 @@ test.describe('LLM Dashboard Studio live E2E', () => {
           res.url().endsWith('/dashboards')
       );
 
-      await page.getByRole('button', { name: 'Save New Dashboard' }).click();
+      await studio.getByRole('button', { name: 'Save New Dashboard', exact: true }).click();
       const saveResponse = await saveResponsePromise;
       page.off('request', putWatch);
 
