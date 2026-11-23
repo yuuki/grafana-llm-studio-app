@@ -54,16 +54,20 @@ jobs:
         run: npm run verify:bundle
 
       - name: Go vet
-        run: go vet ./pkg/...
+        run: go vet ./pkg/... ./cmd/...
 
       - name: Go race tests
-        run: go test -race -count=1 ./pkg/...
+        run: go test -race -count=1 ./pkg/... ./cmd/...
 
-      - name: Build Linux amd64 Go plugin backend
-        run: make build-backend
+      - name: Build Linux amd64 Go plugin backend & benchmark CLI
+        run: |
+          make build-backend
+          make build-bench
 
-      - name: Validate Docker Compose configuration
-        run: docker compose -f deploy/docker-compose.yml config --quiet
+      - name: Validate Docker Compose configurations
+        run: |
+          docker compose -f deploy/docker-compose.yml config --quiet
+          docker compose -f deploy/docker-compose.yml -f deploy/docker-compose.bench-verify.yml config --quiet
 
       - name: Upload built plugin dist artifact
         uses: actions/upload-artifact@v4

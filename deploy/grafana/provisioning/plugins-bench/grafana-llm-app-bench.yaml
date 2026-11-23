@@ -1,0 +1,20 @@
+# Provisioning for grafana-llm-app used by deploy/docker-compose.bench-verify.yml.
+# Contains zero secrets; values are supplied via container environment variables.
+apiVersion: 1
+
+apps:
+  - type: grafana-llm-app
+    org_id: 1
+    disabled: false
+    jsonData:
+      provider: custom
+      openAI:
+        url: ${OPENAI_BASE_URL}
+        apiPath: ${OPENAI_API_PATH}
+      models:
+        default: base
+        mapping:
+          base: ${OPENAI_MODEL_BASE}
+          large: ${OPENAI_MODEL_LARGE}
+    secureJsonData:
+      openAIKey: ${OPENAI_API_KEY}

@@ -1,0 +1,36 @@
+# Docker Compose override for verifying the REAL grafana-llm-app plugin container
+# wire protocol end-to-end with cmd/llm-bench and live Prometheus (no external API keys required).
+#
+# Usage:
+#   docker compose -f deploy/docker-compose.yml -f deploy/docker-compose.bench-verify.yml up -d
+#   node scripts/verify-grafana-llm-app.mjs
+#   docker compose -f deploy/docker-compose.yml -f deploy/docker-compose.bench-verify.yml down -v
+services:
+  llm-stub:
+    image: node:22-alpine
+    working_dir: /app
+    command: ["node", "/app/openai-compat-capture-stub.mjs"]
+    environment:
+      STUB_HOST: "0.0.0.0"
+      STUB_PORT: "18080"
+    volumes:
+      - ../scripts/openai-compat-capture-stub.mjs:/app/openai-compat-capture-stub.mjs:ro
+    ports:
+      - "127.0.0.1:18080:18080"
+
+  grafana:
+    environment:
+      GF_INSTALL_PLUGINS: "${GRAFANA_LLM_APP_INSTALL:-grafana-llm-app 1.2.0}"
+      GF_PLUGINS_PUBLIC_KEY_RETRIEVAL_DISABLED: "false"
+      OPENAI_BASE_URL: "http://llm-stub:18080"
+      OPENAI_API_PATH: "/v1"
+      OPENAI_MODEL_BASE: "bench-base-model"
+      OPENAI_MODEL_LARGE: "bench-large-model"
+      OPENAI_API_KEY: "stub-key-local-verification-only"
+    volumes: !override
+      - ../dist:/var/lib/grafana/plugins/yuuki-llmstudio-app:ro
+      - ./grafana/provisioning/datasources:/etc/grafana/provisioning/datasources:ro
+      - ./grafana/provisioning/plugins-bench:/etc/grafana/provisioning/plugins:ro
+    depends_on:
+      - prometheus
+      - llm-stub
