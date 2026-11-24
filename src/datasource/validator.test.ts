@@ -218,6 +218,154 @@ describe('Dry-run validation concurrency and error classification', () => {
     expect(budgeted.map((m) => m.name)).toEqual(['http_requests_total']);
   });
 
+  test('validates multi-query panels in one /api/ds/query request with variable interpolation and per-refId error surfacing', async () => {
+    mockFetch
+      .mockReturnValueOnce(
+        of({
+          data: {
+            results: {
+              A: { frames: [{ data: { values: [[1, 2], [0.1, 0.2]] } }] },
+              B: { frames: [{ data: { values: [[1, 2], [0.5, 0.6]] } }] },
+            },
+          },
+        })
+      )
+      .mockReturnValueOnce(
+        of({
+          data: {
+            results: {
+              A: { frames: [{ data: { values: [[1, 2], [0.1, 0.2]] } }] },
+              B: { status: 400, error: 'parse error: unexpected ")"' },
+            },
+          },
+        })
+      );
+
+    const multiVarIR: DashboardIR = {
+      schemaVersion: '1.1',
+      revision: 1,
+      title: 'Multi-query + Vars',
+      timeRange: { from: 'now-15m', to: 'now' },
+      variables: [
+        {
+          name: 'service',
+          type: 'query',
+          datasourceRef: 'selected_prometheus',
+          labelName: 'service',
+          defaultValue: 'checkout-api',
+        },
+      ],
+      panels: [
+        {
+          id: 'panel-lat',
+          type: 'timeseries',
+          title: 'Latency',
+          datasourceRef: 'selected_prometheus',
+          queries: [
+            { refId: 'A', expr: 'histogram_quantile(0.50, sum by (le) (rate(http_request_duration_seconds_bucket{service="$service"}[5m])))' },
+            { refId: 'B', expr: 'histogram_quantile(0.95, sum by (le) (rate(http_request_duration_seconds_bucket{service="$service"}[5m])))' },
+          ],
+          unit: 's',
+          layout: { row: 0, col: 0, width: 'full' },
+        },
+      ],
+    };
+
+    const spec = normalizeDashboardIR(multiVarIR, { uid: 'prom-main', type: 'prometheus' });
+    const okRes = await runDryRunValidation(spec, { maxConcurrency: 1 });
+    expect(okRes).toHaveLength(1);
+    expect(okRes[0].category).toBe('ok');
+    expect(okRes[0].seriesCount).toBe(2);
+
+    // Verify variable interpolation happened before /api/ds/query was called.
+    const sentQueries = mockFetch.mock.calls[0][0].data.queries as Array<{ refId: string; expr: string }>;
+    expect(sentQueries).toHaveLength(2);
+    expect(sentQueries[0].refId).toBe('A');
+    expect(sentQueries[0].expr).toContain('service="checkout-api"');
+    expect(sentQueries[1].refId).toBe('B');
+    expect(sentQueries[1].expr).toContain('service="checkout-api"');
+
+    // Second run: refId B fails with syntax_error -> surfaced with [B] prefix.
+    const errRes = await runDryRunValidation(spec, { maxConcurrency: 1 });
+    expect(errRes[0].category).toBe('syntax_error');
+    expect(errRes[0].errorText).toContain('[B] parse error');
+  });
+
+  test('enforces permission/timeout precedence over syntax_error, handles metric names containing timeout/permission, and flags missing refId (H-5)', async () => {
+    // Metric names like http_timeout_total or auth_permission_checks_total in 400 parse errors MUST stay syntax_error
+    expect(
+      classifyDatasourceError(400, 'parse error at char 5: unexpected metric http_timeout_total')
+    ).toBe('syntax_error');
+    expect(
+      classifyDatasourceError(400, 'bad_data: parse error near auth_permission_checks_total')
+    ).toBe('syntax_error');
+
+    const twoQueryIR: DashboardIR = {
+      schemaVersion: '1.1',
+      revision: 1,
+      title: 'Error Precedence',
+      timeRange: { from: 'now-15m', to: 'now' },
+      panels: [
+        {
+          id: 'panel-multi',
+          type: 'timeseries',
+          title: 'Multi',
+          datasourceRef: 'selected_prometheus',
+          queries: [
+            { refId: 'A', expr: 'up' },
+            { refId: 'B', expr: 'up' },
+          ],
+          unit: 'short',
+          layout: { row: 0, col: 0, width: 'full' },
+        },
+      ],
+    };
+    const spec = normalizeDashboardIR(twoQueryIR, { uid: 'prom-main', type: 'prometheus' });
+
+    // 1. Non-throwing response with A=403 forbidden + B=400 parse error -> permission_error dominates (never triggers auto-repair)
+    mockFetch.mockReturnValueOnce(
+      of({
+        data: {
+          results: {
+            A: { status: 403, error: 'Forbidden' },
+            B: { status: 400, error: 'parse error: unexpected ")"' },
+          },
+        },
+      })
+    );
+    const res1 = await runDryRunValidation(spec, { maxConcurrency: 1 });
+    expect(res1[0].category).toBe('permission_error');
+
+    // 2. Throwing FetchError with A=400 parse error + B=403 forbidden -> permission_error still dominates
+    mockFetch.mockReturnValueOnce(
+      throwError(() => ({
+        status: 400,
+        data: {
+          results: {
+            A: { status: 400, error: 'parse error: unexpected ")"' },
+            B: { status: 403, error: 'Forbidden' },
+          },
+        },
+      }))
+    );
+    const res2 = await runDryRunValidation(spec, { maxConcurrency: 1 });
+    expect(res2[0].category).toBe('permission_error');
+
+    // 3. Missing refId B in response -> datasource_error instead of silent ok/empty_result
+    mockFetch.mockReturnValueOnce(
+      of({
+        data: {
+          results: {
+            A: { frames: [{ data: { values: [[1], [1]] } }] },
+          },
+        },
+      })
+    );
+    const res3 = await runDryRunValidation(spec, { maxConcurrency: 1 });
+    expect(res3[0].category).toBe('datasource_error');
+    expect(res3[0].errorText).toContain('[B]');
+  });
+
   test('localizes dry-run query timeout messages across en and ja locales', async () => {
     const { DEFAULT_LOCALE, setStudioLocale } = await import('../i18n');
     mockFetch.mockImplementation(() => new Observable(() => {}));

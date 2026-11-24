@@ -170,4 +170,77 @@ func TestApp_AuthContextHealthAndStrictRouting(t *testing.T) {
 	if !cfg.MockBanner || len(cfg.AllowedDatasourceUIDs) != 1 {
 		t.Fatalf("unexpected public config: %+v", cfg)
 	}
+
+	// POST /jobs/import requires authentication and accepts a valid constrained v1.1 draft.
+	senderUnauthImport := &captureSender{}
+	_ = app.CallResource(context.Background(), &backend.CallResourceRequest{
+		Path:   "jobs/import",
+		Method: http.MethodPost,
+		Body:   []byte(`{}`),
+	}, senderUnauthImport)
+	if senderUnauthImport.resp == nil || senderUnauthImport.resp.Status != http.StatusUnauthorized {
+		t.Fatalf("expected 401 for unauthenticated /jobs/import, got %+v", senderUnauthImport.resp)
+	}
+
+	senderImport := &captureSender{}
+	_ = app.CallResource(context.Background(), &backend.CallResourceRequest{
+		PluginContext: authPluginCtx,
+		Path:          "jobs/import",
+		Method:        http.MethodPost,
+		Body: []byte(`{
+			"datasourceUid": "prom-1",
+			"importSource": {"uid": "existing-uid", "resourceVersion": "9"},
+			"draft": {
+				"schemaVersion": "1.1",
+				"revision": 1,
+				"title": "Imported Overview",
+				"timeRange": {"from": "now-15m", "to": "now"},
+				"panels": [{
+					"id": "panel-up",
+					"type": "gauge",
+					"title": "Availability",
+					"datasourceRef": "selected_prometheus",
+					"query": {"expr": "avg(up{service=\"checkout-api\"})"},
+					"unit": "percentunit",
+					"layout": {"row": 0, "col": 0, "width": "full"}
+				}]
+			}
+		}`),
+	}, senderImport)
+	if senderImport.resp == nil || senderImport.resp.Status != http.StatusOK {
+		t.Fatalf("expected 200 for valid /jobs/import, got %+v (body=%s)", senderImport.resp, string(senderImport.resp.Body))
+	}
+	if !strings.Contains(string(senderImport.resp.Body), `"resourceVersion":"9"`) {
+		t.Fatalf("expected importSource.resourceVersion in /jobs/import response, got %s", string(senderImport.resp.Body))
+	}
+
+	// H-2: /jobs/import must strictly decode draft (reject unknown fields & missing required fields like layout.col / query+queries).
+	senderStrictImport := &captureSender{}
+	_ = app.CallResource(context.Background(), &backend.CallResourceRequest{
+		PluginContext: authPluginCtx,
+		Path:          "jobs/import",
+		Method:        http.MethodPost,
+		Body: []byte(`{
+			"datasourceUid": "prom-1",
+			"draft": {
+				"schemaVersion": "1.1",
+				"revision": 1,
+				"title": "Bad Import",
+				"timeRange": {"from": "now-15m", "to": "now"},
+				"panels": [{
+					"id": "panel-up",
+					"type": "gauge",
+					"title": "Availability",
+					"datasourceRef": "selected_prometheus",
+					"query": {"expr": "up"},
+					"queries": [],
+					"unit": "short",
+					"layout": {"row": 0, "col": 0, "width": "full"}
+				}]
+			}
+		}`),
+	}, senderStrictImport)
+	if senderStrictImport.resp == nil || senderStrictImport.resp.Status != http.StatusBadRequest {
+		t.Fatalf("expected 400 on /jobs/import with query + empty queries: [], got %+v", senderStrictImport.resp)
+	}
 }

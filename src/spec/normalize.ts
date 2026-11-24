@@ -1,10 +1,15 @@
 import {
+  ALLOWED_QUERY_REF_IDS,
   AllowedUnit,
   DashboardIR,
+  getPanelQueries,
   PanelType,
+  QueryRefId,
   SELECTED_DATASOURCE_REF,
   ThresholdColor,
   validateIRClient,
+  VariableIR,
+  VariableType,
 } from '../ir/types';
 
 export interface ResolvedDatasource {
@@ -26,13 +31,34 @@ export interface NormalizedThresholdStep {
 }
 
 export interface NormalizedQueryTarget {
-  refId: 'A';
+  refId: QueryRefId;
   expr: string;
   legendFormat?: string;
   datasource: {
     type: string;
     uid: string;
   };
+}
+
+export interface NormalizedVariableSpec {
+  name: string;
+  label: string;
+  type: VariableType;
+  datasource?: {
+    type: string;
+    uid: string;
+  };
+  /**
+   * For query variables: Prometheus label_values(...) query string.
+   * For custom variables: comma-separated options string.
+   */
+  query: string;
+  labelName?: string;
+  metricName?: string;
+  options: string[];
+  defaultValue: string;
+  multi: boolean;
+  includeAll: boolean;
 }
 
 export interface NormalizedPanelSpec {
@@ -45,7 +71,14 @@ export interface NormalizedPanelSpec {
     type: string;
     uid: string;
   };
+  /**
+   * Primary query target (targets[0]), retained for convenience and backward compatibility.
+   */
   target: NormalizedQueryTarget;
+  /**
+   * Ordered list of 1..3 query targets (refIds A, B, C).
+   */
+  targets: NormalizedQueryTarget[];
   unit: AllowedUnit;
   thresholds: NormalizedThresholdStep[];
   gridPos: NormalizedGridPos;
@@ -61,17 +94,26 @@ export interface NormalizedDashboardSpec {
   };
   refresh: '';
   tags: string[];
+  variables: NormalizedVariableSpec[];
   panels: NormalizedPanelSpec[];
 }
 
-const ROW_HEIGHT_TIMESERIES = 8;
-const ROW_HEIGHT_STAT = 6;
+const PANEL_ROW_HEIGHT: Record<PanelType, number> = {
+  timeseries: 8,
+  stat: 6,
+  table: 8,
+  gauge: 6,
+  bargauge: 6,
+  piechart: 8,
+  'state-timeline': 8,
+};
 
 /**
  * Single normalization pipeline shared by both the Scenes preview adapter
  * and the Foundation SDK dashboard export/save adapter.
- * Layout, units, thresholds, datasource reference, and query targets are
- * computed ONCE here to guarantee parity between preview and saved dashboard.
+ * Layout, units, thresholds, datasource references, multi-query targets, and
+ * scoped template variables are computed ONCE here to guarantee parity between
+ * live preview and saved/exported dashboard.
  */
 export function normalizeDashboardIR(
   doc: DashboardIR,
@@ -91,6 +133,10 @@ export function normalizeDashboardIR(
     uid: datasource.uid.trim(),
   };
 
+  const normalizedVariables: NormalizedVariableSpec[] = (doc.variables ?? []).map((v) =>
+    normalizeVariable(v, dsRef)
+  );
+
   const sorted = [...doc.panels].sort((a, b) => {
     if (a.layout.row !== b.layout.row) {
       return a.layout.row - b.layout.row;
@@ -103,7 +149,7 @@ export function normalizeDashboardIR(
 
   const rowHeights = new Map<number, number>();
   for (const p of sorted) {
-    const h = p.type === 'stat' ? ROW_HEIGHT_STAT : ROW_HEIGHT_TIMESERIES;
+    const h = PANEL_ROW_HEIGHT[p.type] ?? 8;
     const prev = rowHeights.get(p.layout.row) ?? 0;
     if (h > prev) {
       rowHeights.set(p.layout.row, h);
@@ -114,7 +160,7 @@ export function normalizeDashboardIR(
   let cursorY = 0;
   for (const r of orderedRows) {
     rowStartY.set(r, cursorY);
-    cursorY += rowHeights.get(r) ?? ROW_HEIGHT_TIMESERIES;
+    cursorY += rowHeights.get(r) ?? 8;
   }
 
   const normalizedPanels: NormalizedPanelSpec[] = sorted.map((p, index) => {
@@ -123,8 +169,16 @@ export function normalizeDashboardIR(
     }
     const w = p.layout.width === 'full' ? 24 : 12;
     const x = p.layout.width === 'full' ? 0 : p.layout.col * 12;
-    const h = rowHeights.get(p.layout.row) ?? ROW_HEIGHT_TIMESERIES;
-    const y = rowStartY.get(p.layout.row) ?? index * ROW_HEIGHT_TIMESERIES;
+    const h = rowHeights.get(p.layout.row) ?? 8;
+    const y = rowStartY.get(p.layout.row) ?? index * 8;
+
+    const rawQueries = getPanelQueries(p);
+    const targets: NormalizedQueryTarget[] = rawQueries.map((q, qi) => ({
+      refId: q.refId || ALLOWED_QUERY_REF_IDS[qi],
+      expr: q.expr.trim(),
+      legendFormat: q.legendFormat,
+      datasource: { ...dsRef },
+    }));
 
     return {
       id: p.id,
@@ -133,12 +187,8 @@ export function normalizeDashboardIR(
       title: p.title,
       description: p.description,
       datasource: { ...dsRef },
-      target: {
-        refId: 'A',
-        expr: p.query.expr.trim(),
-        legendFormat: p.query.legendFormat,
-        datasource: { ...dsRef },
-      },
+      target: targets[0],
+      targets,
       unit: p.unit,
       thresholds: normalizeThresholds(p.thresholds),
       gridPos: { x, y, w, h },
@@ -155,8 +205,105 @@ export function normalizeDashboardIR(
     },
     refresh: '',
     tags: ['llm-dashboard-studio'],
+    variables: normalizedVariables,
     panels: normalizedPanels,
   };
+}
+
+function normalizeVariable(
+  v: VariableIR,
+  dsRef: { type: string; uid: string }
+): NormalizedVariableSpec {
+  const label = (v.label && v.label.trim()) || v.name;
+  const multi = Boolean(v.multi);
+  const includeAll = Boolean(v.includeAll);
+
+  if (v.type === 'query') {
+    if (v.datasourceRef !== SELECTED_DATASOURCE_REF) {
+      throw new Error(`Variable ${v.name} has unauthorized datasourceRef: ${v.datasourceRef}`);
+    }
+    const query = v.metricName
+      ? `label_values(${v.metricName}, ${v.labelName})`
+      : `label_values(${v.labelName})`;
+    return {
+      name: v.name,
+      label,
+      type: 'query',
+      datasource: { ...dsRef },
+      query,
+      labelName: v.labelName,
+      metricName: v.metricName,
+      options: [],
+      defaultValue: (v.defaultValue ?? '').trim(),
+      multi,
+      includeAll,
+    };
+  }
+
+  const options = [...(v.options ?? [])];
+  const defaultValue = (v.defaultValue ?? '').trim() || options[0] || '';
+  return {
+    name: v.name,
+    label,
+    type: 'custom',
+    query: options.join(','),
+    options,
+    defaultValue,
+    multi,
+    includeAll,
+  };
+}
+
+const SINGLE_PASS_VAR_TOKEN =
+  /\$\{([a-zA-Z_][a-zA-Z0-9_]*)(?::(regex|pipe))?\}|\$([a-zA-Z_][a-zA-Z0-9_]*)(?![a-zA-Z0-9_])/g;
+
+function escapePromQLString(value: string): string {
+  return value
+    .replace(/\\/g, '\\\\')
+    .replace(/"/g, '\\"')
+    .replace(/\n/g, '\\n')
+    .replace(/\r/g, '\\r');
+}
+
+/**
+ * Single-pass interpolation of declared dashboard template variable placeholders
+ * ($var, ${var}, ${var:regex}, ${var:pipe}) using their default values for non-Grafana
+ * dry-run validation queries (/api/ds/query).
+ * Escapes values for PromQL double-quoted string literals (and RE2 + PromQL string for :regex)
+ * to prevent secondary interpolation and invalid PromQL escape sequences (e.g. `\.` -> `\\.`).
+ */
+export function interpolatePromQLVariables(
+  expr: string,
+  variables: NormalizedVariableSpec[]
+): string {
+  if (!variables.length || !expr.includes('$')) {
+    return expr;
+  }
+  const valueMap = new Map<string, string>();
+  for (const v of variables) {
+    const val = v.defaultValue || v.options[0] || '';
+    if (val) {
+      valueMap.set(v.name, val);
+    }
+  }
+  if (valueMap.size === 0) {
+    return expr;
+  }
+  return expr.replace(
+    SINGLE_PASS_VAR_TOKEN,
+    (match, bracedName: string | undefined, format: string | undefined, bareName: string | undefined) => {
+      const name = bracedName ?? bareName ?? '';
+      const rawVal = valueMap.get(name);
+      if (rawVal === undefined) {
+        return match;
+      }
+      if (format === 'regex') {
+        const re2Escaped = rawVal.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+        return escapePromQLString(re2Escaped);
+      }
+      return escapePromQLString(rawVal);
+    }
+  );
 }
 
 /**

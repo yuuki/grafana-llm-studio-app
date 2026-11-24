@@ -106,6 +106,7 @@ type JobSnapshot struct {
 	Status             JobStatus           `json:"status"`
 	DatasourceUID      string              `json:"datasourceUid"`
 	Scope              *ir.ScopeFilter     `json:"scope,omitempty"`
+	ImportSource       *ir.ImportSource    `json:"importSource,omitempty"`
 	CurrentIR          *ir.DashboardIR     `json:"currentIR,omitempty"`
 	LastDiff           []ir.DiffEntry      `json:"lastDiff,omitempty"`
 	Summary            string              `json:"summary,omitempty"`
@@ -123,6 +124,7 @@ type jobRecord struct {
 	owner              Owner
 	datasourceUID      string
 	scope              *ir.ScopeFilter
+	importSource       *ir.ImportSource
 	status             JobStatus
 	currentIR          *ir.DashboardIR
 	history            []ir.DashboardIR
@@ -186,6 +188,15 @@ type GenerateInput struct {
 	Catalog       []ir.MetricCatalogItem `json:"catalog"`
 }
 
+// ImportInput is the request payload for creating a constrained draft job from an existing dashboard.
+type ImportInput struct {
+	DatasourceUID string                 `json:"datasourceUid"`
+	Scope         *ir.ScopeFilter        `json:"scope,omitempty"`
+	Draft         ir.DashboardIR         `json:"draft"`
+	ImportSource  *ir.ImportSource       `json:"importSource,omitempty"`
+	Catalog       []ir.MetricCatalogItem `json:"catalog,omitempty"`
+}
+
 // PatchInput is the request payload for applying a partial edit to an existing job.
 type PatchInput struct {
 	BaseRevision  int                    `json:"baseRevision"`
@@ -206,8 +217,9 @@ func (m *Manager) Generate(ctx context.Context, owner Owner, in GenerateInput) (
 	if err := validateOwner(owner); err != nil {
 		return JobSnapshot{}, err
 	}
-	if !m.isDatasourceAllowed(in.DatasourceUID) {
-		return JobSnapshot{}, fmt.Errorf("%w: %q", ErrDatasourceDenied, in.DatasourceUID)
+	dsUID := strings.TrimSpace(in.DatasourceUID)
+	if !m.isDatasourceAllowed(dsUID) {
+		return JobSnapshot{}, fmt.Errorf("%w: %q", ErrDatasourceDenied, dsUID)
 	}
 	if strings.TrimSpace(in.UserIntent) == "" {
 		return JobSnapshot{}, errors.New("userIntent is required")
@@ -222,7 +234,7 @@ func (m *Manager) Generate(ctx context.Context, owner Owner, in GenerateInput) (
 	if len(boundedCatalog) == 0 {
 		return JobSnapshot{
 			Status:            StatusInsufficientMetrics,
-			DatasourceUID:     in.DatasourceUID,
+			DatasourceUID:     dsUID,
 			Scope:             safeScope,
 			MaxRepairAttempts: m.cfg.MaxRepairAttempts,
 			ErrorMessage:      "選択スコープに利用可能なメトリクス候補がありません。メトリクス名を捏造せず中断しました。",
@@ -236,11 +248,7 @@ func (m *Manager) Generate(ctx context.Context, owner Owner, in GenerateInput) (
 	defer cancel()
 
 	knownGauges := make(map[string]bool)
-	for _, item := range boundedCatalog {
-		if strings.EqualFold(item.Type, "gauge") {
-			knownGauges[item.Name] = true
-		}
-	}
+	recordKnownGauges(knownGauges, boundedCatalog)
 
 	m.mu.Lock()
 	m.evictExpiredLocked(now)
@@ -255,7 +263,7 @@ func (m *Manager) Generate(ctx context.Context, owner Owner, in GenerateInput) (
 	rec := &jobRecord{
 		id:                jobID,
 		owner:             owner,
-		datasourceUID:     in.DatasourceUID,
+		datasourceUID:     dsUID,
 		scope:             cloneScope(safeScope),
 		status:            StatusGenerating,
 		maxRepairAttempts: m.cfg.MaxRepairAttempts,
@@ -313,6 +321,87 @@ func (m *Manager) Generate(ctx context.Context, owner Owner, in GenerateInput) (
 	return m.finishJob(jobID, opToken, StatusAwaitingPreview, &doc, nil, "初期ドラフトを生成しました。検証・プレビューを実行して内容を確認してください。", warnings, "", &meta)
 }
 
+// Import validates a constrained DashboardIR converted from an existing Grafana dashboard
+// and registers it as an owner-bound draft job ready for dry-run validation, preview, and patching.
+// Static IR schema + PromQL AST/regex/range safety policies are ALWAYS enforced; catalog membership
+// is additionally enforced whenever a non-empty scoped catalog is supplied.
+func (m *Manager) Import(owner Owner, in ImportInput) (JobSnapshot, error) {
+	if err := validateOwner(owner); err != nil {
+		return JobSnapshot{}, err
+	}
+	dsUID := strings.TrimSpace(in.DatasourceUID)
+	if !m.isDatasourceAllowed(dsUID) {
+		return JobSnapshot{}, fmt.Errorf("%w: %q", ErrDatasourceDenied, dsUID)
+	}
+	if err := promql.ValidateScopeFilter(in.Scope); err != nil {
+		return JobSnapshot{}, err
+	}
+	if err := ir.ValidateImportSource(in.ImportSource); err != nil {
+		return JobSnapshot{}, err
+	}
+	safeScope := prompt.SanitizeScope(in.Scope)
+	boundedCatalog := prompt.BoundCatalog(in.Catalog)
+
+	doc := in.Draft.Clone()
+	if strings.TrimSpace(doc.SchemaVersion) == "" {
+		doc.SchemaVersion = ir.SchemaVersion
+	}
+	if doc.Revision < 1 || doc.Revision > ir.MaxRevision {
+		return JobSnapshot{}, fmt.Errorf("imported IR validation failed: revision must be between 1 and %d, got %d", ir.MaxRevision, doc.Revision)
+	}
+	doc.Revision = 1
+
+	policy := promql.DefaultPolicy()
+	policy.RequireCatalogMatch = len(boundedCatalog) > 0
+
+	warnings, err := promql.ValidateDashboardIR(
+		doc,
+		boundedCatalog,
+		safeScope,
+		ir.ValidateOptions{MaxPanels: m.cfg.MaxPanels},
+		policy,
+	)
+	if err != nil {
+		return JobSnapshot{}, fmt.Errorf("imported IR validation failed: %w", err)
+	}
+
+	knownGauges := make(map[string]bool)
+	recordKnownGauges(knownGauges, boundedCatalog)
+
+	now := m.nowFunc()
+	jobID := newJobID()
+	summary := "既存ダッシュボードを安全な IR ドラフトとしてインポートしました。検証・プレビューを実行して内容を確認してください。"
+	if in.ImportSource != nil && in.ImportSource.UID != "" {
+		summary = fmt.Sprintf("既存ダッシュボード (%s) を安全な IR ドラフトとしてインポートしました。検証・プレビューを実行して内容を確認してください。", in.ImportSource.UID)
+	}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.evictExpiredLocked(now)
+	if err := m.ensureImportCapacityLocked(owner); err != nil {
+		return JobSnapshot{}, err
+	}
+	docCopy := doc.Clone()
+	rec := &jobRecord{
+		id:                jobID,
+		owner:             owner,
+		datasourceUID:     dsUID,
+		scope:             cloneScope(safeScope),
+		importSource:      cloneImportSource(in.ImportSource),
+		status:            StatusAwaitingPreview,
+		currentIR:         &docCopy,
+		summary:           summary,
+		warnings:          warnings,
+		maxRepairAttempts: m.cfg.MaxRepairAttempts,
+		knownGauges:       knownGauges,
+		createdAt:         now,
+		updatedAt:         now,
+		activeOpToken:     1,
+	}
+	m.jobs[jobID] = rec
+	return snapshotLocked(rec), nil
+}
+
 // Patch performs a partial edit anchored to baseRevision without regenerating untouched panels.
 func (m *Manager) Patch(ctx context.Context, owner Owner, jobID string, in PatchInput) (JobSnapshot, error) {
 	if err := validateOwner(owner); err != nil {
@@ -342,6 +431,11 @@ func (m *Manager) Patch(ctx context.Context, owner Owner, jobID string, in Patch
 		m.mu.Unlock()
 		return JobSnapshot{}, fmt.Errorf("%w: request baseRevision=%d != current revision=%d", ir.ErrRevisionConflict, in.BaseRevision, curRev)
 	}
+	targetPanelID := strings.TrimSpace(in.TargetPanelID)
+	if targetPanelID != "" && !panelExists(rec.currentIR.Panels, targetPanelID) {
+		m.mu.Unlock()
+		return JobSnapshot{}, fmt.Errorf("%w: %q", ir.ErrPanelNotFound, targetPanelID)
+	}
 	if rec.activeCancel != nil {
 		m.mu.Unlock()
 		return JobSnapshot{}, ErrOperationInProgress
@@ -351,8 +445,9 @@ func (m *Manager) Patch(ctx context.Context, owner Owner, jobID string, in Patch
 		return JobSnapshot{}, ErrConcurrencyLimited
 	}
 
-	// Preserve known gauge types from earlier revisions so clients cannot spoof gauge->counter.
+	// Preserve and monotonically expand known gauge types so clients cannot spoof gauge->counter across revisions.
 	boundedCatalog = enforceKnownGaugeTypes(boundedCatalog, rec.knownGauges)
+	recordKnownGauges(rec.knownGauges, boundedCatalog)
 
 	opCtx, cancel := context.WithTimeout(ctx, m.cfg.JobDeadline)
 	defer cancel()
@@ -370,7 +465,7 @@ func (m *Manager) Patch(ctx context.Context, owner Owner, jobID string, in Patch
 
 	raw, meta, err := m.client.GeneratePatch(opCtx, llm.PatchRequest{
 		CurrentIR:     currentCopy,
-		TargetPanelID: in.TargetPanelID,
+		TargetPanelID: targetPanelID,
 		EditIntent:    in.EditIntent,
 		Scope:         scopeCopy,
 		Catalog:       boundedCatalog,
@@ -388,7 +483,6 @@ func (m *Manager) Patch(ctx context.Context, owner Owner, jobID string, in Patch
 	}
 
 	// When user explicitly targeted a single panel, enforce that the LLM only updates that panel.
-	targetPanelID := strings.TrimSpace(in.TargetPanelID)
 	if targetPanelID != "" {
 		for _, op := range patch.Operations {
 			if op.Op != "update_panel" || op.PanelID != targetPanelID {
@@ -423,13 +517,16 @@ func (m *Manager) Patch(ctx context.Context, owner Owner, jobID string, in Patch
 
 // Repair attempts a bounded repair ONLY for syntax_error panels matching the current IR revision and queryHash.
 // Repair NEVER runs for empty_result, permission_error, or timeout, NEVER resets the per-job repair budget,
-// and ONLY allows mutating the failing panels' Query field.
+// and ONLY allows mutating the failing panels' Query/Queries field.
 func (m *Manager) Repair(ctx context.Context, owner Owner, jobID string, in RepairInput) (JobSnapshot, error) {
 	if err := validateOwner(owner); err != nil {
 		return JobSnapshot{}, err
 	}
 
 	boundedCatalog := prompt.BoundCatalog(in.Catalog)
+	if len(boundedCatalog) == 0 {
+		return JobSnapshot{}, errors.New("non-empty scoped metric catalog is required for repair")
+	}
 
 	m.mu.Lock()
 	rec, err := m.getOwnedLocked(owner, jobID)
@@ -477,17 +574,26 @@ func (m *Manager) Repair(ctx context.Context, owner Owner, jobID string, in Repa
 		if !exists {
 			continue
 		}
-		if r.QueryHash != ir.QueryHash(p.Query.Expr) {
+		if r.QueryHash != ir.PanelQueryHash(p) {
 			rejectedReasons = append(rejectedReasons, fmt.Sprintf("%s: queryHash mismatch", r.PanelID))
 			continue
 		}
 		switch r.Category {
 		case ir.ValidationSyntaxError:
-			targets = append(targets, prompt.RepairTarget{
+			qs := p.EffectiveQueries()
+			primaryExpr := ""
+			if len(qs) > 0 {
+				primaryExpr = qs[0].Expr
+			}
+			target := prompt.RepairTarget{
 				PanelID:   p.ID,
-				Expr:      p.Query.Expr,
+				Expr:      primaryExpr,
 				ErrorText: r.ErrorText,
-			})
+			}
+			if len(p.Queries) > 0 {
+				target.Queries = append([]ir.QueryIR(nil), p.Queries...)
+			}
+			targets = append(targets, target)
 		case ir.ValidationEmptyResult, ir.ValidationPermissionError, ir.ValidationTimeout:
 			rejectedReasons = append(rejectedReasons, fmt.Sprintf("%s: %s is not eligible for auto-repair", r.PanelID, r.Category))
 		}
@@ -507,6 +613,7 @@ func (m *Manager) Repair(ctx context.Context, owner Owner, jobID string, in Repa
 	}
 
 	boundedCatalog = enforceKnownGaugeTypes(boundedCatalog, rec.knownGauges)
+	recordKnownGauges(rec.knownGauges, boundedCatalog)
 
 	// Consume repair budget BEFORE calling LLM so repeated requests cannot bypass budget.
 	rec.repairAttemptsUsed++
@@ -542,13 +649,13 @@ func (m *Manager) Repair(ctx context.Context, owner Owner, jobID string, in Repa
 		return m.recordEditFailure(jobID, opToken, fmt.Sprintf("修復パッチ JSON 検査に失敗しました: %v", err), &meta)
 	}
 
-	// Enforce that repair ONLY touches Query on the failing syntax_error panels.
+	// Enforce that repair ONLY touches Query or Queries on the failing syntax_error panels.
 	allowedTargetIDs := make(map[string]bool, len(targets))
 	for _, t := range targets {
 		allowedTargetIDs[t.PanelID] = true
 	}
 	for _, op := range patch.Operations {
-		if op.Op != "update_panel" || !allowedTargetIDs[op.PanelID] || op.Panel == nil || op.Panel.Query == nil {
+		if op.Op != "update_panel" || !allowedTargetIDs[op.PanelID] || op.Panel == nil || (op.Panel.Query == nil && op.Panel.Queries == nil) {
 			return m.recordEditFailure(jobID, opToken, fmt.Sprintf("修復パッチが対象外パネル/操作 (%s:%s) を含んでいたため拒否しました", op.Op, op.PanelID), &meta)
 		}
 		p := op.Panel
@@ -867,6 +974,47 @@ func (m *Manager) ensureCapacityLocked(caller Owner) error {
 	return nil
 }
 
+// ensureImportCapacityLocked enforces per-user and global caps for synchronous Import jobs.
+// Unlike Generate, Import does not consume an LLM concurrency slot, so it MUST NEVER evict
+// another user's non-expired job (preventing cross-user job-eviction DoS).
+func (m *Manager) ensureImportCapacityLocked(caller Owner) error {
+	userCount := 0
+	var callerOldestInactive string
+	var callerOldestTime time.Time
+	for id, rec := range m.jobs {
+		if rec.owner == caller {
+			userCount++
+			if rec.activeCancel == nil && (callerOldestInactive == "" || rec.updatedAt.Before(callerOldestTime)) {
+				callerOldestInactive = id
+				callerOldestTime = rec.updatedAt
+			}
+		}
+	}
+	if userCount >= m.cfg.MaxJobsPerUser {
+		if callerOldestInactive == "" {
+			return ErrConcurrencyLimited
+		}
+		delete(m.jobs, callerOldestInactive)
+	}
+	if len(m.jobs) < m.cfg.MaxJobs {
+		return nil
+	}
+	// Global cap reached: only evict another of the caller's own inactive jobs.
+	var callerNextOldest string
+	var callerNextTime time.Time
+	for id, rec := range m.jobs {
+		if rec.owner == caller && rec.activeCancel == nil && (callerNextOldest == "" || rec.updatedAt.Before(callerNextTime)) {
+			callerNextOldest = id
+			callerNextTime = rec.updatedAt
+		}
+	}
+	if callerNextOldest == "" {
+		return ErrConcurrencyLimited
+	}
+	delete(m.jobs, callerNextOldest)
+	return nil
+}
+
 func (m *Manager) releaseSlot(owner Owner) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -887,6 +1035,26 @@ func (m *Manager) isDatasourceAllowed(uid string) bool {
 	}
 	for _, allowed := range m.cfg.AllowedDSUIDs {
 		if strings.TrimSpace(allowed) == uid {
+			return true
+		}
+	}
+	return false
+}
+
+func recordKnownGauges(dst map[string]bool, catalog []ir.MetricCatalogItem) {
+	if dst == nil {
+		return
+	}
+	for _, item := range catalog {
+		if strings.EqualFold(strings.TrimSpace(item.Type), "gauge") && strings.TrimSpace(item.Name) != "" {
+			dst[item.Name] = true
+		}
+	}
+}
+
+func panelExists(panels []ir.PanelIR, panelID string) bool {
+	for _, p := range panels {
+		if p.ID == panelID {
 			return true
 		}
 	}
@@ -922,6 +1090,14 @@ func cloneScope(s *ir.ScopeFilter) *ir.ScopeFilter {
 	return &cp
 }
 
+func cloneImportSource(s *ir.ImportSource) *ir.ImportSource {
+	if s == nil {
+		return nil
+	}
+	cp := *s
+	return &cp
+}
+
 func snapshotLocked(rec *jobRecord) JobSnapshot {
 	var irCopy *ir.DashboardIR
 	if rec.currentIR != nil {
@@ -948,6 +1124,7 @@ func snapshotLocked(rec *jobRecord) JobSnapshot {
 		Status:             rec.status,
 		DatasourceUID:      rec.datasourceUID,
 		Scope:              cloneScope(rec.scope),
+		ImportSource:       cloneImportSource(rec.importSource),
 		CurrentIR:          irCopy,
 		LastDiff:           diffs,
 		Summary:            rec.summary,

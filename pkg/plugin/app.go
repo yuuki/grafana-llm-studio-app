@@ -160,6 +160,7 @@ func (a *App) registerRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/health", a.handleHealth)
 	mux.HandleFunc("/config/public", a.handlePublicConfig)
 	mux.HandleFunc("/jobs/generate", a.handleGenerate)
+	mux.HandleFunc("/jobs/import", a.handleImport)
 	mux.HandleFunc("/jobs/", a.handleJobAction)
 }
 
@@ -239,6 +240,54 @@ func (a *App) handleGenerate(w http.ResponseWriter, r *http.Request) {
 	}
 
 	snap, err := a.jobManager.Generate(r.Context(), owner, in)
+	if err != nil {
+		writeJobError(w, err, snap)
+		return
+	}
+	writeJSON(w, http.StatusOK, snap)
+}
+
+type importHTTPRequest struct {
+	DatasourceUID string                 `json:"datasourceUid"`
+	Scope         *ir.ScopeFilter        `json:"scope,omitempty"`
+	Draft         json.RawMessage        `json:"draft"`
+	ImportSource  *ir.ImportSource       `json:"importSource,omitempty"`
+	Catalog       []ir.MetricCatalogItem `json:"catalog,omitempty"`
+}
+
+func (a *App) handleImport(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	if a.jobManager == nil {
+		writeError(w, http.StatusServiceUnavailable, "LLM client unavailable; check plugin configuration")
+		return
+	}
+	owner, err := callerOwnerFromContext(r.Context())
+	if err != nil {
+		writeError(w, http.StatusUnauthorized, err.Error())
+		return
+	}
+
+	var req importHTTPRequest
+	if err := decodeBoundedJSON(r.Body, &req); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	draft, err := ir.DecodeStrictIR(req.Draft)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, fmt.Sprintf("invalid draft IR: %v", err))
+		return
+	}
+
+	snap, err := a.jobManager.Import(owner, jobs.ImportInput{
+		DatasourceUID: req.DatasourceUID,
+		Scope:         req.Scope,
+		Draft:         draft,
+		ImportSource:  req.ImportSource,
+		Catalog:       req.Catalog,
+	})
 	if err != nil {
 		writeJobError(w, err, snap)
 		return

@@ -444,8 +444,10 @@ func DefaultScenarios() []Scenario {
 
 func anyExprContains(panels []ir.PanelIR, substr string) bool {
 	for _, p := range panels {
-		if strings.Contains(p.Query.Expr, substr) {
-			return true
+		for _, q := range p.EffectiveQueries() {
+			if strings.Contains(q.Expr, substr) {
+				return true
+			}
 		}
 	}
 	return false
@@ -468,8 +470,14 @@ func assertPanelsUnchanged(before, after []ir.PanelIR, ids ...string) error {
 			return fmt.Errorf("untouched panel %q missing", id)
 		}
 		if b.Type != a.Type || b.Title != a.Title || b.Description != a.Description ||
-			b.DatasourceRef != a.DatasourceRef || b.Query != a.Query || b.Unit != a.Unit || b.Layout != a.Layout {
+			b.DatasourceRef != a.DatasourceRef || b.Query != a.Query || b.Unit != a.Unit || b.Layout != a.Layout ||
+			len(b.Queries) != len(a.Queries) {
 			return fmt.Errorf("untouched panel %q was modified unexpectedly", id)
+		}
+		for i := range b.Queries {
+			if b.Queries[i] != a.Queries[i] {
+				return fmt.Errorf("untouched panel %q query[%d] was modified unexpectedly", id, i)
+			}
 		}
 	}
 	return nil

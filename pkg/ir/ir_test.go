@@ -208,3 +208,228 @@ func TestApplyPatch_RevisionConflictPreservesLegendAndRejectsNoOp(t *testing.T) 
 		t.Fatalf("expected 1 diff entry, got %+v", diffs)
 	}
 }
+
+func TestIRv11_FixturePanelsMultiQueryVariablesAndPatches(t *testing.T) {
+	v11Bytes, err := os.ReadFile(filepath.Join("..", "..", "schemas", "samples", "valid-v11-dashboard.json"))
+	if err != nil {
+		t.Fatalf("read v1.1 fixture: %v", err)
+	}
+	doc, err := ir.DecodeStrictIR(v11Bytes)
+	if err != nil {
+		t.Fatalf("DecodeStrictIR(v1.1) failed: %v", err)
+	}
+	if err := ir.ValidateIR(doc, ir.ValidateOptions{MaxPanels: 6}); err != nil {
+		t.Fatalf("ValidateIR(v1.1) failed: %v", err)
+	}
+	if len(doc.Variables) != 2 || len(doc.Panels) != 6 || len(doc.Panels[0].Queries) != 3 {
+		t.Fatalf("unexpected v1.1 fixture structure: vars=%d panels=%d q0=%d", len(doc.Variables), len(doc.Panels), len(doc.Panels[0].Queries))
+	}
+
+	t.Run("rejects both query and queries on same panel", func(t *testing.T) {
+		raw := []byte(`{"schemaVersion":"1.1","revision":1,"title":"Dup","timeRange":{"from":"now-15m","to":"now"},"panels":[{"id":"panel-a","type":"timeseries","title":"A","datasourceRef":"selected_prometheus","query":{"expr":"up"},"queries":[{"expr":"up"}],"unit":"short","layout":{"row":0,"col":0,"width":"full"}}]}`)
+		if _, err := ir.DecodeStrictIR(raw); err == nil {
+			t.Fatal("expected DecodeStrictIR to reject panel having both query and queries")
+		}
+	})
+
+	t.Run("rejects >3 queries or duplicate refIds", func(t *testing.T) {
+		bad := doc.Clone()
+		bad.Panels[0].Queries = append(bad.Panels[0].Queries, ir.QueryIR{Expr: "up"})
+		if err := ir.ValidateIR(bad, ir.ValidateOptions{MaxPanels: 6}); err == nil {
+			t.Fatal("expected 4 queries per panel to be rejected")
+		}
+
+		dupRef := doc.Clone()
+		dupRef.Panels[0].Queries[1].RefID = "A"
+		if err := ir.ValidateIR(dupRef, ir.ValidateOptions{MaxPanels: 6}); err == nil {
+			t.Fatal("expected duplicate refId to be rejected")
+		}
+	})
+
+	t.Run("rejects reserved variable names, >4 vars, and invalid custom defaultValue", func(t *testing.T) {
+		badVar := doc.Clone()
+		badVar.Variables = append(badVar.Variables, ir.VariableIR{
+			Name:          "__from",
+			Type:          "query",
+			DatasourceRef: ir.SelectedDatasourceRef,
+			LabelName:     "service",
+		})
+		if err := ir.ValidateIR(badVar, ir.ValidateOptions{MaxPanels: 6}); err == nil {
+			t.Fatal("expected reserved variable name __from to be rejected")
+		}
+
+		badDefault := doc.Clone()
+		badDefault.Variables[1].DefaultValue = "not-in-options"
+		if err := ir.ValidateIR(badDefault, ir.ValidateOptions{MaxPanels: 6}); err == nil {
+			t.Fatal("expected custom variable defaultValue outside options to be rejected")
+		}
+
+		tooManyVars := doc.Clone()
+		for i := 0; i < 4; i++ {
+			tooManyVars.Variables = append(tooManyVars.Variables, ir.VariableIR{
+				Name:    "extra_" + string(rune('a'+i)),
+				Type:    "custom",
+				Options: []string{"x"},
+			})
+		}
+		if err := ir.ValidateIR(tooManyVars, ir.ValidateOptions{MaxPanels: 6}); err == nil {
+			t.Fatal("expected >4 variables to be rejected")
+		}
+	})
+
+	t.Run("PanelQueryHash matches QueryHash for single query and tracks multi-query changes", func(t *testing.T) {
+		single := doc.Panels[1]
+		if got, want := ir.PanelQueryHash(single), ir.QueryHash(single.Query.Expr); got != want {
+			t.Fatalf("single-query PanelQueryHash=%q != QueryHash=%q", got, want)
+		}
+		multi := doc.Panels[0]
+		h1 := ir.PanelQueryHash(multi)
+		multi2 := multi
+		multi2.Queries = append([]ir.QueryIR(nil), multi.Queries...)
+		multi2.Queries[2].Expr = `histogram_quantile(0.999, sum by (le) (rate(http_request_duration_seconds_bucket{service="$service"}[5m])))`
+		if h2 := ir.PanelQueryHash(multi2); h1 == h2 {
+			t.Fatal("expected PanelQueryHash to change when query C changes")
+		}
+	})
+
+	t.Run("patch supports add/update/remove variable and multi-query update", func(t *testing.T) {
+		lbl := "Namespace"
+		dsRef := ir.SelectedDatasourceRef
+		lblName := "namespace"
+		defVal := "prod"
+		newQueries := []ir.QueryIR{
+			{RefID: "A", Expr: `sum(rate(http_requests_total{service="$service",status=~"5.."}[5m]))`, LegendFormat: "5xx"},
+			{RefID: "B", Expr: `sum(rate(http_requests_total{service="$service",status=~"4.."}[5m]))`, LegendFormat: "4xx"},
+		}
+		patch := ir.DashboardPatch{
+			SchemaVersion: ir.SchemaVersion,
+			BaseRevision:  doc.Revision,
+			Summary:       "Add namespace variable and expand error panel to 2 queries",
+			Operations: []ir.PatchOperation{
+				{
+					Op: "add_variable",
+					Variable: &ir.VariableUpdate{
+						Name:          "namespace",
+						Label:         &lbl,
+						Type:          "query",
+						DatasourceRef: &dsRef,
+						LabelName:     &lblName,
+						DefaultValue:  &defVal,
+					},
+				},
+				{
+					Op:      "update_panel",
+					PanelID: "panel-error-gauge",
+					Panel:   &ir.PanelUpdate{Queries: &newQueries},
+				},
+			},
+		}
+		next, diffs, err := ir.ApplyPatch(doc, patch, ir.ValidateOptions{MaxPanels: 6})
+		if err != nil {
+			t.Fatalf("ApplyPatch v1.1 failed: %v", err)
+		}
+		if len(next.Variables) != 3 || next.Variables[2].Name != "namespace" {
+			t.Fatalf("expected 3 variables with namespace added, got %+v", next.Variables)
+		}
+		if len(next.Panels[1].Queries) != 2 || next.Panels[1].Query != (ir.QueryIR{}) {
+			t.Fatalf("expected panel-error-gauge switched to 2 queries, got %+v", next.Panels[1])
+		}
+		if len(diffs) != 2 {
+			t.Fatalf("expected 2 diff entries, got %+v", diffs)
+		}
+
+		// Update and then remove the variable.
+		newDef := "staging"
+		updNext, _, err := ir.ApplyPatch(next, ir.DashboardPatch{
+			SchemaVersion: ir.SchemaVersion,
+			BaseRevision:  next.Revision,
+			Summary:       "Update namespace default and remove status_class",
+			Operations: []ir.PatchOperation{
+				{Op: "update_variable", VariableName: "namespace", Variable: &ir.VariableUpdate{DefaultValue: &newDef}},
+				{Op: "remove_variable", VariableName: "status_class"},
+			},
+		}, ir.ValidateOptions{MaxPanels: 6})
+		if err != nil {
+			t.Fatalf("update/remove variable patch failed: %v", err)
+		}
+		if len(updNext.Variables) != 2 || updNext.Variables[1].DefaultValue != "staging" {
+			t.Fatalf("unexpected variables after update/remove: %+v", updNext.Variables)
+		}
+	})
+
+	t.Run("adversarial IR/Patch checks: empty queries, variable injection, legend var tokens, strict patch required fields, type switch cleanup", func(t *testing.T) {
+		// M-1: query + empty queries: [] must be rejected.
+		bothWithEmpty := []byte(`{"schemaVersion":"1.1","revision":1,"title":"Bad","timeRange":{"from":"now-15m","to":"now"},"panels":[{"id":"panel-a","type":"timeseries","title":"A","datasourceRef":"selected_prometheus","query":{"expr":"up"},"queries":[],"unit":"short","layout":{"row":0,"col":0,"width":"full"}}]}`)
+		if _, err := ir.DecodeStrictIR(bothWithEmpty); err == nil {
+			t.Fatal("expected DecodeStrictIR to reject query + empty queries: []")
+		}
+
+		// C-3 & M-6: Variable defaultValue/options with quotes, commas, or $var tokens rejected; query var requires non-empty defaultValue.
+		badQuote := doc.Clone()
+		badQuote.Variables[0].DefaultValue = `checkout-api",status=~".*`
+		if err := ir.ValidateIR(badQuote, ir.ValidateOptions{MaxPanels: 6}); err == nil {
+			t.Fatal("expected quote-injected variable defaultValue to be rejected")
+		}
+
+		emptyQueryDef := doc.Clone()
+		emptyQueryDef.Variables[0].DefaultValue = ""
+		if err := ir.ValidateIR(emptyQueryDef, ir.ValidateOptions{MaxPanels: 6}); err == nil {
+			t.Fatal("expected query variable with empty defaultValue to be rejected")
+		}
+
+		commaOpt := doc.Clone()
+		commaOpt.Variables[1].Options = []string{"5..,evil"}
+		commaOpt.Variables[1].DefaultValue = "5..,evil"
+		if err := ir.ValidateIR(commaOpt, ir.ValidateOptions{MaxPanels: 6}); err == nil {
+			t.Fatal("expected custom variable option containing comma to be rejected")
+		}
+
+		// L-3: Any __* variable name rejected.
+		doubleUnder := doc.Clone()
+		doubleUnder.Variables[0].Name = "__custom_secret"
+		if err := ir.ValidateIR(doubleUnder, ir.ValidateOptions{MaxPanels: 6}); err == nil {
+			t.Fatal("expected __-prefixed variable name to be rejected")
+		}
+
+		// H-1: legendFormat with template variable token rejected.
+		badLegend := doc.Clone()
+		badLegend.Panels[1].Query.LegendFormat = "{{status}} $service"
+		if err := ir.ValidateIR(badLegend, ir.ValidateOptions{MaxPanels: 6}); err == nil {
+			t.Fatal("expected legendFormat containing $var token to be rejected")
+		}
+
+		// H-4: DecodeStrictPatch rejects missing baseRevision or missing layout.col or missing threshold.value.
+		if _, err := ir.DecodeStrictPatch([]byte(`{"schemaVersion":"1.1","summary":"no baseRev","operations":[{"op":"remove_variable","variableName":"service"}]}`)); err == nil {
+			t.Fatal("expected DecodeStrictPatch to reject missing baseRevision")
+		}
+		if _, err := ir.DecodeStrictPatch([]byte(`{"schemaVersion":"1.1","baseRevision":1,"summary":"missing th val","operations":[{"op":"update_panel","panelId":"panel-error-gauge","panel":{"thresholds":[{"color":"red"}]}}]}`)); err == nil {
+			t.Fatal("expected DecodeStrictPatch to reject threshold missing value")
+		}
+
+		// M-3: update_variable switching type query -> custom clears datasourceRef/labelName/metricName cleanly.
+		newOpts := []string{"checkout-api"}
+		newDef := "checkout-api"
+		switched, _, err := ir.ApplyPatch(doc, ir.DashboardPatch{
+			SchemaVersion: ir.SchemaVersion,
+			BaseRevision:  doc.Revision,
+			Summary:       "Switch service variable from query to custom",
+			Operations: []ir.PatchOperation{
+				{
+					Op:           "update_variable",
+					VariableName: "service",
+					Variable: &ir.VariableUpdate{
+						Type:         "custom",
+						Options:      &newOpts,
+						DefaultValue: &newDef,
+					},
+				},
+			},
+		}, ir.ValidateOptions{MaxPanels: 6})
+		if err != nil {
+			t.Fatalf("expected type-switching update_variable to succeed after clearing stale query fields, got %v", err)
+		}
+		if switched.Variables[0].Type != "custom" || switched.Variables[0].DatasourceRef != "" || switched.Variables[0].LabelName != "" {
+			t.Fatalf("stale query fields not cleared on type switch: %+v", switched.Variables[0])
+		}
+	})
+}

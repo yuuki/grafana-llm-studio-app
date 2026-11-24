@@ -1,5 +1,7 @@
 import { BackendSrvRequest, getBackendSrv } from '@grafana/runtime';
 import {
+  DashboardIR,
+  ImportSource,
   JobSnapshot,
   MetricCatalogItem,
   PanelValidationResult,
@@ -14,6 +16,14 @@ export interface GenerateJobRequest {
   scope?: ScopeFilter;
   userIntent: string;
   catalog: MetricCatalogItem[];
+}
+
+export interface ImportJobRequest {
+  datasourceUid: string;
+  scope?: ScopeFilter;
+  draft: DashboardIR;
+  importSource?: ImportSource;
+  catalog?: MetricCatalogItem[];
 }
 
 export interface PatchJobRequest {
@@ -38,14 +48,20 @@ export function extractApiError(err: unknown): string {
   }
   if (typeof err === 'object' && err !== null) {
     const e = err as {
-      data?: { error?: string; message?: string };
-      message?: string;
-      statusText?: string;
+      data?: { error?: unknown; message?: unknown };
+      message?: unknown;
+      statusText?: unknown;
       status?: number;
     };
-    const msg = e.data?.error || e.data?.message || e.message || e.statusText;
+    const candidates = [e.data?.error, e.data?.message, e.message, e.statusText];
+    const msg = candidates.find(
+      (c): c is string => typeof c === 'string' && c.trim().length > 0
+    );
     if (msg) {
-      return e.status ? `HTTP ${e.status}: ${msg}` : String(msg);
+      return e.status ? `HTTP ${e.status}: ${msg}` : msg;
+    }
+    if (typeof e.status === 'number') {
+      return `HTTP ${e.status}`;
     }
   }
   return String(err);
@@ -121,6 +137,21 @@ export async function generateDraft(
   return fetchWithAbort<JobSnapshot>(
     {
       url: `${PLUGIN_RESOURCE_BASE}/jobs/generate`,
+      method: 'POST',
+      data: req,
+      showErrorAlert: false,
+    },
+    signal
+  );
+}
+
+export async function importDraft(
+  req: ImportJobRequest,
+  signal?: AbortSignal
+): Promise<JobSnapshot> {
+  return fetchWithAbort<JobSnapshot>(
+    {
+      url: `${PLUGIN_RESOURCE_BASE}/jobs/import`,
       method: 'POST',
       data: req,
       showErrorAlert: false,

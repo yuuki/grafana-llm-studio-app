@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://github.com/yuuki/grafana-llm-studio-app/schemas/dashboard-ir.schema.json",
   "title": "DashboardIR",
-  "description": "Restricted intermediate representation (IR) for LLM-generated Grafana dashboards in LLM Dashboard Studio MVP.",
+  "description": "Restricted intermediate representation (IR v1.1, backward-compatible with v1.0) for LLM-generated and safely imported Grafana dashboards.",
   "type": "object",
   "additionalProperties": false,
   "required": [
@@ -15,8 +15,8 @@
   "properties": {
     "schemaVersion": {
       "type": "string",
-      "enum": ["1.0"],
-      "description": "Fixed IR schema version."
+      "enum": ["1.0", "1.1"],
+      "description": "IR schema version. New drafts use 1.1; 1.0 remains accepted for backward compatibility."
     },
     "revision": {
       "type": "integer",
@@ -52,11 +52,77 @@
         }
       }
     },
+    "variables": {
+      "type": "array",
+      "maxItems": 4,
+      "description": "Optional scoped dashboard template variables (max 4). Referenced in PromQL label matchers as $name or ${name:regex}.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["name", "type"],
+        "properties": {
+          "name": {
+            "type": "string",
+            "pattern": "^[a-zA-Z_][a-zA-Z0-9_]{0,31}$",
+            "description": "Template variable identifier referenced via $name."
+          },
+          "label": {
+            "type": "string",
+            "maxLength": 64,
+            "description": "Optional display label in the dashboard variable bar."
+          },
+          "type": {
+            "type": "string",
+            "enum": ["query", "custom"],
+            "description": "Restricted variable kind: Prometheus label_values query or bounded custom option list."
+          },
+          "datasourceRef": {
+            "type": "string",
+            "enum": ["selected_prometheus"],
+            "description": "Required for type=query variables; bound to the admin-allowlisted Prometheus datasource."
+          },
+          "labelName": {
+            "type": "string",
+            "pattern": "^[a-zA-Z_][a-zA-Z0-9_]{0,63}$",
+            "description": "Prometheus label name queried by label_values(...) when type=query."
+          },
+          "metricName": {
+            "type": "string",
+            "pattern": "^[a-zA-Z_:][a-zA-Z0-9_:]{0,127}$",
+            "description": "Optional catalog metric name scoping label_values(metricName, labelName) when type=query."
+          },
+          "options": {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": 20,
+            "description": "Bounded static values when type=custom.",
+            "items": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 64
+            }
+          },
+          "defaultValue": {
+            "type": "string",
+            "maxLength": 128,
+            "description": "Initial selected value used for preview and dry-run validation."
+          },
+          "multi": {
+            "type": "boolean",
+            "description": "Whether multiple values can be selected (requires =~ matcher in PromQL)."
+          },
+          "includeAll": {
+            "type": "boolean",
+            "description": "Whether an All option is offered (requires =~ matcher; disallowed on required scope filter variable)."
+          }
+        }
+      }
+    },
     "panels": {
       "type": "array",
       "minItems": 1,
       "maxItems": 6,
-      "description": "MVP allows 1 to 6 panels.",
+      "description": "Allows 1 to 6 panels.",
       "items": {
         "type": "object",
         "additionalProperties": false,
@@ -65,7 +131,6 @@
           "type",
           "title",
           "datasourceRef",
-          "query",
           "unit",
           "layout"
         ],
@@ -77,8 +142,16 @@
           },
           "type": {
             "type": "string",
-            "enum": ["timeseries", "stat"],
-            "description": "MVP supports timeseries and stat panel types only."
+            "enum": [
+              "timeseries",
+              "stat",
+              "table",
+              "gauge",
+              "bargauge",
+              "piechart",
+              "state-timeline"
+            ],
+            "description": "Allowlisted Grafana visualization panel type."
           },
           "title": {
             "type": "string",
@@ -98,16 +171,50 @@
             "type": "object",
             "additionalProperties": false,
             "required": ["expr"],
+            "description": "Single PromQL query (v1.0 compatible). Mutually exclusive with queries.",
             "properties": {
+              "refId": {
+                "type": "string",
+                "enum": ["A", "B", "C"],
+                "description": "Optional deterministic query refId (defaults to A)."
+              },
               "expr": {
                 "type": "string",
                 "minLength": 1,
                 "maxLength": 512,
-                "description": "Single PromQL expression validated deterministically against syntax, policy, and scoped catalog."
+                "description": "PromQL expression validated deterministically against syntax, policy, variables, and scoped catalog."
               },
               "legendFormat": {
                 "type": "string",
                 "maxLength": 80
+              }
+            }
+          },
+          "queries": {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": 3,
+            "description": "Bounded multi-query list (1 to 3 PromQL queries per panel). Mutually exclusive with query.",
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["expr"],
+              "properties": {
+                "refId": {
+                  "type": "string",
+                  "enum": ["A", "B", "C"],
+                  "description": "Optional unique query refId (defaults to A, B, C in order)."
+                },
+                "expr": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 512,
+                  "description": "PromQL expression validated deterministically against syntax, policy, variables, and scoped catalog."
+                },
+                "legendFormat": {
+                  "type": "string",
+                  "maxLength": 80
+                }
               }
             }
           },

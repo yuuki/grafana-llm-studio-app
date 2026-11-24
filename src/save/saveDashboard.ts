@@ -19,11 +19,33 @@ export interface SaveDashboardRequest {
   uidOverride?: string;
 }
 
+export interface UpdateDashboardRequest {
+  spec: NormalizedDashboardSpec;
+  previewedRevision: number;
+  targetUid: string;
+  /**
+   * Required Kubernetes resourceVersion captured when importing the existing dashboard.
+   * Ensures optimistic-concurrency revision checking; missing resourceVersion is rejected.
+   */
+  expectedResourceVersion: string;
+  folderUid: string;
+  /**
+   * Non-folder metadata.annotations captured at import time so PUT does not strip Grafana metadata.
+   */
+  preservedAnnotations?: Record<string, string>;
+  /**
+   * metadata.labels captured at import time so PUT does not strip Grafana labels.
+   */
+  preservedLabels?: Record<string, string>;
+}
+
 export interface SaveDashboardResult {
   uid: string;
   url: string;
   folderUid: string;
   revision: number;
+  mode?: 'created' | 'updated';
+  resourceVersion?: string;
 }
 
 export class SaveDashboardError extends Error {
@@ -31,6 +53,8 @@ export class SaveDashboardError extends Error {
     message: string,
     public readonly code:
       | 'REVISION_MISMATCH'
+      | 'MISSING_RESOURCE_VERSION'
+      | 'REVISION_CONFLICT'
       | 'IN_FLIGHT'
       | 'PERMISSION_DENIED'
       | 'UID_CONFLICT'
@@ -83,7 +107,7 @@ interface FolderV1Beta1ListResponse {
  * Lists folders visible to the logged-in user via Grafana's Folder API.
  * Uses `/api/folders?permission=Edit` (active in Grafana 12.4.x and 13.x) for write-permission filtering,
  * and falls back to `/apis/folder.grafana.app/v1beta1/namespaces/{namespace}/folders` if legacy `/api`
- * endpoints are disabled (404/410). Save authorization is always enforced server-side on POST.
+ * endpoints are disabled (404/410). Save authorization is always enforced server-side on POST/PUT.
  * Uses showErrorAlert: false so Viewer accounts without folders:read do not see spurious error toasts (M-10).
  */
 export async function listWritableFolders(): Promise<GrafanaFolderOption[]> {
@@ -138,15 +162,16 @@ export async function listWritableFolders(): Promise<GrafanaFolderOption[]> {
 }
 
 /**
- * Create-only Dashboard saver compatible with Grafana OSS 12.4.15 and 13.3.1 Kubernetes-style Dashboard API:
- *   POST /apis/dashboard.grafana.app/v1beta1/namespaces/{namespace}/dashboards
- * (In Grafana 13.x, `v1beta1` is a schema-identical alias of `v1`.)
+ * Dashboard saver compatible with Grafana OSS 12.4.15 and 13.3.1 Kubernetes-style Dashboard API:
+ * - Default `createNewDashboard`: Create-only `POST /apis/dashboard.grafana.app/v1beta1/namespaces/{namespace}/dashboards`
+ *   (on 409 Conflict, NEVER switches to PUT/overwrite).
+ * - Opt-in `updateExistingDashboard`: Explicit revision-checked `PUT .../dashboards/{uid}` requiring
+ *   `metadata.resourceVersion` captured at import time (on 409/412 conflict, fails safely and NEVER force-overwrites).
  *
  * Guarantees:
  * - Uses the logged-in user's Grafana session (never an app backend service account).
  * - Verifies saved revision === previewedRevision before sending.
  * - Guards against double-clicks via per-instance in-flight lock.
- * - Create-only POST: on 409 Conflict (UID collision), NEVER switches to PUT/overwrite.
  * - Prepends config.appSubUrl for subpath Grafana deployments (M-10).
  */
 export class DashboardSaver {
@@ -190,7 +215,7 @@ export class DashboardSaver {
       const url = `/apis/dashboard.grafana.app/v1beta1/namespaces/${encodeURIComponent(namespace)}/dashboards`;
 
       const response = await lastValueFrom(
-        getBackendSrv().fetch<{ metadata?: { name?: string } }>({
+        getBackendSrv().fetch<{ metadata?: { name?: string; resourceVersion?: string } }>({
           url,
           method: 'POST',
           showErrorAlert: false,
@@ -208,6 +233,8 @@ export class DashboardSaver {
         url: `${subUrl}/d/${encodeURIComponent(savedUid)}`,
         folderUid: req.folderUid,
         revision: req.spec.revision,
+        mode: 'created',
+        resourceVersion: response.data?.metadata?.resourceVersion,
       };
     } catch (err: unknown) {
       const status = (err as { status?: number })?.status;
@@ -230,6 +257,123 @@ export class DashboardSaver {
       }
       throw new SaveDashboardError(
         t('save.errors.apiError', { status: status ?? 'unknown', message: msg }),
+        'API_ERROR'
+      );
+    } finally {
+      this.inFlight = false;
+    }
+  }
+
+  /**
+   * Opt-in revision-checked update of an imported Grafana dashboard via Kubernetes-style PUT.
+   * Requires both `targetUid` and `expectedResourceVersion` so concurrent external edits
+   * fail safely with HTTP 409/412 (`REVISION_CONFLICT`) rather than silently overwriting.
+   */
+  async updateExistingDashboard(req: UpdateDashboardRequest): Promise<SaveDashboardResult> {
+    if (this.inFlight) {
+      throw new SaveDashboardError(t('save.errors.inFlight'), 'IN_FLIGHT');
+    }
+    if (req.spec.revision !== req.previewedRevision) {
+      throw new SaveDashboardError(
+        t('save.errors.revisionMismatch', {
+          targetRevision: req.spec.revision,
+          previewedRevision: req.previewedRevision,
+        }),
+        'REVISION_MISMATCH'
+      );
+    }
+    const targetUid = req.targetUid.trim();
+    const expectedRV = req.expectedResourceVersion.trim();
+    if (!targetUid || !expectedRV) {
+      throw new SaveDashboardError(
+        t('save.errors.missingResourceVersion'),
+        'MISSING_RESOURCE_VERSION'
+      );
+    }
+
+    this.inFlight = true;
+    try {
+      const foundationSpec = buildFoundationDashboard(req.spec, { uid: targetUid });
+      const namespace = getOrgNamespace();
+
+      const annotations: Record<string, string> = {};
+      if (req.preservedAnnotations) {
+        for (const [k, v] of Object.entries(req.preservedAnnotations)) {
+          if (k !== 'grafana.app/folder' && typeof v === 'string') {
+            annotations[k] = v;
+          }
+        }
+      }
+      if (req.folderUid && req.folderUid.trim() !== '') {
+        annotations['grafana.app/folder'] = req.folderUid.trim();
+      }
+
+      const metadata: {
+        name: string;
+        resourceVersion: string;
+        annotations: Record<string, string>;
+        labels?: Record<string, string>;
+      } = {
+        name: targetUid,
+        resourceVersion: expectedRV,
+        annotations,
+      };
+      if (req.preservedLabels && Object.keys(req.preservedLabels).length > 0) {
+        metadata.labels = { ...req.preservedLabels };
+      }
+
+      const payload = {
+        apiVersion: 'dashboard.grafana.app/v1beta1',
+        kind: 'Dashboard',
+        metadata,
+        spec: foundationSpec,
+      };
+
+      const url = `/apis/dashboard.grafana.app/v1beta1/namespaces/${encodeURIComponent(namespace)}/dashboards/${encodeURIComponent(targetUid)}`;
+
+      const response = await lastValueFrom(
+        getBackendSrv().fetch<{ metadata?: { name?: string; resourceVersion?: string } }>({
+          url,
+          method: 'PUT',
+          showErrorAlert: false,
+          headers: {
+            'Content-Type': 'application/json',
+          },
+          data: payload,
+        })
+      );
+
+      const savedUid = response.data?.metadata?.name || targetUid;
+      const subUrl = (config.appSubUrl ?? '').replace(/\/+$/, '');
+      return {
+        uid: savedUid,
+        url: `${subUrl}/d/${encodeURIComponent(savedUid)}`,
+        folderUid: req.folderUid,
+        revision: req.spec.revision,
+        mode: 'updated',
+        resourceVersion: response.data?.metadata?.resourceVersion,
+      };
+    } catch (err: unknown) {
+      const status = (err as { status?: number })?.status;
+      const msg =
+        (err as { data?: { message?: string }; message?: string })?.data?.message ||
+        (err as { message?: string })?.message ||
+        t('save.errors.updateDefaultMessage');
+
+      if (status === 401 || status === 403) {
+        throw new SaveDashboardError(
+          t('save.errors.updatePermissionDenied', { status, message: msg }),
+          'PERMISSION_DENIED'
+        );
+      }
+      if (status === 409 || status === 412) {
+        throw new SaveDashboardError(
+          t('save.errors.revisionConflict', { status, message: msg }),
+          'REVISION_CONFLICT'
+        );
+      }
+      throw new SaveDashboardError(
+        t('save.errors.updateApiError', { status: status ?? 'unknown', message: msg }),
         'API_ERROR'
       );
     } finally {

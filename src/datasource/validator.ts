@@ -1,23 +1,28 @@
 import { getBackendSrv } from '@grafana/runtime';
 import { t } from '../i18n';
 import {
-  computeQueryHash,
+  computePanelQueryHash,
   PanelValidationResult,
   ValidationCategory,
 } from '../ir/types';
-import { NormalizedDashboardSpec, NormalizedPanelSpec } from '../spec/normalize';
+import {
+  interpolatePromQLVariables,
+  NormalizedDashboardSpec,
+  NormalizedPanelSpec,
+  NormalizedVariableSpec,
+} from '../spec/normalize';
 
 export interface DryRunOptions {
   /**
-   * Max concurrent datasource queries (MVP default: 2).
+   * Max concurrent datasource queries (default: 2).
    */
   maxConcurrency?: number;
   /**
-   * Per-query timeout in milliseconds (MVP default: 10,000ms).
+   * Per-query timeout in milliseconds (default: 10,000ms).
    */
   timeoutMs?: number;
   /**
-   * Validation window start (MVP default: now-5m).
+   * Validation window start (default: now-5m).
    * Note: Narrow window + maxDataPoints=10 is a safeguard against accidental UI load,
    * NOT a performance guarantee or DoS boundary (enforce limits on Prometheus/VM too).
    */
@@ -46,9 +51,20 @@ interface GrafanaDSQueryResponse {
   >;
 }
 
+const CATEGORY_SEVERITY: Record<ValidationCategory, number> = {
+  ok: 0,
+  empty_result: 1,
+  syntax_error: 2,
+  datasource_error: 3,
+  timeout: 4,
+  permission_error: 5,
+};
+
 /**
  * Executes real bounded dry-run validation queries from the Frontend using the
  * logged-in user's Grafana session (/api/ds/query).
+ * - Supports single-query and bounded multi-query panels (1..3 queries per panel).
+ * - Interpolates declared template variable defaults so $var queries validate cleanly.
  * - Enforces concurrency cap (default 2) and per-query timeout (default 10s).
  * - Properly extracts inner /api/ds/query FetchError.data.results[refId] errors (H-10).
  * - Propagates external AbortSignal cancellation without misclassifying as timeout (M-12).
@@ -82,6 +98,7 @@ export async function runDryRunValidation(
       const idx = cursor++;
       results[idx] = await validateSinglePanel(
         targetPanels[idx],
+        spec.variables,
         from,
         to,
         maxDataPoints,
@@ -101,6 +118,7 @@ export async function runDryRunValidation(
 
 async function validateSinglePanel(
   panel: NormalizedPanelSpec,
+  variables: NormalizedVariableSpec[],
   from: string,
   to: string,
   maxDataPoints: number,
@@ -111,7 +129,7 @@ async function validateSinglePanel(
     throw new DOMException('Aborted', 'AbortError');
   }
 
-  const queryHash = await computeQueryHash(panel.target.expr);
+  const queryHash = await computePanelQueryHash(panel.targets);
   const started = Date.now();
 
   let timedOut = false;
@@ -126,6 +144,8 @@ async function validateSinglePanel(
     controller.abort(outerSignal?.reason);
   };
   outerSignal?.addEventListener('abort', onOuterAbort, { once: true });
+
+  const refIds = panel.targets.map((t) => t.refId);
 
   try {
     const responseData = await new Promise<GrafanaDSQueryResponse>((resolve, reject) => {
@@ -162,18 +182,16 @@ async function validateSinglePanel(
           data: {
             from,
             to,
-            queries: [
-              {
-                refId: panel.target.refId,
-                datasource: panel.datasource,
-                expr: panel.target.expr,
-                legendFormat: panel.target.legendFormat,
-                maxDataPoints,
-                intervalMs: 30000,
-                range: true,
-                instant: false,
-              },
-            ],
+            queries: panel.targets.map((target) => ({
+              refId: target.refId,
+              datasource: target.datasource,
+              expr: interpolatePromQLVariables(target.expr, variables),
+              legendFormat: target.legendFormat,
+              maxDataPoints,
+              intervalMs: 30000,
+              range: true,
+              instant: false,
+            })),
           },
         })
         .subscribe({
@@ -204,34 +222,47 @@ async function validateSinglePanel(
     });
 
     const durationMs = Date.now() - started;
-    const refRes = responseData?.results?.[panel.target.refId];
-    if (!refRes) {
+    let worstCategory: ValidationCategory = 'ok';
+    const errorParts: string[] = [];
+    let totalNonEmptySeries = 0;
+
+    for (const refId of refIds) {
+      const refRes = responseData?.results?.[refId];
+      if (!refRes) {
+        if (CATEGORY_SEVERITY.datasource_error > CATEGORY_SEVERITY[worstCategory]) {
+          worstCategory = 'datasource_error';
+        }
+        const prefix = refIds.length > 1 ? `[${refId}] ` : '';
+        errorParts.push(`${prefix}Datasource returned no result entry for refId ${refId}`);
+        continue;
+      }
+      if (refRes.error) {
+        const cat = classifyDatasourceError(refRes.status, refRes.error);
+        if (CATEGORY_SEVERITY[cat] > CATEGORY_SEVERITY[worstCategory]) {
+          worstCategory = cat;
+        }
+        const prefix = refIds.length > 1 ? `[${refId}] ` : '';
+        errorParts.push(`${prefix}${refRes.error}`);
+        continue;
+      }
+      const frames = refRes.frames ?? [];
+      const nonEmptySeries = frames.filter(
+        (f) => Array.isArray(f.data?.values) && f.data!.values!.some((col) => col.length > 0)
+      ).length;
+      totalNonEmptySeries += nonEmptySeries;
+    }
+
+    if (errorParts.length > 0) {
       return {
         panelId: panel.id,
         queryHash,
-        category: 'empty_result',
-        seriesCount: 0,
+        category: worstCategory,
+        errorText: errorParts.join('; ').slice(0, 300),
         durationMs,
       };
     }
 
-    if (refRes.error) {
-      const cat = classifyDatasourceError(refRes.status, refRes.error);
-      return {
-        panelId: panel.id,
-        queryHash,
-        category: cat,
-        errorText: refRes.error.slice(0, 300),
-        durationMs,
-      };
-    }
-
-    const frames = refRes.frames ?? [];
-    const nonEmptySeries = frames.filter(
-      (f) => Array.isArray(f.data?.values) && f.data!.values!.some((col) => col.length > 0)
-    ).length;
-
-    if (nonEmptySeries === 0) {
+    if (totalNonEmptySeries === 0) {
       return {
         panelId: panel.id,
         queryHash,
@@ -245,7 +276,7 @@ async function validateSinglePanel(
       panelId: panel.id,
       queryHash,
       category: 'ok',
-      seriesCount: nonEmptySeries,
+      seriesCount: totalNonEmptySeries,
       durationMs,
     };
   } catch (err: unknown) {
@@ -262,8 +293,7 @@ async function validateSinglePanel(
         durationMs,
       };
     }
-    const { status, message } = extractErrorInfo(err, panel.target.refId);
-    const category = classifyDatasourceError(status, message);
+    const { category, message } = extractAndClassifyError(err, refIds);
 
     return {
       panelId: panel.id,
@@ -283,42 +313,66 @@ export function classifyDatasourceError(
   message = ''
 ): ValidationCategory {
   const lower = message.toLowerCase();
-  if (
-    status === 401 ||
-    status === 403 ||
-    lower.includes('forbidden') ||
-    lower.includes('unauthorized') ||
-    lower.includes('access denied') ||
-    lower.includes('permission')
-  ) {
-    return 'permission_error';
-  }
-  if (
-    status === 408 ||
-    status === 504 ||
-    lower.includes('timeout') ||
-    lower.includes('deadline exceeded')
-  ) {
-    return 'timeout';
-  }
-  if (
-    status === 400 ||
-    status === 422 ||
+  const isSyntaxMsg =
     lower.includes('parse error') ||
     lower.includes('bad_data') ||
     lower.includes('unexpected') ||
     lower.includes('invalid parameter') ||
-    lower.includes('unknown function')
+    lower.includes('unknown function');
+
+  // 1. Trust explicit HTTP status codes first so metric names (e.g. http_timeout_total,
+  //    auth_permission_checks_total) inside 400 parse errors are never misclassified.
+  if (status === 401 || status === 403) {
+    return 'permission_error';
+  }
+  if (status === 408 || status === 504) {
+    return 'timeout';
+  }
+  if (status === 400 || status === 422) {
+    if (isSyntaxMsg) {
+      return 'syntax_error';
+    }
+    if (
+      lower.includes('forbidden') ||
+      lower.includes('unauthorized') ||
+      lower.includes('access denied')
+    ) {
+      return 'permission_error';
+    }
+    if (lower.includes('deadline exceeded') || lower.includes('query timed out')) {
+      return 'timeout';
+    }
+    return 'syntax_error';
+  }
+  if (status !== undefined && status >= 500) {
+    if (lower.includes('timeout') || lower.includes('deadline exceeded')) {
+      return 'timeout';
+    }
+    return 'datasource_error';
+  }
+
+  // 2. Fallback heuristic when status is omitted or 200 with embedded error text.
+  if (
+    lower.includes('forbidden') ||
+    lower.includes('unauthorized') ||
+    lower.includes('access denied') ||
+    lower.includes('permission denied')
   ) {
+    return 'permission_error';
+  }
+  if (lower.includes('timeout') || lower.includes('deadline exceeded')) {
+    return 'timeout';
+  }
+  if (isSyntaxMsg) {
     return 'syntax_error';
   }
   return 'datasource_error';
 }
 
-function extractErrorInfo(
+function extractAndClassifyError(
   err: unknown,
-  refId: string
-): { status?: number; message: string } {
+  refIds: string[]
+): { category: ValidationCategory; message: string } {
   if (typeof err === 'object' && err !== null) {
     const e = err as {
       status?: number;
@@ -330,21 +384,42 @@ function extractErrorInfo(
         results?: Record<string, { status?: number; error?: string }>;
       };
     };
-    // Prioritize inner /api/ds/query results[refId] error and status (H-10).
-    const inner = e.data?.results?.[refId];
-    if (inner?.error) {
+    // Classify each inner /api/ds/query results[refId] individually using the same
+    // severity precedence as the non-throwing response path (permission > timeout > datasource > syntax).
+    const innerMessages: string[] = [];
+    let worstCategory: ValidationCategory = 'ok';
+    for (const refId of refIds) {
+      const inner = e.data?.results?.[refId];
+      if (inner?.error) {
+        const errStr = String(inner.error);
+        const cat = classifyDatasourceError(inner.status ?? e.status, errStr);
+        if (CATEGORY_SEVERITY[cat] > CATEGORY_SEVERITY[worstCategory]) {
+          worstCategory = cat;
+        }
+        const prefix = refIds.length > 1 ? `[${refId}] ` : '';
+        innerMessages.push(`${prefix}${errStr}`);
+      }
+    }
+    if (innerMessages.length > 0) {
       return {
-        status: inner.status ?? e.status,
-        message: String(inner.error),
+        category: worstCategory,
+        message: innerMessages.join('; '),
       };
     }
     const msg =
-      e.data?.message ||
-      e.data?.error ||
-      e.message ||
-      e.statusText ||
+      (typeof e.data?.message === 'string' && e.data.message) ||
+      (typeof e.data?.error === 'string' && e.data.error) ||
+      (typeof e.message === 'string' && e.message) ||
+      (typeof e.statusText === 'string' && e.statusText) ||
       'Datasource query failed';
-    return { status: e.status, message: String(msg) };
+    return {
+      category: classifyDatasourceError(e.status, msg),
+      message: msg,
+    };
   }
-  return { message: String(err) };
+  const msg = String(err);
+  return {
+    category: classifyDatasourceError(undefined, msg),
+    message: msg,
+  };
 }

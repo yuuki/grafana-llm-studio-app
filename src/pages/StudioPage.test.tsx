@@ -26,6 +26,7 @@ jest.mock('../spec/toScene', () => ({
 }));
 
 const mockGenerateDraft = jest.fn();
+const mockImportDraft = jest.fn();
 const mockPatchDraft = jest.fn();
 const mockRepairDraft = jest.fn();
 const mockUndoDraft = jest.fn();
@@ -43,6 +44,7 @@ jest.mock('../api/studioClient', () => ({
     mockBanner: true,
   })),
   generateDraft: (...args: unknown[]) => mockGenerateDraft(...args),
+  importDraft: (...args: unknown[]) => mockImportDraft(...args),
   patchDraft: (...args: unknown[]) => mockPatchDraft(...args),
   repairDraft: (...args: unknown[]) => mockRepairDraft(...args),
   undoDraft: (...args: unknown[]) => mockUndoDraft(...args),
@@ -68,11 +70,27 @@ jest.mock('../datasource/validator', () => ({
   runDryRunValidation: (...args: unknown[]) => mockRunDryRunValidation(...args),
 }));
 
+const mockFetchExistingDashboardByUid = jest.fn();
+const mockListExistingDashboards = jest.fn();
+
+jest.mock('../import/importDashboard', () => {
+  const actual = jest.requireActual('../import/importDashboard');
+  return {
+    ...actual,
+    fetchExistingDashboardByUid: (...args: unknown[]) => mockFetchExistingDashboardByUid(...args),
+    listExistingDashboards: (...args: unknown[]) => mockListExistingDashboards(...args),
+  };
+});
+
+const mockCreateNewDashboard = jest.fn();
+const mockUpdateExistingDashboard = jest.fn();
+
 jest.mock('../save/saveDashboard', () => ({
   listWritableFolders: jest.fn(async () => [{ uid: '', title: 'General (Root)' }]),
   buildExportableDashboardJson: jest.fn(() => '{}'),
   DashboardSaver: jest.fn().mockImplementation(() => ({
-    createNewDashboard: jest.fn(),
+    createNewDashboard: (...args: unknown[]) => mockCreateNewDashboard(...args),
+    updateExistingDashboard: (...args: unknown[]) => mockUpdateExistingDashboard(...args),
   })),
 }));
 
@@ -380,5 +398,234 @@ describe('StudioPage reactive locale switching', () => {
     expect(screen.getByText('開発・テスト用モックLLMモード')).toBeTruthy();
     expect(screen.getByText('スコープのメトリクスを取得')).toBeTruthy();
     expect(screen.getByText('検証・プレビューを実行')).toBeTruthy();
+  });
+});
+
+describe('StudioPage v1.1 safe import & variable cache invalidation', () => {
+  beforeEach(async () => {
+    await setStudioLocale(DEFAULT_LOCALE);
+    sceneMountCount = 0;
+    sceneUnmountCount = 0;
+    mockBuildPreviewScene.mockClear();
+    mockGenerateDraft.mockReset();
+    mockImportDraft.mockReset();
+    mockPatchDraft.mockReset();
+    mockRepairDraft.mockReset();
+    mockUndoDraft.mockReset();
+    mockCancelDraftJob.mockReset();
+    mockRunDryRunValidation.mockReset();
+    mockFetchExistingDashboardByUid.mockReset();
+    mockListExistingDashboards.mockReset();
+    mockCreateNewDashboard.mockReset();
+    mockUpdateExistingDashboard.mockReset();
+  });
+
+  afterEach(async () => {
+    await act(async () => {
+      await setStudioLocale(DEFAULT_LOCALE);
+    });
+  });
+
+  test('safe import defaults to create-as-copy and only uses revision-checked PUT when explicitly opted in', async () => {
+    const reqHash = await computeQueryHash(REQ_EXPR);
+
+    mockFetchExistingDashboardByUid.mockResolvedValueOnce({
+      source: {
+        uid: 'existing-dash-1',
+        resourceVersion: '27',
+        folderUid: '',
+        title: 'Existing Dash',
+      },
+      rawDashboard: {
+        title: 'Existing Dash',
+        time: { from: 'now-15m', to: 'now' },
+        panels: [
+          {
+            type: 'gauge',
+            title: 'Request Gauge',
+            datasource: { type: 'prometheus', uid: 'prom-main' },
+            gridPos: { x: 0, y: 0, w: 12, h: 6 },
+            fieldConfig: { defaults: { unit: 'reqps' } },
+            targets: [{ expr: REQ_EXPR }],
+          },
+        ],
+      },
+    });
+    mockImportDraft.mockImplementationOnce(async (req: { draft: unknown; importSource: unknown }) => ({
+      jobId: 'job-imported-1',
+      status: 'awaiting_preview',
+      datasourceUid: 'prom-main',
+      importSource: req.importSource,
+      currentIR: req.draft,
+      repairAttemptsUsed: 0,
+      maxRepairAttempts: 2,
+      canUndo: false,
+      updatedAt: '2026-11-23T00:00:00Z',
+    }));
+    mockRunDryRunValidation.mockResolvedValueOnce([
+      { panelId: 'panel-request-gauge', queryHash: reqHash, category: 'ok', seriesCount: 1, durationMs: 8 },
+    ]);
+    mockCreateNewDashboard.mockResolvedValueOnce({
+      uid: 'llmstudio-copy123',
+      url: '/d/llmstudio-copy123',
+      folderUid: '',
+      revision: 1,
+      mode: 'created',
+    });
+    mockUpdateExistingDashboard.mockResolvedValueOnce({
+      uid: 'existing-dash-1',
+      url: '/d/existing-dash-1',
+      folderUid: '',
+      revision: 1,
+      mode: 'updated',
+      resourceVersion: '28',
+    });
+
+    render(<StudioPage />);
+    await waitFor(() => expect(screen.getByText('Development/Testing Mock LLM Mode')).toBeTruthy());
+
+    // Open collapsible safe import panel and import existing dashboard
+    fireEvent.click(screen.getByText('Import Existing Dashboard (Optional)'));
+    fireEvent.change(screen.getByPlaceholderText('existing-dashboard-uid'), {
+      target: { value: 'existing-dash-1' },
+    });
+    fireEvent.click(screen.getByText('Import as Safe IR'));
+
+    await waitFor(() => expect(screen.getByTestId('studio-import-report')).toBeTruthy());
+    expect(mockImportDraft).toHaveBeenCalledTimes(1);
+
+    // Dry-run & preview to unlock save
+    fireEvent.click(screen.getByText('Validate & Preview'));
+    await waitFor(() => expect(screen.getByTestId('mock-scene-canvas')).toBeTruthy());
+
+    // Default save mode is create-as-copy (POST)
+    fireEvent.click(screen.getByText('Save New Dashboard'));
+    await waitFor(() => expect(mockCreateNewDashboard).toHaveBeenCalledTimes(1));
+    expect(mockUpdateExistingDashboard).not.toHaveBeenCalled();
+
+    // Explicitly opt in to revision-checked update (PUT with resourceVersion)
+    fireEvent.click(screen.getByTestId('studio-optin-update-checkbox'));
+    fireEvent.click(screen.getByText('Update Existing Dashboard'));
+    await waitFor(() => expect(mockUpdateExistingDashboard).toHaveBeenCalledTimes(1));
+    expect(mockUpdateExistingDashboard).toHaveBeenCalledWith(
+      expect.objectContaining({
+        targetUid: 'existing-dash-1',
+        expectedResourceVersion: '27',
+        previewedRevision: 1,
+      })
+    );
+    // Opt-in checkbox resets to false after save so next save defaults safely to create-as-copy.
+    expect((screen.getByTestId('studio-optin-update-checkbox') as HTMLInputElement).checked).toBe(false);
+  });
+
+  test('variable-only patch invalidates dry-run cache even when panel queryHash is unchanged (H-8)', async () => {
+    const varExpr = 'sum(rate(http_requests_total{service="$service"}[5m]))';
+    const varHash = await computeQueryHash(varExpr);
+
+    mockGenerateDraft.mockResolvedValueOnce({
+      jobId: 'job-var-cache',
+      status: 'awaiting_preview',
+      datasourceUid: 'prom-main',
+      currentIR: {
+        schemaVersion: '1.1',
+        revision: 1,
+        title: 'Var Draft',
+        timeRange: { from: 'now-15m', to: 'now' },
+        variables: [
+          {
+            name: 'service',
+            type: 'query',
+            datasourceRef: 'selected_prometheus',
+            labelName: 'service',
+            metricName: 'http_requests_total',
+            defaultValue: 'checkout-api',
+          },
+        ],
+        panels: [
+          {
+            id: 'panel-req',
+            type: 'timeseries',
+            title: 'Requests',
+            datasourceRef: 'selected_prometheus',
+            query: { expr: varExpr },
+            unit: 'reqps',
+            layout: { row: 0, col: 0, width: 'full' },
+          },
+        ],
+      },
+      repairAttemptsUsed: 0,
+      maxRepairAttempts: 2,
+      canUndo: false,
+      updatedAt: '2026-11-23T00:00:00Z',
+    });
+    mockRunDryRunValidation
+      .mockResolvedValueOnce([
+        { panelId: 'panel-req', queryHash: varHash, category: 'ok', seriesCount: 1, durationMs: 5 },
+      ])
+      .mockResolvedValueOnce([
+        { panelId: 'panel-req', queryHash: varHash, category: 'ok', seriesCount: 1, durationMs: 5 },
+      ]);
+    mockPatchDraft.mockResolvedValueOnce({
+      jobId: 'job-var-cache',
+      status: 'awaiting_preview',
+      datasourceUid: 'prom-main',
+      currentIR: {
+        schemaVersion: '1.1',
+        revision: 2,
+        title: 'Var Draft',
+        timeRange: { from: 'now-15m', to: 'now' },
+        variables: [
+          {
+            name: 'service',
+            type: 'query',
+            datasourceRef: 'selected_prometheus',
+            labelName: 'service',
+            metricName: 'http_requests_total',
+            defaultValue: 'payments-api',
+          },
+        ],
+        panels: [
+          {
+            id: 'panel-req',
+            type: 'timeseries',
+            title: 'Requests',
+            datasourceRef: 'selected_prometheus',
+            query: { expr: varExpr },
+            unit: 'reqps',
+            layout: { row: 0, col: 0, width: 'full' },
+          },
+        ],
+      },
+      repairAttemptsUsed: 0,
+      maxRepairAttempts: 2,
+      canUndo: true,
+      updatedAt: '2026-11-23T00:00:05Z',
+    });
+
+    render(<StudioPage />);
+    await waitFor(() => expect(screen.getByText('Development/Testing Mock LLM Mode')).toBeTruthy());
+
+    fireEvent.change(screen.getByPlaceholderText('checkout-api'), { target: { value: 'checkout-api' } });
+    fireEvent.click(screen.getByText('Fetch Scoped Metrics'));
+    await waitFor(() => expect(screen.getByTestId('studio-catalog-count').textContent).toBe('2'));
+
+    fireEvent.click(screen.getByText('Generate Dashboard Draft'));
+    await waitFor(() => expect(screen.getByTestId('studio-job-revision').textContent).toBe('rev 1'));
+
+    fireEvent.click(screen.getByText('Validate & Preview'));
+    await waitFor(() => expect(mockRunDryRunValidation).toHaveBeenCalledTimes(1));
+
+    // Patch changes ONLY variable defaultValue; panel queryHash stays identical
+    fireEvent.click(screen.getByText('Apply Partial Edit'));
+    await waitFor(() => expect(screen.getByTestId('studio-job-revision').textContent).toBe('rev 2'));
+
+    // Re-validate MUST re-run dry-run for panel-req because variablesFingerprint changed!
+    fireEvent.click(screen.getByText('Validate & Preview'));
+    await waitFor(() => expect(mockRunDryRunValidation).toHaveBeenCalledTimes(2));
+    expect(mockRunDryRunValidation).toHaveBeenNthCalledWith(
+      2,
+      expect.anything(),
+      expect.objectContaining({ onlyPanelIds: ['panel-req'] })
+    );
   });
 });

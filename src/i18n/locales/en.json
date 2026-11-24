@@ -10,6 +10,7 @@
     },
     "savedAlert": {
       "title": "New dashboard saved",
+      "updatedTitle": "Existing dashboard updated (revision-checked)",
       "uidPrefix": "UID:",
       "revision": "(rev {{revision}})",
       "openLink": "Open saved dashboard to review queries, units, thresholds, and layout"
@@ -33,6 +34,21 @@
       "truncatedSuffix": "(truncated at limit)",
       "staleSuffix": "(scope changed — re-fetch required)"
     },
+    "import": {
+      "openButton": "Import Existing Dashboard (Optional)",
+      "closeButton": "Close Import",
+      "uidLabel": "Existing Dashboard UID",
+      "uidPlaceholder": "existing-dashboard-uid",
+      "listButton": "List Dashboards",
+      "importButton": "Import as Safe IR",
+      "importing": "Importing...",
+      "selectPlaceholder": "Select an existing dashboard",
+      "reportTitle": "Import Result:",
+      "reportCounts": "{{panels}} panel(s) / {{variables}} variable(s)",
+      "skippedPanels": "Skipped panels: {{items}}",
+      "skippedVariables": "Skipped variables: {{items}}",
+      "folderFallback": "Imported Folder ({{uid}})"
+    },
     "edit": {
       "label": "Edit Mode / Target Panel",
       "autoPatch": "Patch existing draft (auto-detect)",
@@ -54,6 +70,8 @@
     "job": {
       "statusLabel": "Status:",
       "revision": "rev {{revision}}",
+      "variablesLabel": "Variables:",
+      "warningsLabel": "Warnings:",
       "messageTitle": "Generation & Validation Message",
       "diffTitle": "Changes (Diff):",
       "repairBudget": "Repair budget: {{used}} / {{max}} used"
@@ -62,6 +80,7 @@
       "heading": "Validation Results (Dry-Run: last 5m / maxDataPoints=10)",
       "repairing": "Repairing...",
       "repairSyntaxOnly": "Auto-Repair Syntax Errors Only",
+      "repairCatalogRequiredHint": "Run \"Fetch Scoped Metrics\" first to enable auto-repair.",
       "category": {
         "ok": "OK",
         "empty_result": "Empty result (not auto-repaired)",
@@ -73,8 +92,11 @@
     },
     "save": {
       "folderLabel": "Target Folder (Create-Only)",
+      "folderLabelUpdateLocked": "Target Folder (Original folder retained on update)",
+      "optInUpdateLabel": "Update imported source ({{uid}}, rv={{rv}}) with revision check (optional)",
       "saving": "Saving...",
       "saveNewDashboard": "Save New Dashboard",
+      "updateExistingDashboard": "Update Existing Dashboard",
       "exportJson": "Export JSON",
       "requiresValidationHint": "Saving is enabled once \"Validate & Preview\" completes without errors for the latest revision (rev {{revision}})."
     },
@@ -96,6 +118,8 @@
       "metadataFailed": "Failed to fetch scoped metadata: {{error}}",
       "datasourceRequired": "Please select an allowlisted Prometheus datasource.",
       "catalogRequired": "Please fetch metric candidates for the current scope (click \"Fetch Scoped Metrics\").",
+      "listDashboardsFailed": "Failed to list existing dashboards: {{error}}",
+      "importFailed": "Failed to import existing dashboard: {{error}}",
       "validationBlocked": "Dry-run validation detected blocking errors (syntax error, permission error, timeout, etc.), so Scenes preview and saving were blocked.",
       "validationFailed": "Validation & preview failed: {{error}}",
       "previewRequiredBeforeSave": "Run \"Validate & Preview\" to verify the latest draft before saving.",
@@ -188,10 +212,15 @@
     "errors": {
       "inFlight": "A save operation is already in progress. Please wait for it to finish.",
       "revisionMismatch": "Target revision (rev {{targetRevision}}) does not match the validated preview (rev {{previewedRevision}}). Run Validate & Preview first.",
+      "missingResourceVersion": "Target UID and import-time resourceVersion are required to update an existing dashboard. Save as a new copy instead.",
       "defaultMessage": "Failed to create new dashboard",
+      "updateDefaultMessage": "Failed to update existing dashboard",
       "permissionDenied": "You do not have permission to save to the selected folder (HTTP {{status}}): {{message}}",
+      "updatePermissionDenied": "You do not have permission to update the target dashboard (HTTP {{status}}): {{message}}",
       "uidConflict": "Aborted dashboard creation due to a UID conflict. No existing dashboard was overwritten (HTTP {{status}}): {{message}}",
-      "apiError": "Dashboard save API error (HTTP {{status}}): {{message}}"
+      "revisionConflict": "Aborted overwrite because the existing dashboard was modified externally after import (HTTP {{status}}). Re-import it or save as a new copy: {{message}}",
+      "apiError": "Dashboard save API error (HTTP {{status}}): {{message}}",
+      "updateApiError": "Dashboard update API error (HTTP {{status}}): {{message}}"
     }
   },
   "validator": {

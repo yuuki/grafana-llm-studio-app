@@ -13,9 +13,19 @@ jest.mock('@grafana/runtime', () => ({
   locationService: { getLocation: () => ({ search: '', pathname: '/' }), partial: jest.fn() },
 }));
 
-import { SceneGridItem, SceneGridLayout, SceneQueryRunner, SceneTimeRange, VizPanel } from '@grafana/scenes';
-import { DashboardIR } from '../ir/types';
-import { normalizeDashboardIR } from './normalize';
+import {
+  CustomVariable,
+  QueryVariable,
+  SceneGridItem,
+  SceneGridLayout,
+  SceneQueryRunner,
+  SceneTimeRange,
+  SceneVariableSet,
+  VariableValueSelectors,
+  VizPanel,
+} from '@grafana/scenes';
+import { DashboardIR, validateIRClient } from '../ir/types';
+import { interpolatePromQLVariables, normalizeDashboardIR } from './normalize';
 import { buildFoundationDashboard } from './toFoundation';
 import { buildPreviewScene } from './toScene';
 
@@ -181,5 +191,291 @@ describe('Scenes and Foundation SDK adapter parity', () => {
     const overlapping = JSON.parse(JSON.stringify(sampleIR)) as DashboardIR;
     overlapping.panels[1].layout = { ...overlapping.panels[0].layout };
     expect(() => normalizeDashboardIR(overlapping, resolvedDs)).toThrow(/Layout overlap/);
+  });
+
+  test('IR v1.1 full parity across timeseries, gauge, bargauge, piechart, table, state-timeline, multi-query (3 targets), and variables', () => {
+    const v11Path = path.resolve(__dirname, '../../schemas/samples/valid-v11-dashboard.json');
+    const v11IR = JSON.parse(fs.readFileSync(v11Path, 'utf8')) as DashboardIR;
+    const spec = normalizeDashboardIR(v11IR, resolvedDs);
+    const scene = buildPreviewScene(spec);
+    const foundationDash = buildFoundationDashboard(spec, { uid: 'llmstudio-v11-parity' });
+
+    // Variable parity between Scenes SceneVariableSet and Foundation SDK templating.list
+    const sceneVarSet = scene.state.$variables as SceneVariableSet;
+    expect(sceneVarSet).toBeInstanceOf(SceneVariableSet);
+    expect(scene.state.controls?.[0]).toBeInstanceOf(VariableValueSelectors);
+
+    const sceneVars = sceneVarSet.state.variables;
+    const foundationVars = foundationDash.templating?.list ?? [];
+    expect(sceneVars).toHaveLength(2);
+    expect(foundationVars).toHaveLength(2);
+
+    const sQueryVar = sceneVars[0] as QueryVariable;
+    const fQueryVar = foundationVars[0];
+    expect(sQueryVar.state.name).toBe('service');
+    expect(fQueryVar.name).toBe('service');
+    expect(fQueryVar.type).toBe('query');
+    expect(sQueryVar.state.label).toBe(fQueryVar.label);
+    expect(sQueryVar.state.query).toBe('label_values(http_requests_total, service)');
+    expect(fQueryVar.query).toBe(sQueryVar.state.query);
+    expect(sQueryVar.state.datasource?.uid).toBe('prom-main');
+    expect(fQueryVar.datasource?.uid).toBe('prom-main');
+    expect(sQueryVar.state.value).toBe('checkout-api');
+    expect(fQueryVar.current?.value).toBe('checkout-api');
+
+    const sCustomVar = sceneVars[1] as CustomVariable;
+    const fCustomVar = foundationVars[1];
+    expect(sCustomVar.state.name).toBe('status_class');
+    expect(fCustomVar.name).toBe('status_class');
+    expect(fCustomVar.type).toBe('custom');
+    expect(sCustomVar.state.query).toBe('5..,4..|5..');
+    expect(fCustomVar.query).toBe(sCustomVar.state.query);
+    expect(fCustomVar.current?.value).toBe('5..');
+
+    // Panel parity across all 6 panels in v1.1 fixture (including 3-query timeseries + 5 new panel types)
+    const gridLayout = scene.state.body as SceneGridLayout;
+    const sceneItems = gridLayout.state.children as SceneGridItem[];
+    const foundationPanels = foundationDash.panels ?? [];
+
+    expect(sceneItems).toHaveLength(6);
+    expect(foundationPanels).toHaveLength(6);
+
+    for (let i = 0; i < spec.panels.length; i++) {
+      const sItem = sceneItems[i];
+      const viz = sItem.state.body as VizPanel;
+      const qr = viz.state.$data as SceneQueryRunner;
+      const fPanel = foundationPanels[i] as {
+        id?: number;
+        title?: string;
+        type?: string;
+        gridPos?: { x: number; y: number; w: number; h: number };
+        options?: Record<string, unknown>;
+        targets?: Array<{ refId?: string; expr?: string; legendFormat?: string; datasource?: { uid?: string } }>;
+        fieldConfig?: { defaults?: { unit?: string } };
+      };
+
+      expect(fPanel.id).toBe(spec.panels[i].numericId);
+      expect(fPanel.type).toBe(viz.state.pluginId);
+      expect(fPanel.title).toBe(viz.state.title);
+      expect(fPanel.fieldConfig?.defaults?.unit).toBe(viz.state.fieldConfig.defaults.unit);
+      expect(fPanel.gridPos).toEqual({
+        x: sItem.state.x,
+        y: sItem.state.y,
+        w: sItem.state.width,
+        h: sItem.state.height,
+      });
+
+      // Multi-query target parity (panel 0 has 3 queries A/B/C)
+      const sQueries = qr.state.queries as Array<{ refId: string; expr: string; legendFormat?: string }>;
+      expect(fPanel.targets).toHaveLength(sQueries.length);
+      for (let q = 0; q < sQueries.length; q++) {
+        expect(fPanel.targets?.[q]?.refId).toBe(sQueries[q].refId);
+        expect(fPanel.targets?.[q]?.expr).toBe(sQueries[q].expr);
+        expect(fPanel.targets?.[q]?.legendFormat).toBe(sQueries[q].legendFormat);
+        expect(fPanel.targets?.[q]?.datasource?.uid).toBe('prom-main');
+      }
+
+      // Panel-type-specific options parity
+      const sOpts = viz.state.options as Record<string, unknown>;
+      const fOpts = fPanel.options ?? {};
+      switch (fPanel.type) {
+        case 'timeseries':
+          expect(sQueries).toHaveLength(3);
+          expect(sOpts.legend).toEqual(fOpts.legend);
+          break;
+        case 'gauge':
+          expect(sOpts.reduceOptions).toMatchObject({ calcs: ['lastNotNull'], values: false });
+          expect(fOpts.reduceOptions).toMatchObject({ calcs: ['lastNotNull'], values: false });
+          expect(sOpts.showThresholdLabels).toBe(fOpts.showThresholdLabels);
+          expect(sOpts.showThresholdMarkers).toBe(fOpts.showThresholdMarkers);
+          expect(sOpts.orientation).toBe(fOpts.orientation);
+          break;
+        case 'bargauge':
+          expect(sOpts.displayMode).toBe('gradient');
+          expect(fOpts.displayMode).toBe('gradient');
+          expect(sOpts.orientation).toBe('horizontal');
+          expect(fOpts.orientation).toBe('horizontal');
+          expect(sOpts.showUnfilled).toBe(fOpts.showUnfilled);
+          expect(sOpts.reduceOptions).toMatchObject({ calcs: ['lastNotNull'], values: false });
+          expect(fOpts.reduceOptions).toMatchObject({ calcs: ['lastNotNull'], values: false });
+          break;
+        case 'piechart':
+          expect(sOpts.pieType).toBe('pie');
+          expect(fOpts.pieType).toBe('pie');
+          expect(sOpts.legend).toMatchObject({
+            showLegend: true,
+            displayMode: 'list',
+            placement: 'bottom',
+          });
+          expect(fOpts.legend).toMatchObject({
+            showLegend: true,
+            displayMode: 'list',
+            placement: 'bottom',
+          });
+          break;
+        case 'table':
+          expect(sOpts.frameIndex).toBe(0);
+          expect(fOpts.frameIndex).toBe(0);
+          expect(sOpts.showHeader).toBe(true);
+          expect(fOpts.showHeader).toBe(true);
+          expect(sOpts.showTypeIcons).toBe(false);
+          expect(fOpts.showTypeIcons).toBe(false);
+          expect(sOpts.cellHeight).toBe('sm');
+          expect(fOpts.cellHeight).toBe('sm');
+          break;
+        case 'state-timeline':
+          expect(sOpts.mergeValues).toBe(true);
+          expect(fOpts.mergeValues).toBe(true);
+          expect(sOpts.showValue).toBe('auto');
+          expect(fOpts.showValue).toBe('auto');
+          expect(sOpts.rowHeight).toBe(0.9);
+          expect(fOpts.rowHeight).toBe(0.9);
+          expect(sOpts.legend).toEqual(fOpts.legend);
+          break;
+        default:
+          throw new Error(`Unexpected panel type in v1.1 fixture: ${fPanel.type}`);
+      }
+    }
+  });
+
+  test('validateIRClient enforces IR v1.1 multi-query and variable bounds', () => {
+    const badDoc: DashboardIR = {
+      schemaVersion: '1.1',
+      revision: 1,
+      title: 'Bad v1.1',
+      timeRange: { from: 'now-15m', to: 'now' },
+      variables: [
+        { name: '__from', type: 'custom', options: ['a'] },
+      ],
+      panels: [
+        {
+          id: 'panel-a',
+          type: 'timeseries',
+          title: 'Too many queries',
+          datasourceRef: 'selected_prometheus',
+          queries: [
+            { refId: 'A', expr: 'up' },
+            { refId: 'B', expr: 'up' },
+            { refId: 'C', expr: 'up' },
+            { expr: 'up' },
+          ],
+          unit: 'short',
+          layout: { row: 0, col: 0, width: 'full' },
+        },
+      ],
+    };
+    const issues = validateIRClient(badDoc);
+    expect(issues.some((m) => m.includes('reserved'))).toBe(true);
+    expect(issues.some((m) => m.includes('max 3 queries'))).toBe(true);
+
+    // Adversarial client validation checks: HTML/Bidi/quotes/legend var token/empty queries
+    const adversarialDoc: DashboardIR = {
+      schemaVersion: '1.1',
+      revision: 1,
+      title: 'Safe <img src=x>',
+      timeRange: { from: 'now-15m', to: 'now' },
+      variables: [
+        {
+          name: '__custom_var',
+          type: 'query',
+          datasourceRef: 'selected_prometheus',
+          labelName: 'service',
+          defaultValue: '',
+        },
+        {
+          name: 'env',
+          type: 'custom',
+          options: ['prod,staging'],
+          defaultValue: 'prod,staging',
+        },
+      ],
+      panels: [
+        {
+          id: 'panel-a',
+          type: 'timeseries',
+          title: 'Panel A',
+          datasourceRef: 'selected_prometheus',
+          query: { expr: 'up', legendFormat: '{{instance}} $env' },
+          queries: [],
+          unit: 'short',
+          layout: { row: 0, col: 0, width: 'full' },
+        },
+      ],
+    };
+    const advIssues = validateIRClient(adversarialDoc);
+    expect(advIssues.some((m) => m.includes('angle brackets'))).toBe(true);
+    expect(advIssues.some((m) => m.includes('__custom_var'))).toBe(true);
+    expect(advIssues.some((m) => m.includes('comma'))).toBe(true);
+    expect(advIssues.some((m) => m.includes('both query and queries'))).toBe(true);
+  });
+
+  test('multi + includeAll variable parity and single-pass PromQL interpolation escaping (H-1, M-2)', () => {
+    const multiVarDoc: DashboardIR = {
+      schemaVersion: '1.1',
+      revision: 1,
+      title: 'Multi Var Parity',
+      timeRange: { from: 'now-15m', to: 'now' },
+      variables: [
+        {
+          name: 'host',
+          type: 'query',
+          datasourceRef: 'selected_prometheus',
+          labelName: 'instance',
+          metricName: 'up',
+          defaultValue: 'api.v1',
+          multi: true,
+          includeAll: true,
+        },
+        {
+          name: 'tier',
+          type: 'custom',
+          options: ['web', 'worker'],
+          defaultValue: 'web',
+          multi: true,
+          includeAll: true,
+        },
+      ],
+      panels: [
+        {
+          id: 'panel-up',
+          type: 'stat',
+          title: 'Up',
+          datasourceRef: 'selected_prometheus',
+          query: { expr: 'avg(up{instance=~"${host:regex}",tier=~"${tier:pipe}"})' },
+          unit: 'short',
+          layout: { row: 0, col: 0, width: 'full' },
+        },
+      ],
+    };
+
+    const spec = normalizeDashboardIR(multiVarDoc, { uid: 'prom-main', type: 'prometheus' });
+    const scene = buildPreviewScene(spec);
+    const foundationDash = buildFoundationDashboard(spec, { uid: 'llmstudio-multi-var' });
+
+    const sceneVars = (scene.state.$variables as SceneVariableSet).state.variables;
+    const foundationVars = foundationDash.templating?.list ?? [];
+
+    // Multi variables must use array initial values in both Scenes and Foundation SDK
+    expect((sceneVars[0] as QueryVariable).state.value).toEqual(['api.v1']);
+    expect(foundationVars[0].current?.value).toEqual(['api.v1']);
+    expect(foundationVars[0].allowCustomValue).toBe(false);
+
+    expect((sceneVars[1] as CustomVariable).state.value).toEqual(['web']);
+    expect(foundationVars[1].current?.value).toEqual(['web']);
+    expect(foundationVars[1].allowCustomValue).toBe(false);
+    expect(foundationVars[1].options?.[0]).toEqual({ text: 'All', value: '$__all', selected: false });
+
+    // Single-pass interpolation escapes RE2 dots + PromQL backslashes (\\. not \.)
+    expect(
+      interpolatePromQLVariables('up{instance=~"${host:regex}",tier=~"${tier:pipe}"}', spec.variables)
+    ).toBe('up{instance=~"api\\\\.v1",tier=~"web"}');
+
+    // Single-pass prevents secondary expansion ($a -> "$b" must NOT expand $b)
+    expect(
+      interpolatePromQLVariables('up{a="$a",b="$b"}', [
+        { name: 'a', label: 'a', type: 'custom', query: '$b', options: ['$b'], defaultValue: '$b', multi: false, includeAll: false },
+        { name: 'b', label: 'b', type: 'custom', query: 'pwned', options: ['pwned'], defaultValue: 'pwned', multi: false, includeAll: false },
+      ])
+    ).toBe('up{a="$b",b="pwned"}');
   });
 });

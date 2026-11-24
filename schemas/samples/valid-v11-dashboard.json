@@ -1,0 +1,159 @@
+{
+  "schemaVersion": "1.1",
+  "revision": 1,
+  "title": "checkout-api v1.1 Full Observability",
+  "description": "IR v1.1 showcase with scoped variables, bounded multi-query panels, and expanded visualization types.",
+  "timeRange": {
+    "from": "now-15m",
+    "to": "now"
+  },
+  "variables": [
+    {
+      "name": "service",
+      "label": "Service",
+      "type": "query",
+      "datasourceRef": "selected_prometheus",
+      "labelName": "service",
+      "metricName": "http_requests_total",
+      "defaultValue": "checkout-api",
+      "multi": false,
+      "includeAll": false
+    },
+    {
+      "name": "status_class",
+      "label": "Error Status Regex",
+      "type": "custom",
+      "options": ["5..", "4..|5.."],
+      "defaultValue": "5..",
+      "multi": false,
+      "includeAll": false
+    }
+  ],
+  "panels": [
+    {
+      "id": "panel-latency-quantiles",
+      "type": "timeseries",
+      "title": "Request Latency (p50 / p95 / p99)",
+      "description": "Multi-query percentile comparison for the selected service.",
+      "datasourceRef": "selected_prometheus",
+      "queries": [
+        {
+          "refId": "A",
+          "expr": "histogram_quantile(0.50, sum by (le) (rate(http_request_duration_seconds_bucket{service=\"$service\"}[5m])))",
+          "legendFormat": "p50"
+        },
+        {
+          "refId": "B",
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(http_request_duration_seconds_bucket{service=\"$service\"}[5m])))",
+          "legendFormat": "p95"
+        },
+        {
+          "refId": "C",
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(http_request_duration_seconds_bucket{service=\"$service\"}[5m])))",
+          "legendFormat": "p99"
+        }
+      ],
+      "unit": "s",
+      "thresholds": [
+        { "value": 0, "color": "green" },
+        { "value": 0.5, "color": "yellow" },
+        { "value": 1.0, "color": "red" }
+      ],
+      "layout": {
+        "row": 0,
+        "col": 0,
+        "width": "full"
+      }
+    },
+    {
+      "id": "panel-error-gauge",
+      "type": "gauge",
+      "title": "Error Ratio Gauge",
+      "datasourceRef": "selected_prometheus",
+      "query": {
+        "expr": "sum(rate(http_requests_total{service=\"$service\",status=~\"$status_class\"}[5m])) / clamp_min(sum(rate(http_requests_total{service=\"$service\"}[5m])), 1e-9)",
+        "legendFormat": "error ratio"
+      },
+      "unit": "percentunit",
+      "thresholds": [
+        { "value": 0, "color": "green" },
+        { "value": 0.01, "color": "yellow" },
+        { "value": 0.05, "color": "red" }
+      ],
+      "layout": {
+        "row": 1,
+        "col": 0,
+        "width": "half"
+      }
+    },
+    {
+      "id": "panel-status-bargauge",
+      "type": "bargauge",
+      "title": "RPS by Status",
+      "datasourceRef": "selected_prometheus",
+      "query": {
+        "expr": "sum by (status) (rate(http_requests_total{service=\"$service\"}[5m]))",
+        "legendFormat": "{{status}}"
+      },
+      "unit": "reqps",
+      "layout": {
+        "row": 1,
+        "col": 1,
+        "width": "half"
+      }
+    },
+    {
+      "id": "panel-status-pie",
+      "type": "piechart",
+      "title": "Traffic Share by Status",
+      "datasourceRef": "selected_prometheus",
+      "query": {
+        "expr": "sum by (status) (rate(http_requests_total{service=\"$service\"}[5m]))",
+        "legendFormat": "{{status}}"
+      },
+      "unit": "reqps",
+      "layout": {
+        "row": 2,
+        "col": 0,
+        "width": "half"
+      }
+    },
+    {
+      "id": "panel-metrics-table",
+      "type": "table",
+      "title": "Status Breakdown Table",
+      "datasourceRef": "selected_prometheus",
+      "query": {
+        "expr": "sum by (status) (rate(http_requests_total{service=\"$service\"}[5m]))",
+        "legendFormat": "{{status}}"
+      },
+      "unit": "reqps",
+      "layout": {
+        "row": 2,
+        "col": 1,
+        "width": "half"
+      }
+    },
+    {
+      "id": "panel-memory-timeline",
+      "type": "state-timeline",
+      "title": "Memory State Timeline",
+      "datasourceRef": "selected_prometheus",
+      "query": {
+        "expr": "avg(process_resident_memory_bytes{service=\"$service\"})",
+        "legendFormat": "memory"
+      },
+      "unit": "bytes",
+      "thresholds": [
+        { "value": 0, "color": "green" },
+        { "value": 400000000, "color": "orange" },
+        { "value": 800000000, "color": "red" }
+      ],
+      "layout": {
+        "row": 3,
+        "col": 0,
+        "width": "full"
+      }
+    }
+  ]
+}

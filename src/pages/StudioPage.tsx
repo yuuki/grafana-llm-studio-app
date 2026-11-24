@@ -16,6 +16,7 @@ import {
   extractApiError,
   fetchPublicConfig,
   generateDraft,
+  importDraft,
   patchDraft,
   repairDraft,
   undoDraft,
@@ -25,7 +26,14 @@ import { fetchScopedMetricCatalog, fetchScopeLabelValues } from '../datasource/m
 import { runDryRunValidation } from '../datasource/validator';
 import { TranslationKey, useStudioTranslation } from '../i18n';
 import {
-  computeQueryHash,
+  convertGrafanaDashboardToIR,
+  ExistingDashboardSummary,
+  fetchExistingDashboardByUid,
+  ImportConversionReport,
+  listExistingDashboards,
+} from '../import/importDashboard';
+import {
+  computePanelQueryHash,
   JobSnapshot,
   MetricCatalogItem,
   PanelValidationResult,
@@ -52,6 +60,19 @@ interface AllowedDatasourceOption {
 interface PreviewMeta {
   jobId: string;
   revision: number;
+}
+
+interface ValidatedPanelCacheEntry {
+  rawQueryHash: string;
+  varsFingerprint: string;
+  category: ValidationCategory;
+}
+
+interface PreservedImportMeta {
+  resourceVersion?: string;
+  folderUid?: string;
+  preservedAnnotations?: Record<string, string>;
+  preservedLabels?: Record<string, string>;
 }
 
 const VALIDATION_BADGE_COLOR: Record<ValidationCategory, 'green' | 'orange' | 'red' | 'blue'> = {
@@ -88,8 +109,22 @@ function makeScopeKey(dsUid: string, labelName: string, labelValue: string): str
   return `${dsUid}::${labelName}::${labelValue.trim()}`;
 }
 
+function computeVariablesFingerprint(spec: NormalizedDashboardSpec): string {
+  return JSON.stringify(
+    spec.variables.map((v) => ({
+      name: v.name,
+      type: v.type,
+      query: v.query,
+      options: v.options,
+      defaultValue: v.defaultValue,
+      multi: v.multi,
+      includeAll: v.includeAll,
+    }))
+  );
+}
+
 export const StudioPage: React.FC = () => {
-  const { t } = useStudioTranslation();
+  const { t, locale } = useStudioTranslation();
   const currentOrgId = config.bootData?.user?.orgId ?? 1;
 
   const [publicCfg, setPublicCfg] = useState<PublicConfig | null>(null);
@@ -110,9 +145,15 @@ export const StudioPage: React.FC = () => {
   const [editPanelId, setEditPanelId] = useState<string>('');
   const [job, setJob] = useState<JobSnapshot | null>(null);
   const [busyState, setBusyState] = useState<
-    'idle' | 'generating' | 'patching' | 'validating' | 'repairing' | 'undoing' | 'saving'
+    'idle' | 'generating' | 'importing' | 'patching' | 'validating' | 'repairing' | 'undoing' | 'saving'
   >('idle');
   const [uiError, setUiError] = useState<string | null>(null);
+
+  // Optional safe import state.
+  const [showImportPanel, setShowImportPanel] = useState(false);
+  const [importUid, setImportUid] = useState('');
+  const [existingDashboards, setExistingDashboards] = useState<ExistingDashboardSummary[]>([]);
+  const [importReport, setImportReport] = useState<ImportConversionReport | null>(null);
 
   // Dry-run validation and explicit Scenes preview state bound to (jobId, revision).
   const [validationResults, setValidationResults] = useState<PanelValidationResult[]>([]);
@@ -121,25 +162,50 @@ export const StudioPage: React.FC = () => {
   const [previewMeta, setPreviewMeta] = useState<PreviewMeta | null>(null);
   const [rightTab, setRightTab] = useState<'preview' | 'ir' | 'foundation'>('preview');
 
-  // Create-only save state.
+  // Save state (create-only copy by default; opt-in revision-checked update for imported dashboards).
   const [folders, setFolders] = useState<GrafanaFolderOption[]>(() => [
     { uid: '', title: t('save.folder.generalRoot') },
   ]);
   const [selectedFolderUid, setSelectedFolderUid] = useState<string>('');
+  const [optInUpdateExisting, setOptInUpdateExisting] = useState(false);
   const [savedResult, setSavedResult] = useState<SaveDashboardResult | null>(null);
 
   const abortRef = useRef<AbortController | null>(null);
   const metadataAbortRef = useRef<AbortController | null>(null);
   const contextSeqRef = useRef<number>(0);
+  const jobOpSeqRef = useRef<number>(0);
+  const validatedFingerprintsRef = useRef<Map<string, ValidatedPanelCacheEntry>>(new Map());
+  const latestImportMetaRef = useRef<Map<string, PreservedImportMeta>>(new Map());
   const saverRef = useRef<DashboardSaver>(new DashboardSaver());
   const prevContextKeyRef = useRef<string>(`${currentOrgId}:${selectedDsUid}`);
 
+  const applyJobSnapshot = useCallback((nextJob: JobSnapshot) => {
+    if (nextJob.importSource?.uid) {
+      const metaKey = `${nextJob.jobId}:${nextJob.importSource.uid}`;
+      const latest = latestImportMetaRef.current.get(metaKey);
+      if (latest?.resourceVersion) {
+        setJob({
+          ...nextJob,
+          importSource: {
+            ...nextJob.importSource,
+            resourceVersion: latest.resourceVersion,
+          },
+        });
+        return;
+      }
+    }
+    setJob(nextJob);
+  }, []);
+
   const clearDraftAndMetadata = useCallback(() => {
     contextSeqRef.current += 1;
+    jobOpSeqRef.current += 1;
     abortRef.current?.abort();
     abortRef.current = null;
     metadataAbortRef.current?.abort();
     metadataAbortRef.current = null;
+    validatedFingerprintsRef.current.clear();
+    latestImportMetaRef.current.clear();
     setCatalog([]);
     setCatalogScopeKey('');
     setCatalogTruncated(false);
@@ -147,6 +213,12 @@ export const StudioPage: React.FC = () => {
     setScopeLabelValues([]);
     setScopeLabelValue('');
     setJob(null);
+    setShowImportPanel(false);
+    setImportUid('');
+    setExistingDashboards([]);
+    setImportReport(null);
+    setSelectedFolderUid('');
+    setOptInUpdateExisting(false);
     setValidationResults([]);
     setPreviewSpec(null);
     setPreviewScene(null);
@@ -169,6 +241,7 @@ export const StudioPage: React.FC = () => {
   useEffect(() => {
     return () => {
       contextSeqRef.current += 1;
+      jobOpSeqRef.current += 1;
       abortRef.current?.abort();
       metadataAbortRef.current?.abort();
     };
@@ -222,6 +295,20 @@ export const StudioPage: React.FC = () => {
     () => allowedDatasources.find((d) => d.uid === selectedDsUid) ?? null,
     [allowedDatasources, selectedDsUid]
   );
+
+  const folderOptions = useMemo(() => {
+    const opts = folders.map((f) => ({
+      label: f.uid === '' ? t('save.folder.generalRoot') : f.title,
+      value: f.uid,
+    }));
+    if (selectedFolderUid && !folders.some((f) => f.uid === selectedFolderUid)) {
+      opts.push({
+        label: t('studio.import.folderFallback', { uid: selectedFolderUid }),
+        value: selectedFolderUid,
+      });
+    }
+    return opts;
+  }, [folders, selectedFolderUid, t, locale]);
 
   const currentScopeKey = makeScopeKey(selectedDsUid, scopeLabelName, scopeLabelValue);
   const isCatalogFresh = catalog.length > 0 && catalogScopeKey === currentScopeKey;
@@ -320,6 +407,7 @@ export const StudioPage: React.FC = () => {
     const controller = new AbortController();
     abortRef.current = controller;
     const seq = contextSeqRef.current;
+    jobOpSeqRef.current += 1;
 
     const isPatch = Boolean(job?.currentIR && editPanelId !== '__new__');
     setBusyState(isPatch ? 'patching' : 'generating');
@@ -328,10 +416,13 @@ export const StudioPage: React.FC = () => {
 
     // Starting a brand-new draft MUST clear previous job's preview state immediately (C-2).
     if (!isPatch) {
+      validatedFingerprintsRef.current.clear();
       setPreviewSpec(null);
       setPreviewScene(null);
       setPreviewMeta(null);
       setValidationResults([]);
+      setImportReport(null);
+      setOptInUpdateExisting(false);
     }
 
     const narrowedCatalog = selectMetricCandidates(catalog, promptText, {
@@ -369,10 +460,10 @@ export const StudioPage: React.FC = () => {
       if (controller.signal.aborted || seq !== contextSeqRef.current) {
         return;
       }
-      setJob(nextJob);
+      applyJobSnapshot(nextJob);
       reconcileEditPanelId(nextJob);
-      // Do NOT clear validationResults on patch: queryHash matching in handleValidateAndPreview
-      // retains results for untouched panels and re-validates only changed/missing panels (H-9).
+      // Do NOT clear validationResults on patch: (queryHash, varsFingerprint) matching in
+      // handleValidateAndPreview retains results for untouched panels and re-validates changed ones (H-9).
       if (!isPatch) {
         setValidationResults([]);
       }
@@ -382,6 +473,106 @@ export const StudioPage: React.FC = () => {
       }
       syncJobFromError(err);
       setUiError(extractApiError(err));
+    } finally {
+      if (abortRef.current === controller && seq === contextSeqRef.current) {
+        setBusyState('idle');
+      }
+    }
+  };
+
+  const handleListExistingDashboards = async () => {
+    metadataAbortRef.current?.abort();
+    const controller = new AbortController();
+    metadataAbortRef.current = controller;
+    const seq = contextSeqRef.current;
+
+    setUiError(null);
+    try {
+      const list = await listExistingDashboards(50, controller.signal);
+      if (controller.signal.aborted || seq !== contextSeqRef.current) {
+        return;
+      }
+      setExistingDashboards(list);
+      if (list.length > 0 && !importUid) {
+        setImportUid(list[0].uid);
+      }
+    } catch (err: unknown) {
+      if (!controller.signal.aborted && seq === contextSeqRef.current) {
+        setUiError(t('studio.errors.listDashboardsFailed', { error: extractApiError(err) }));
+      }
+    }
+  };
+
+  const handleImportExistingDashboard = async () => {
+    if (!selectedDatasource || !importUid.trim() || busyState !== 'idle') {
+      return;
+    }
+    abortRef.current?.abort();
+    const controller = new AbortController();
+    abortRef.current = controller;
+    const seq = contextSeqRef.current;
+    jobOpSeqRef.current += 1;
+
+    setBusyState('importing');
+    setUiError(null);
+
+    try {
+      const fetched = await fetchExistingDashboardByUid(importUid.trim(), controller.signal);
+      if (controller.signal.aborted || seq !== contextSeqRef.current) {
+        return;
+      }
+      const { draft, report } = convertGrafanaDashboardToIR(fetched.rawDashboard, {
+        selectedDatasourceUid: selectedDatasource.uid,
+        selectedDatasourceName: selectedDatasource.name,
+        maxPanels: publicCfg?.maxPanels ?? 6,
+      });
+      const scope: ScopeFilter | undefined =
+        isCatalogFresh && scopeLabelValue.trim()
+          ? { labelName: scopeLabelName, labelValue: scopeLabelValue.trim() }
+          : undefined;
+      const importedJob = await importDraft(
+        {
+          datasourceUid: selectedDatasource.uid,
+          scope,
+          draft,
+          importSource: fetched.source,
+          catalog: isCatalogFresh ? catalog.slice(0, 50) : undefined,
+        },
+        controller.signal
+      );
+      if (controller.signal.aborted || seq !== contextSeqRef.current) {
+        return;
+      }
+      // Only reset active preview/validation state once import has succeeded.
+      validatedFingerprintsRef.current.clear();
+      setPreviewSpec(null);
+      setPreviewScene(null);
+      setPreviewMeta(null);
+      setValidationResults([]);
+      setSavedResult(null);
+      setOptInUpdateExisting(false);
+
+      if (importedJob.importSource?.uid) {
+        latestImportMetaRef.current.set(
+          `${importedJob.jobId}:${importedJob.importSource.uid}`,
+          {
+            resourceVersion: importedJob.importSource.resourceVersion,
+            folderUid: importedJob.importSource.folderUid ?? '',
+            preservedAnnotations: fetched.preservedAnnotations,
+            preservedLabels: fetched.preservedLabels,
+          }
+        );
+      }
+      applyJobSnapshot(importedJob);
+      setImportReport(report);
+      if (fetched.source.folderUid !== undefined) {
+        setSelectedFolderUid(fetched.source.folderUid);
+      }
+      reconcileEditPanelId(importedJob);
+    } catch (err: unknown) {
+      if (!controller.signal.aborted && seq === contextSeqRef.current) {
+        setUiError(t('studio.errors.importFailed', { error: extractApiError(err) }));
+      }
     } finally {
       if (abortRef.current === controller && seq === contextSeqRef.current) {
         setBusyState('idle');
@@ -403,10 +594,11 @@ export const StudioPage: React.FC = () => {
       job?.jobId
     ) {
       const seq = contextSeqRef.current;
+      const opSeq = ++jobOpSeqRef.current;
       try {
         const updated = await cancelDraftJob(job.jobId);
-        if (seq === contextSeqRef.current) {
-          setJob(updated);
+        if (seq === contextSeqRef.current && opSeq === jobOpSeqRef.current) {
+          applyJobSnapshot(updated);
         }
       } catch {
         // Ignore cancel race errors if job already completed.
@@ -422,6 +614,7 @@ export const StudioPage: React.FC = () => {
     const controller = new AbortController();
     abortRef.current = controller;
     const seq = contextSeqRef.current;
+    jobOpSeqRef.current += 1;
 
     setBusyState('undoing');
     setUiError(null);
@@ -430,7 +623,13 @@ export const StudioPage: React.FC = () => {
       if (controller.signal.aborted || seq !== contextSeqRef.current) {
         return;
       }
-      setJob(updated);
+      validatedFingerprintsRef.current.clear();
+      setValidationResults([]);
+      setPreviewSpec(null);
+      setPreviewScene(null);
+      setPreviewMeta(null);
+      setOptInUpdateExisting(false);
+      applyJobSnapshot(updated);
       reconcileEditPanelId(updated);
       setSavedResult(null);
     } catch (err: unknown) {
@@ -446,7 +645,7 @@ export const StudioPage: React.FC = () => {
 
   /**
    * Explicit user action: runs bounded Dry-Run validation (5m, maxDataPoints=10, concurrency<=2)
-   * ONLY for panels whose queryHash changed or were not previously validated cleanly (H-9).
+   * ONLY for panels whose (queryHash, variablesFingerprint) changed or were not previously validated cleanly (H-9).
    * Blocks Scenes construction and Save if any panel has a blocking error (C-2).
    */
   const handleValidateAndPreview = async () => {
@@ -470,23 +669,30 @@ export const StudioPage: React.FC = () => {
         selectedDatasource,
         publicCfg?.maxPanels ?? 6
       );
+      const varsFingerprint = computeVariablesFingerprint(normalized);
 
-      // Compare queryHash against previously cached validation results for the SAME job (H-9).
+      // Compare BOTH queryHash and variablesFingerprint for the SAME jobId so variable
+      // edits always invalidate cached panel dry-run results.
       const prevByPanel = new Map<string, PanelValidationResult>();
-      if (previewMeta?.jobId === targetJobId || validationResults.length > 0) {
-        for (const r of validationResults) {
-          prevByPanel.set(r.panelId, r);
-        }
+      for (const r of validationResults) {
+        prevByPanel.set(r.panelId, r);
       }
 
       const panelsNeedingValidation: string[] = [];
+      const panelHashMap = new Map<string, string>();
       for (const panel of normalized.panels) {
-        const expectedHash = await computeQueryHash(panel.target.expr);
-        const cached = prevByPanel.get(panel.id);
+        const expectedHash = await computePanelQueryHash(panel.targets);
+        panelHashMap.set(panel.id, expectedHash);
+        const cacheKey = `${targetJobId}:${panel.id}`;
+        const cachedEntry = validatedFingerprintsRef.current.get(cacheKey);
+        const prevResult = prevByPanel.get(panel.id);
         const cachedClean =
-          cached &&
-          cached.queryHash === expectedHash &&
-          !BLOCKING_CATEGORIES.has(cached.category);
+          Boolean(cachedEntry) &&
+          Boolean(prevResult) &&
+          cachedEntry!.rawQueryHash === expectedHash &&
+          cachedEntry!.varsFingerprint === varsFingerprint &&
+          prevResult!.queryHash === expectedHash &&
+          !BLOCKING_CATEGORIES.has(cachedEntry!.category);
         if (!cachedClean) {
           panelsNeedingValidation.push(panel.id);
         }
@@ -510,6 +716,15 @@ export const StudioPage: React.FC = () => {
       }
 
       const mergedResults = mergeValidationResults(validationResults, freshResults, normalized);
+      // Sync cache entries for the current jobId and current panel set.
+      validatedFingerprintsRef.current.clear();
+      for (const r of mergedResults) {
+        validatedFingerprintsRef.current.set(`${targetJobId}:${r.panelId}`, {
+          rawQueryHash: panelHashMap.get(r.panelId) ?? r.queryHash,
+          varsFingerprint,
+          category: r.category,
+        });
+      }
       setValidationResults(mergedResults);
 
       const hasBlockingErrors = mergedResults.some((r) => BLOCKING_CATEGORIES.has(r.category));
@@ -552,19 +767,20 @@ export const StudioPage: React.FC = () => {
     if (typeof err === 'object' && err !== null) {
       const maybeJob = (err as { data?: { job?: JobSnapshot } })?.data?.job;
       if (maybeJob && maybeJob.jobId) {
-        setJob(maybeJob);
+        applyJobSnapshot(maybeJob);
       }
     }
   };
 
   const handleRepairSyntaxErrors = async () => {
-    if (!job?.currentIR || syntaxErrors.length === 0 || busyState !== 'idle') {
+    if (!job?.currentIR || syntaxErrors.length === 0 || busyState !== 'idle' || !isCatalogFresh) {
       return;
     }
     abortRef.current?.abort();
     const controller = new AbortController();
     abortRef.current = controller;
     const seq = contextSeqRef.current;
+    jobOpSeqRef.current += 1;
 
     setBusyState('repairing');
     setUiError(null);
@@ -584,8 +800,11 @@ export const StudioPage: React.FC = () => {
         controller.signal
       );
       if (!controller.signal.aborted && seq === contextSeqRef.current) {
-        setJob(updated);
+        applyJobSnapshot(updated);
         // Clear stale syntax_error results so repaired panels must be re-validated (M-11).
+        for (const s of syntaxErrors) {
+          validatedFingerprintsRef.current.delete(`${job.jobId}:${s.panelId}`);
+        }
         setValidationResults((prev) =>
           prev.filter((r) => !syntaxErrors.some((s) => s.panelId === r.panelId))
         );
@@ -603,7 +822,11 @@ export const StudioPage: React.FC = () => {
     }
   };
 
-  const handleSaveNewDashboard = async () => {
+  const canOptInUpdate = Boolean(
+    job?.importSource?.uid && job?.importSource?.resourceVersion
+  );
+
+  const handleSaveDashboard = async () => {
     if (!job?.currentIR || !selectedDatasource || !previewSpec || !previewMeta) {
       setUiError(t('studio.errors.previewRequiredBeforeSave'));
       return;
@@ -628,13 +851,56 @@ export const StudioPage: React.FC = () => {
         selectedDatasource,
         publicCfg?.maxPanels ?? 6
       );
-      const res = await saverRef.current.createNewDashboard({
-        spec: currentSpec,
-        previewedRevision: previewMeta.revision,
-        folderUid: selectedFolderUid,
-      });
+      const useUpdate =
+        optInUpdateExisting &&
+        Boolean(job.importSource?.uid) &&
+        Boolean(job.importSource?.resourceVersion);
+
+      const importMetaKey = job.importSource?.uid
+        ? `${job.jobId}:${job.importSource.uid}`
+        : '';
+      const preservedMeta = importMetaKey
+        ? latestImportMetaRef.current.get(importMetaKey)
+        : undefined;
+      const updateFolderUid = job.importSource?.folderUid ?? preservedMeta?.folderUid ?? '';
+
+      const res = useUpdate
+        ? await saverRef.current.updateExistingDashboard({
+            spec: currentSpec,
+            previewedRevision: previewMeta.revision,
+            targetUid: job.importSource!.uid,
+            expectedResourceVersion:
+              preservedMeta?.resourceVersion || job.importSource!.resourceVersion!,
+            folderUid: updateFolderUid,
+            preservedAnnotations: preservedMeta?.preservedAnnotations,
+            preservedLabels: preservedMeta?.preservedLabels,
+          })
+        : await saverRef.current.createNewDashboard({
+            spec: currentSpec,
+            previewedRevision: previewMeta.revision,
+            folderUid: selectedFolderUid,
+          });
       if (seq === contextSeqRef.current) {
         setSavedResult(res);
+        setOptInUpdateExisting(false);
+        if (useUpdate && res.resourceVersion && importMetaKey) {
+          latestImportMetaRef.current.set(importMetaKey, {
+            ...preservedMeta,
+            resourceVersion: res.resourceVersion,
+            folderUid: updateFolderUid,
+          });
+          setJob((prev) =>
+            prev?.importSource
+              ? {
+                  ...prev,
+                  importSource: {
+                    ...prev.importSource,
+                    resourceVersion: res.resourceVersion,
+                  },
+                }
+              : prev
+          );
+        }
       }
     } catch (err: unknown) {
       if (seq === contextSeqRef.current) {
@@ -698,6 +964,7 @@ export const StudioPage: React.FC = () => {
 
   const canCancel =
     busyState === 'generating' ||
+    busyState === 'importing' ||
     busyState === 'patching' ||
     busyState === 'validating' ||
     busyState === 'repairing';
@@ -722,7 +989,14 @@ export const StudioPage: React.FC = () => {
 
       {savedResult && (
         <div data-testid="studio-saved-alert">
-          <Alert title={t('studio.savedAlert.title')} severity="success">
+          <Alert
+            title={
+              savedResult.mode === 'updated'
+                ? t('studio.savedAlert.updatedTitle')
+                : t('studio.savedAlert.title')
+            }
+            severity="success"
+          >
             {t('studio.savedAlert.uidPrefix')}{' '}
             <code data-testid="studio-saved-uid">{savedResult.uid}</code>{' '}
             {t('studio.savedAlert.revision', { revision: savedResult.revision })} —{' '}
@@ -734,7 +1008,7 @@ export const StudioPage: React.FC = () => {
       )}
 
       <div style={{ display: 'grid', gridTemplateColumns: '420px 1fr', gap: 16, alignItems: 'start' }}>
-        {/* Left Pane: Scope, Chat, Status, Diff, Validation, Save/Export */}
+        {/* Left Pane: Scope, Optional Safe Import, Chat, Status, Diff, Validation, Save/Export */}
         <div style={{ display: 'flex', flexDirection: 'column', gap: 12, border: '1px solid #2c3235', borderRadius: 6, padding: 12 }}>
           <h4 style={{ margin: 0 }}>{t('studio.title')}</h4>
 
@@ -798,6 +1072,92 @@ export const StudioPage: React.FC = () => {
             {catalogTruncated ? ` ${t('studio.catalog.truncatedSuffix')}` : ''}
             {catalog.length > 0 && !isCatalogFresh ? ` ${t('studio.catalog.staleSuffix')}` : ''}
           </div>
+
+          <div style={{ borderTop: '1px solid #2c3235', paddingTop: 8 }}>
+            <Button
+              size="sm"
+              variant="secondary"
+              onClick={() => setShowImportPanel((prev) => !prev)}
+              disabled={!selectedDsUid}
+            >
+              {showImportPanel ? t('studio.import.closeButton') : t('studio.import.openButton')}
+            </Button>
+            {showImportPanel && (
+              <div
+                data-testid="studio-import-section"
+                style={{ marginTop: 8, display: 'flex', flexDirection: 'column', gap: 8 }}
+              >
+                <Field label={t('studio.import.uidLabel')}>
+                  <Input
+                    value={importUid}
+                    onChange={(e) => setImportUid(e.currentTarget.value)}
+                    placeholder={t('studio.import.uidPlaceholder')}
+                  />
+                </Field>
+                <div style={{ display: 'flex', gap: 8 }}>
+                  <Button
+                    size="sm"
+                    variant="secondary"
+                    onClick={handleListExistingDashboards}
+                    disabled={busyState !== 'idle'}
+                  >
+                    {t('studio.import.listButton')}
+                  </Button>
+                  <Button
+                    size="sm"
+                    variant="primary"
+                    onClick={handleImportExistingDashboard}
+                    disabled={!importUid.trim() || !selectedDatasource || busyState !== 'idle'}
+                  >
+                    {busyState === 'importing'
+                      ? t('studio.import.importing')
+                      : t('studio.import.importButton')}
+                  </Button>
+                </div>
+                {existingDashboards.length > 0 && (
+                  <Select
+                    options={existingDashboards.map((d) => ({
+                      label: `${d.title} (${d.uid})`,
+                      value: d.uid,
+                    }))}
+                    value={importUid}
+                    onChange={(v) => setImportUid(v.value ?? '')}
+                    placeholder={t('studio.import.selectPlaceholder')}
+                  />
+                )}
+              </div>
+            )}
+          </div>
+
+          {importReport && (
+            <div
+              data-testid="studio-import-report"
+              style={{ fontSize: 12, border: '1px solid #2c3235', borderRadius: 4, padding: 8 }}
+            >
+              <strong>{t('studio.import.reportTitle')}</strong>{' '}
+              {t('studio.import.reportCounts', {
+                panels: importReport.importedPanelCount,
+                variables: importReport.importedVariableCount,
+              })}
+              {importReport.skippedPanels.length > 0 && (
+                <div>
+                  {t('studio.import.skippedPanels', {
+                    items: importReport.skippedPanels.map((s) => `${s.title} (${s.reason})`).join(', '),
+                  })}
+                </div>
+              )}
+              {importReport.skippedVariables.length > 0 && (
+                <div>
+                  {t('studio.import.skippedVariables', {
+                    items: importReport.skippedVariables.map((s) => `${s.title} (${s.reason})`).join(', '),
+                  })}
+                </div>
+              )}
+              {importReport.warnings.length > 0 && (
+                <div style={{ color: '#ff9830' }}>{importReport.warnings.join(' / ')}</div>
+              )}
+            </div>
+          )}
 
           {job?.currentIR && (
             <Field label={t('studio.edit.label')}>
@@ -864,7 +1224,18 @@ export const StudioPage: React.FC = () => {
                   </span>
                 )}
               </div>
+              {job.currentIR?.variables && job.currentIR.variables.length > 0 && (
+                <div data-testid="studio-ir-variables" style={{ fontSize: 12, color: '#9fa7b3' }}>
+                  {t('studio.job.variablesLabel')}{' '}
+                  {job.currentIR.variables.map((v) => `$${v.name} (${v.type})`).join(', ')}
+                </div>
+              )}
               {job.summary && <div style={{ fontSize: 13 }}>{job.summary}</div>}
+              {job.warnings && job.warnings.length > 0 && (
+                <div data-testid="studio-job-warnings" style={{ fontSize: 12, color: '#ff9830' }}>
+                  <strong>{t('studio.job.warningsLabel')}</strong> {job.warnings.join(' / ')}
+                </div>
+              )}
               {job.errorMessage && (
                 <Alert title={t('studio.job.messageTitle')} severity="warning">
                   {job.errorMessage}
@@ -914,36 +1285,72 @@ export const StudioPage: React.FC = () => {
               {syntaxErrors.length > 0 &&
                 job &&
                 job.repairAttemptsUsed < job.maxRepairAttempts && (
-                  <Button
-                    size="sm"
-                    variant="secondary"
-                    onClick={handleRepairSyntaxErrors}
-                    disabled={busyState !== 'idle'}
-                  >
-                    {busyState === 'repairing'
-                      ? t('studio.validation.repairing')
-                      : t('studio.validation.repairSyntaxOnly')}
-                  </Button>
+                  <>
+                    <Button
+                      size="sm"
+                      variant="secondary"
+                      onClick={handleRepairSyntaxErrors}
+                      disabled={busyState !== 'idle' || !isCatalogFresh}
+                    >
+                      {busyState === 'repairing'
+                        ? t('studio.validation.repairing')
+                        : t('studio.validation.repairSyntaxOnly')}
+                    </Button>
+                    {!isCatalogFresh && (
+                      <div style={{ fontSize: 11, color: '#9fa7b3' }}>
+                        {t('studio.validation.repairCatalogRequiredHint')}
+                      </div>
+                    )}
+                  </>
                 )}
             </div>
           )}
 
           {job?.currentIR && (
             <div style={{ borderTop: '1px solid #2c3235', paddingTop: 10, display: 'flex', flexDirection: 'column', gap: 8 }}>
-              <Field label={t('studio.save.folderLabel')}>
+              <Field
+                label={
+                  optInUpdateExisting && canOptInUpdate
+                    ? t('studio.save.folderLabelUpdateLocked')
+                    : t('studio.save.folderLabel')
+                }
+              >
                 <Select
-                  options={folders.map((f) => ({
-                    label: f.uid === '' ? t('save.folder.generalRoot') : f.title,
-                    value: f.uid,
-                  }))}
-                  value={selectedFolderUid}
+                  options={folderOptions}
+                  value={
+                    optInUpdateExisting && canOptInUpdate
+                      ? job.importSource?.folderUid ?? ''
+                      : selectedFolderUid
+                  }
                   onChange={(v) => setSelectedFolderUid(v.value ?? '')}
+                  disabled={optInUpdateExisting && canOptInUpdate}
                 />
               </Field>
+              {canOptInUpdate && (
+                <label
+                  data-testid="studio-optin-update-label"
+                  style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 12, cursor: 'pointer' }}
+                >
+                  <input
+                    data-testid="studio-optin-update-checkbox"
+                    type="checkbox"
+                    checked={optInUpdateExisting}
+                    onChange={(e) => setOptInUpdateExisting(e.currentTarget.checked)}
+                  />
+                  <span>
+                    {t('studio.save.optInUpdateLabel', {
+                      uid: job.importSource?.uid ?? '',
+                      rv: job.importSource?.resourceVersion ?? '',
+                    })}
+                  </span>
+                </label>
+              )}
               <div style={{ display: 'flex', gap: 8 }}>
-                <Button onClick={handleSaveNewDashboard} disabled={!canSave}>
+                <Button onClick={handleSaveDashboard} disabled={!canSave}>
                   {busyState === 'saving'
                     ? t('studio.save.saving')
+                    : optInUpdateExisting && canOptInUpdate
+                    ? t('studio.save.updateExistingDashboard')
                     : t('studio.save.saveNewDashboard')}
                 </Button>
                 <Button variant="secondary" onClick={handleExportJson} disabled={busyState !== 'idle'}>

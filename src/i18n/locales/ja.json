@@ -10,6 +10,7 @@
     },
     "savedAlert": {
       "title": "ダッシュボードを新規保存しました",
+      "updatedTitle": "既存ダッシュボードを更新しました（revision 検証済み）",
       "uidPrefix": "UID:",
       "revision": "(rev {{revision}})",
       "openLink": "保存したダッシュボードを開いてクエリ・単位・閾値・配置を確認"
@@ -33,6 +34,21 @@
       "truncatedSuffix": "（上限で打ち切り）",
       "staleSuffix": "（スコープ変更済み・再取得が必要）"
     },
+    "import": {
+      "openButton": "既存ダッシュボードをインポート（任意）",
+      "closeButton": "既存インポートを閉じる",
+      "uidLabel": "既存ダッシュボード UID",
+      "uidPlaceholder": "existing-dashboard-uid",
+      "listButton": "一覧取得",
+      "importButton": "安全な IR としてインポート",
+      "importing": "インポート中...",
+      "selectPlaceholder": "既存ダッシュボードを選択",
+      "reportTitle": "インポート結果:",
+      "reportCounts": "パネル {{panels}} 件 / 変数 {{variables}} 件",
+      "skippedPanels": "スキップしたパネル: {{items}}",
+      "skippedVariables": "スキップした変数: {{items}}",
+      "folderFallback": "インポート元フォルダ ({{uid}})"
+    },
     "edit": {
       "label": "編集モード / 対象パネル",
       "autoPatch": "既存ドラフトを部分修正（自動判定）",
@@ -54,6 +70,8 @@
     "job": {
       "statusLabel": "状態:",
       "revision": "rev {{revision}}",
+      "variablesLabel": "変数:",
+      "warningsLabel": "警告:",
       "messageTitle": "生成・検査メッセージ",
       "diffTitle": "変更内容 (Diff):",
       "repairBudget": "修復予算: {{used}} / {{max}} 回使用"
@@ -62,6 +80,7 @@
       "heading": "検証結果（Dry-Run: 直近5m / maxDataPoints=10）",
       "repairing": "修復中...",
       "repairSyntaxOnly": "構文エラーのみ自動修復",
+      "repairCatalogRequiredHint": "自動修復を実行するには先に「スコープのメトリクスを取得」を実行してください。",
       "category": {
         "ok": "正常",
         "empty_result": "空結果（自動修復対象外）",
@@ -73,8 +92,11 @@
     },
     "save": {
       "folderLabel": "保存先フォルダ（新規作成のみ）",
+      "folderLabelUpdateLocked": "保存先フォルダ（既存更新時は元のフォルダを維持）",
+      "optInUpdateLabel": "インポート元 ({{uid}}, rv={{rv}}) を revision 検証付きで更新（任意）",
       "saving": "保存中...",
       "saveNewDashboard": "新規ダッシュボード保存",
+      "updateExistingDashboard": "既存ダッシュボードを更新",
       "exportJson": "JSONエクスポート",
       "requiresValidationHint": "最新リビジョン (rev {{revision}}) の「検証・プレビューを実行」がエラーなしで完了すると保存できます。"
     },
@@ -96,6 +118,8 @@
       "metadataFailed": "メタデータ取得エラー: {{error}}",
       "datasourceRequired": "許可された Prometheus データソースを選択してください。",
       "catalogRequired": "現在のスコープに対応するメトリクス候補を取得してください（「スコープのメトリクスを取得」を実行）。",
+      "listDashboardsFailed": "ダッシュボード一覧取得エラー: {{error}}",
+      "importFailed": "既存ダッシュボードのインポートに失敗しました: {{error}}",
       "validationBlocked": "Dry-Run 検証でエラー（構文エラー・権限エラー・タイムアウト等）が検出されたため、Scenes プレビューと保存をブロックしました。",
       "validationFailed": "検証・プレビューに失敗しました: {{error}}",
       "previewRequiredBeforeSave": "保存前に「検証・プレビューを実行」して最新ドラフトを確認してください。",
@@ -188,10 +212,15 @@
     "errors": {
       "inFlight": "保存処理がすでに進行中です。完了までお待ちください。",
       "revisionMismatch": "保存対象リビジョン (rev {{targetRevision}}) が確認済みプレビュー (rev {{previewedRevision}}) と一致しません。先に検証・プレビューを実行してください。",
+      "missingResourceVersion": "既存ダッシュボードの更新には対象 UID とインポート時の resourceVersion が必須です。コピーとして新規保存してください。",
       "defaultMessage": "ダッシュボードの新規保存に失敗しました",
+      "updateDefaultMessage": "既存ダッシュボードの更新に失敗しました",
       "permissionDenied": "選択したフォルダへの保存権限がありません (HTTP {{status}}): {{message}}",
+      "updatePermissionDenied": "対象ダッシュボードの更新権限がありません (HTTP {{status}}): {{message}}",
       "uidConflict": "UID 衝突のため新規作成を中止しました。既存ダッシュボードは上書きされていません (HTTP {{status}}): {{message}}",
-      "apiError": "ダッシュボード保存 API エラー (HTTP {{status}}): {{message}}"
+      "revisionConflict": "インポート後に既存ダッシュボードが他で更新されたため上書きを中止しました (HTTP {{status}})。再インポートするか新規コピーとして保存してください: {{message}}",
+      "apiError": "ダッシュボード保存 API エラー (HTTP {{status}}): {{message}}",
+      "updateApiError": "ダッシュボード更新 API エラー (HTTP {{status}}): {{message}}"
     }
   },
   "validator": {
