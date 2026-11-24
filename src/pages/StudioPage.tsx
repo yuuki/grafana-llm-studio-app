@@ -105,6 +105,24 @@ function isPrometheusCompatibleType(dsType: string): boolean {
   return lower === 'prometheus' || lower.includes('victoriametrics');
 }
 
+function resolveDatasourceDialect(
+  ds: AllowedDatasourceOption | null,
+  pinnedDialects?: Record<string, 'promql' | 'metricsql'>
+): { kind: 'promql' | 'metricsql'; pinned: boolean } {
+  if (!ds) {
+    return { kind: 'promql', pinned: false };
+  }
+  const pinned = pinnedDialects?.[ds.uid];
+  if (pinned === 'promql' || pinned === 'metricsql') {
+    return { kind: pinned, pinned: true };
+  }
+  const lower = (ds.type || '').toLowerCase();
+  if (lower.includes('victoriametrics')) {
+    return { kind: 'metricsql', pinned: false };
+  }
+  return { kind: 'promql', pinned: false };
+}
+
 function makeScopeKey(dsUid: string, labelName: string, labelValue: string): string {
   return `${dsUid}::${labelName}::${labelValue.trim()}`;
 }
@@ -296,6 +314,11 @@ export const StudioPage: React.FC = () => {
     [allowedDatasources, selectedDsUid]
   );
 
+  const activeDialect = useMemo(
+    () => resolveDatasourceDialect(selectedDatasource, publicCfg?.datasourceDialects),
+    [selectedDatasource, publicCfg?.datasourceDialects]
+  );
+
   const folderOptions = useMemo(() => {
     const opts = folders.map((f) => ({
       label: f.uid === '' ? t('save.folder.generalRoot') : f.title,
@@ -341,7 +364,8 @@ export const StudioPage: React.FC = () => {
         scopeLabelName,
         3600,
         100,
-        controller.signal
+        controller.signal,
+        selectedDatasource?.type
       );
       if (controller.signal.aborted || seq !== contextSeqRef.current) {
         return;
@@ -373,6 +397,7 @@ export const StudioPage: React.FC = () => {
     try {
       const res = await fetchScopedMetricCatalog({
         datasourceUid: selectedDsUid,
+        datasourceType: selectedDatasource?.type,
         scope: { labelName: scopeLabelName, labelValue: scopeLabelValue.trim() },
         signal: controller.signal,
       });
@@ -450,6 +475,7 @@ export const StudioPage: React.FC = () => {
           : await generateDraft(
               {
                 datasourceUid: selectedDsUid,
+                queryKind: activeDialect.kind,
                 scope,
                 userIntent: promptText,
                 catalog: narrowedCatalog,
@@ -524,6 +550,7 @@ export const StudioPage: React.FC = () => {
       const { draft, report } = convertGrafanaDashboardToIR(fetched.rawDashboard, {
         selectedDatasourceUid: selectedDatasource.uid,
         selectedDatasourceName: selectedDatasource.name,
+        queryKind: activeDialect.kind,
         maxPanels: publicCfg?.maxPanels ?? 6,
       });
       const scope: ScopeFilter | undefined =
@@ -533,6 +560,7 @@ export const StudioPage: React.FC = () => {
       const importedJob = await importDraft(
         {
           datasourceUid: selectedDatasource.uid,
+          queryKind: activeDialect.kind,
           scope,
           draft,
           importSource: fetched.source,
@@ -1020,6 +1048,24 @@ export const StudioPage: React.FC = () => {
               placeholder={t('studio.datasource.placeholder')}
             />
           </Field>
+
+          {selectedDatasource && (
+            <div
+              data-testid="studio-active-dialect"
+              style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 12, color: '#9fa7b3' }}
+            >
+              <span>{t('studio.datasource.dialectLabel')}</span>
+              <Badge
+                text={activeDialect.kind === 'metricsql' ? 'MetricsQL' : 'PromQL'}
+                color={activeDialect.kind === 'metricsql' ? 'purple' : 'blue'}
+              />
+              <span>
+                {activeDialect.pinned
+                  ? t('studio.datasource.dialectPinned')
+                  : t('studio.datasource.dialectAuto')}
+              </span>
+            </div>
+          )}
 
           <div style={{ display: 'grid', gridTemplateColumns: '120px 1fr', gap: 8 }}>
             <Field label={t('studio.scope.labelName')}>

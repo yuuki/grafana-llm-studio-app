@@ -12,8 +12,10 @@ import (
 
 	"github.com/yuuki/grafana-llm-studio-app/pkg/ir"
 	"github.com/yuuki/grafana-llm-studio-app/pkg/llm"
+	"github.com/yuuki/grafana-llm-studio-app/pkg/metricsql"
 	"github.com/yuuki/grafana-llm-studio-app/pkg/promql"
 	"github.com/yuuki/grafana-llm-studio-app/pkg/prompt"
+	"github.com/yuuki/grafana-llm-studio-app/pkg/query"
 )
 
 var (
@@ -63,6 +65,8 @@ type Config struct {
 	MaxRepairAttemptsSet bool
 	JobDeadline          time.Duration
 	AllowedDSUIDs        []string
+	DatasourceDialects   map[string]string
+	QueryRegistry        *query.Registry
 }
 
 func (c *Config) normalize() {
@@ -105,6 +109,7 @@ type JobSnapshot struct {
 	JobID              string              `json:"jobId"`
 	Status             JobStatus           `json:"status"`
 	DatasourceUID      string              `json:"datasourceUid"`
+	QueryKind          string              `json:"queryKind,omitempty"`
 	Scope              *ir.ScopeFilter     `json:"scope,omitempty"`
 	ImportSource       *ir.ImportSource    `json:"importSource,omitempty"`
 	CurrentIR          *ir.DashboardIR     `json:"currentIR,omitempty"`
@@ -123,6 +128,7 @@ type jobRecord struct {
 	id                 string
 	owner              Owner
 	datasourceUID      string
+	queryKind          query.Kind
 	scope              *ir.ScopeFilter
 	importSource       *ir.ImportSource
 	status             JobStatus
@@ -149,6 +155,7 @@ type Manager struct {
 	mu           sync.Mutex
 	cfg          Config
 	client       llm.Client
+	registry     *query.Registry
 	jobs         map[string]*jobRecord
 	activeGlobal int
 	activeByUser map[Owner]int
@@ -158,9 +165,17 @@ type Manager struct {
 // NewManager creates a new bounded job manager.
 func NewManager(client llm.Client, cfg Config) *Manager {
 	cfg.normalize()
+	reg := cfg.QueryRegistry
+	if reg == nil {
+		reg = query.NewRegistry(
+			promql.NewAdapter(promql.DefaultPolicy()),
+			metricsql.NewAdapter(metricsql.DefaultPolicy()),
+		)
+	}
 	return &Manager{
 		cfg:          cfg,
 		client:       client,
+		registry:     reg,
 		jobs:         make(map[string]*jobRecord),
 		activeByUser: make(map[Owner]int),
 		nowFunc:      time.Now,
@@ -183,6 +198,7 @@ func (m *Manager) Close() {
 // GenerateInput is the request payload for starting a new draft generation job.
 type GenerateInput struct {
 	DatasourceUID string                 `json:"datasourceUid"`
+	QueryKind     string                 `json:"queryKind,omitempty"`
 	Scope         *ir.ScopeFilter        `json:"scope,omitempty"`
 	UserIntent    string                 `json:"userIntent"`
 	Catalog       []ir.MetricCatalogItem `json:"catalog"`
@@ -191,6 +207,7 @@ type GenerateInput struct {
 // ImportInput is the request payload for creating a constrained draft job from an existing dashboard.
 type ImportInput struct {
 	DatasourceUID string                 `json:"datasourceUid"`
+	QueryKind     string                 `json:"queryKind,omitempty"`
 	Scope         *ir.ScopeFilter        `json:"scope,omitempty"`
 	Draft         ir.DashboardIR         `json:"draft"`
 	ImportSource  *ir.ImportSource       `json:"importSource,omitempty"`
@@ -212,7 +229,7 @@ type RepairInput struct {
 	Catalog      []ir.MetricCatalogItem     `json:"catalog"`
 }
 
-// Generate creates a new owner-bound job, calls the configured LLM, and validates the IR + PromQL.
+// Generate creates a new owner-bound job, calls the configured LLM, and validates the IR + queries.
 func (m *Manager) Generate(ctx context.Context, owner Owner, in GenerateInput) (JobSnapshot, error) {
 	if err := validateOwner(owner); err != nil {
 		return JobSnapshot{}, err
@@ -221,10 +238,14 @@ func (m *Manager) Generate(ctx context.Context, owner Owner, in GenerateInput) (
 	if !m.isDatasourceAllowed(dsUID) {
 		return JobSnapshot{}, fmt.Errorf("%w: %q", ErrDatasourceDenied, dsUID)
 	}
+	qKind, adapter, err := m.resolveAdapter(dsUID, in.QueryKind)
+	if err != nil {
+		return JobSnapshot{}, err
+	}
 	if strings.TrimSpace(in.UserIntent) == "" {
 		return JobSnapshot{}, errors.New("userIntent is required")
 	}
-	if err := promql.ValidateScopeFilter(in.Scope); err != nil {
+	if err := adapter.ValidateScopeFilter(in.Scope); err != nil {
 		return JobSnapshot{}, err
 	}
 	safeScope := prompt.SanitizeScope(in.Scope)
@@ -235,6 +256,7 @@ func (m *Manager) Generate(ctx context.Context, owner Owner, in GenerateInput) (
 		return JobSnapshot{
 			Status:            StatusInsufficientMetrics,
 			DatasourceUID:     dsUID,
+			QueryKind:         string(qKind),
 			Scope:             safeScope,
 			MaxRepairAttempts: m.cfg.MaxRepairAttempts,
 			ErrorMessage:      "選択スコープに利用可能なメトリクス候補がありません。メトリクス名を捏造せず中断しました。",
@@ -264,6 +286,7 @@ func (m *Manager) Generate(ctx context.Context, owner Owner, in GenerateInput) (
 		id:                jobID,
 		owner:             owner,
 		datasourceUID:     dsUID,
+		queryKind:         qKind,
 		scope:             cloneScope(safeScope),
 		status:            StatusGenerating,
 		maxRepairAttempts: m.cfg.MaxRepairAttempts,
@@ -281,10 +304,12 @@ func (m *Manager) Generate(ctx context.Context, owner Owner, in GenerateInput) (
 	defer m.releaseSlot(owner)
 
 	raw, meta, err := m.client.GenerateIR(opCtx, llm.GenerateRequest{
-		UserIntent: in.UserIntent,
-		Scope:      rec.scope,
-		Catalog:    boundedCatalog,
-		MaxPanels:  m.cfg.MaxPanels,
+		UserIntent:   in.UserIntent,
+		Scope:        rec.scope,
+		Catalog:      boundedCatalog,
+		MaxPanels:    m.cfg.MaxPanels,
+		QueryKind:    string(qKind),
+		DialectRules: adapter.PromptRules(),
 	})
 	if err != nil {
 		if errors.Is(err, context.Canceled) || opCtx.Err() == context.Canceled {
@@ -303,19 +328,23 @@ func (m *Manager) Generate(ctx context.Context, owner Owner, in GenerateInput) (
 		return m.finishJob(jobID, opToken, StatusFailed, nil, nil, "", nil, fmt.Sprintf("IR JSON Schema 検査に失敗しました: %v", err), &meta)
 	}
 	doc.Revision = 1
+	if qKind != query.KindPromQL {
+		doc.StampQueryKind(string(qKind))
+	}
 
-	warnings, err := promql.ValidateDashboardIR(
+	warnings, err := query.ValidateDashboardIR(
+		adapter,
 		doc,
 		boundedCatalog,
 		rec.scope,
 		ir.ValidateOptions{MaxPanels: m.cfg.MaxPanels},
-		promql.DefaultPolicy(),
+		query.ValidateOptions{RequireCatalogMatch: true},
 	)
 	if err != nil {
-		if errors.Is(err, promql.ErrMetricNotInCatalog) {
+		if errors.Is(err, query.ErrMetricNotInCatalog) {
 			return m.finishJob(jobID, opToken, StatusInsufficientMetrics, nil, nil, "", nil, fmt.Sprintf("カタログ外のメトリクス参照を検出し拒否しました: %v", err), &meta)
 		}
-		return m.finishJob(jobID, opToken, StatusFailed, nil, nil, "", nil, fmt.Sprintf("IR/PromQL 検査に失敗しました: %v", err), &meta)
+		return m.finishJob(jobID, opToken, StatusFailed, nil, nil, "", nil, fmt.Sprintf("IR/%s 検査に失敗しました: %v", adapter.DisplayName(), err), &meta)
 	}
 
 	return m.finishJob(jobID, opToken, StatusAwaitingPreview, &doc, nil, "初期ドラフトを生成しました。検証・プレビューを実行して内容を確認してください。", warnings, "", &meta)
@@ -323,7 +352,7 @@ func (m *Manager) Generate(ctx context.Context, owner Owner, in GenerateInput) (
 
 // Import validates a constrained DashboardIR converted from an existing Grafana dashboard
 // and registers it as an owner-bound draft job ready for dry-run validation, preview, and patching.
-// Static IR schema + PromQL AST/regex/range safety policies are ALWAYS enforced; catalog membership
+// Static IR schema + dialect AST/regex/range safety policies are ALWAYS enforced; catalog membership
 // is additionally enforced whenever a non-empty scoped catalog is supplied.
 func (m *Manager) Import(owner Owner, in ImportInput) (JobSnapshot, error) {
 	if err := validateOwner(owner); err != nil {
@@ -333,7 +362,11 @@ func (m *Manager) Import(owner Owner, in ImportInput) (JobSnapshot, error) {
 	if !m.isDatasourceAllowed(dsUID) {
 		return JobSnapshot{}, fmt.Errorf("%w: %q", ErrDatasourceDenied, dsUID)
 	}
-	if err := promql.ValidateScopeFilter(in.Scope); err != nil {
+	qKind, adapter, err := m.resolveAdapter(dsUID, in.QueryKind)
+	if err != nil {
+		return JobSnapshot{}, err
+	}
+	if err := adapter.ValidateScopeFilter(in.Scope); err != nil {
 		return JobSnapshot{}, err
 	}
 	if err := ir.ValidateImportSource(in.ImportSource); err != nil {
@@ -350,16 +383,17 @@ func (m *Manager) Import(owner Owner, in ImportInput) (JobSnapshot, error) {
 		return JobSnapshot{}, fmt.Errorf("imported IR validation failed: revision must be between 1 and %d, got %d", ir.MaxRevision, doc.Revision)
 	}
 	doc.Revision = 1
+	if qKind != query.KindPromQL {
+		doc.StampQueryKind(string(qKind))
+	}
 
-	policy := promql.DefaultPolicy()
-	policy.RequireCatalogMatch = len(boundedCatalog) > 0
-
-	warnings, err := promql.ValidateDashboardIR(
+	warnings, err := query.ValidateDashboardIR(
+		adapter,
 		doc,
 		boundedCatalog,
 		safeScope,
 		ir.ValidateOptions{MaxPanels: m.cfg.MaxPanels},
-		policy,
+		query.ValidateOptions{RequireCatalogMatch: len(boundedCatalog) > 0},
 	)
 	if err != nil {
 		return JobSnapshot{}, fmt.Errorf("imported IR validation failed: %w", err)
@@ -386,6 +420,7 @@ func (m *Manager) Import(owner Owner, in ImportInput) (JobSnapshot, error) {
 		id:                jobID,
 		owner:             owner,
 		datasourceUID:     dsUID,
+		queryKind:         qKind,
 		scope:             cloneScope(safeScope),
 		importSource:      cloneImportSource(in.ImportSource),
 		status:            StatusAwaitingPreview,
@@ -460,6 +495,15 @@ func (m *Manager) Patch(ctx context.Context, owner Owner, jobID string, in Patch
 	m.activeByUser[owner]++
 	currentCopy := rec.currentIR.Clone()
 	scopeCopy := cloneScope(rec.scope)
+	qKind := rec.queryKind
+	if qKind == "" {
+		qKind = query.KindPromQL
+	}
+	adapter, err := m.registry.Get(qKind)
+	if err != nil {
+		m.mu.Unlock()
+		return JobSnapshot{}, err
+	}
 	m.mu.Unlock()
 	defer m.releaseSlot(owner)
 
@@ -469,6 +513,8 @@ func (m *Manager) Patch(ctx context.Context, owner Owner, jobID string, in Patch
 		EditIntent:    in.EditIntent,
 		Scope:         scopeCopy,
 		Catalog:       boundedCatalog,
+		QueryKind:     string(qKind),
+		DialectRules:  adapter.PromptRules(),
 	})
 	if err != nil {
 		if errors.Is(err, context.Canceled) || opCtx.Err() == context.Canceled {
@@ -500,16 +546,20 @@ func (m *Manager) Patch(ctx context.Context, owner Owner, jobID string, in Patch
 	if err != nil {
 		return m.recordEditFailure(jobID, opToken, fmt.Sprintf("パッチ適用に失敗しました: %v", err), &meta)
 	}
+	if qKind != query.KindPromQL {
+		nextIR.StampQueryKind(string(qKind))
+	}
 
-	warnings, err := promql.ValidateDashboardIR(
+	warnings, err := query.ValidateDashboardIR(
+		adapter,
 		nextIR,
 		boundedCatalog,
 		scopeCopy,
 		ir.ValidateOptions{MaxPanels: m.cfg.MaxPanels},
-		promql.DefaultPolicy(),
+		query.ValidateOptions{RequireCatalogMatch: true},
 	)
 	if err != nil {
-		return m.recordEditFailure(jobID, opToken, fmt.Sprintf("パッチ後の PromQL 検査に失敗しました: %v", err), &meta)
+		return m.recordEditFailure(jobID, opToken, fmt.Sprintf("パッチ後の %s 検査に失敗しました: %v", adapter.DisplayName(), err), &meta)
 	}
 
 	return m.commitRevision(jobID, opToken, currentCopy.Revision, nextIR, diffs, patch.Summary, warnings, &meta)
@@ -612,6 +662,16 @@ func (m *Manager) Repair(ctx context.Context, owner Owner, jobID string, in Repa
 		return JobSnapshot{}, ErrConcurrencyLimited
 	}
 
+	qKind := rec.queryKind
+	if qKind == "" {
+		qKind = query.KindPromQL
+	}
+	adapter, err := m.registry.Get(qKind)
+	if err != nil {
+		m.mu.Unlock()
+		return JobSnapshot{}, err
+	}
+
 	boundedCatalog = enforceKnownGaugeTypes(boundedCatalog, rec.knownGauges)
 	recordKnownGauges(rec.knownGauges, boundedCatalog)
 
@@ -632,10 +692,12 @@ func (m *Manager) Repair(ctx context.Context, owner Owner, jobID string, in Repa
 	defer m.releaseSlot(owner)
 
 	raw, meta, err := m.client.RepairPanels(opCtx, llm.RepairRequest{
-		CurrentIR: currentCopy,
-		Targets:   targets,
-		Scope:     scopeCopy,
-		Catalog:   boundedCatalog,
+		CurrentIR:    currentCopy,
+		Targets:      targets,
+		Scope:        scopeCopy,
+		Catalog:      boundedCatalog,
+		QueryKind:    string(qKind),
+		DialectRules: adapter.PromptRules(),
 	})
 	if err != nil {
 		if errors.Is(err, context.Canceled) || opCtx.Err() == context.Canceled {
@@ -649,7 +711,8 @@ func (m *Manager) Repair(ctx context.Context, owner Owner, jobID string, in Repa
 		return m.recordEditFailure(jobID, opToken, fmt.Sprintf("修復パッチ JSON 検査に失敗しました: %v", err), &meta)
 	}
 
-	// Enforce that repair ONLY touches Query or Queries on the failing syntax_error panels.
+	// Enforce that repair ONLY touches Query or Queries on the failing syntax_error panels
+	// and NEVER mutates query.kind away from the job's active dialect.
 	allowedTargetIDs := make(map[string]bool, len(targets))
 	for _, t := range targets {
 		allowedTargetIDs[t.PanelID] = true
@@ -663,7 +726,17 @@ func (m *Manager) Repair(ctx context.Context, owner Owner, jobID string, in Repa
 			return m.recordEditFailure(jobID, opToken, "修復パッチによるデータソース変更は禁止されています", &meta)
 		}
 		if p.Type != "" || p.Title != "" || p.Description != nil || p.Unit != "" || p.Thresholds != nil || p.Layout != nil {
-			return m.recordEditFailure(jobID, opToken, "修復パッチは失敗パネルの PromQL クエリのみ変更可能です", &meta)
+			return m.recordEditFailure(jobID, opToken, fmt.Sprintf("修復パッチは失敗パネルの %s クエリのみ変更可能です", adapter.DisplayName()), &meta)
+		}
+		if p.Query != nil && p.Query.Kind != nil && *p.Query.Kind != "" && *p.Query.Kind != string(qKind) {
+			return m.recordEditFailure(jobID, opToken, fmt.Sprintf("修復パッチによるクエリ方言変更 (%q -> %q) は禁止されています", qKind, *p.Query.Kind), &meta)
+		}
+		if p.Queries != nil {
+			for _, q := range *p.Queries {
+				if q.Kind != "" && q.Kind != string(qKind) {
+					return m.recordEditFailure(jobID, opToken, fmt.Sprintf("修復パッチによるクエリ方言変更 (%q -> %q) は禁止されています", qKind, q.Kind), &meta)
+				}
+			}
 		}
 	}
 
@@ -671,16 +744,20 @@ func (m *Manager) Repair(ctx context.Context, owner Owner, jobID string, in Repa
 	if err != nil {
 		return m.recordEditFailure(jobID, opToken, fmt.Sprintf("修復パッチ適用に失敗しました: %v", err), &meta)
 	}
+	if qKind != query.KindPromQL {
+		nextIR.StampQueryKind(string(qKind))
+	}
 
-	warnings, err := promql.ValidateDashboardIR(
+	warnings, err := query.ValidateDashboardIR(
+		adapter,
 		nextIR,
 		boundedCatalog,
 		scopeCopy,
 		ir.ValidateOptions{MaxPanels: m.cfg.MaxPanels},
-		promql.DefaultPolicy(),
+		query.ValidateOptions{RequireCatalogMatch: true},
 	)
 	if err != nil {
-		return m.recordEditFailure(jobID, opToken, fmt.Sprintf("修復後の PromQL/スコープ検査に失敗しました: %v", err), &meta)
+		return m.recordEditFailure(jobID, opToken, fmt.Sprintf("修復後の %s/スコープ検査に失敗しました: %v", adapter.DisplayName(), err), &meta)
 	}
 
 	return m.commitRevision(jobID, opToken, currentCopy.Revision, nextIR, diffs, "構文エラーのパネルを修復しました。変更パネルを再検証してください。", warnings, &meta)
@@ -1041,6 +1118,31 @@ func (m *Manager) isDatasourceAllowed(uid string) bool {
 	return false
 }
 
+// resolveAdapter determines the authoritative query dialect for dsUID:
+// admin-configured DatasourceDialects[dsUID] takes precedence over client-supplied queryKind.
+func (m *Manager) resolveAdapter(dsUID string, clientKind string) (query.Kind, query.Adapter, error) {
+	if pinned, ok := m.cfg.DatasourceDialects[dsUID]; ok && strings.TrimSpace(pinned) != "" {
+		k, err := query.ParseKind(pinned)
+		if err != nil {
+			return "", nil, err
+		}
+		adapter, err := m.registry.Get(k)
+		if err != nil {
+			return "", nil, err
+		}
+		return k, adapter, nil
+	}
+	k, err := query.ParseKind(clientKind)
+	if err != nil {
+		return "", nil, err
+	}
+	adapter, err := m.registry.Get(k)
+	if err != nil {
+		return "", nil, err
+	}
+	return k, adapter, nil
+}
+
 func recordKnownGauges(dst map[string]bool, catalog []ir.MetricCatalogItem) {
 	if dst == nil {
 		return
@@ -1119,10 +1221,15 @@ func snapshotLocked(rec *jobRecord) JobSnapshot {
 		mc := *rec.llmMeta
 		metaCopy = &mc
 	}
+	qKind := rec.queryKind
+	if qKind == "" {
+		qKind = query.KindPromQL
+	}
 	return JobSnapshot{
 		JobID:              rec.id,
 		Status:             rec.status,
 		DatasourceUID:      rec.datasourceUID,
+		QueryKind:          string(qKind),
 		Scope:              cloneScope(rec.scope),
 		ImportSource:       cloneImportSource(rec.importSource),
 		CurrentIR:          irCopy,

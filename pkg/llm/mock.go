@@ -73,6 +73,12 @@ func (m *MockClient) GenerateIR(ctx context.Context, req GenerateRequest) ([]byt
 		}
 	}
 
+	isMetricsQL := strings.EqualFold(strings.TrimSpace(req.QueryKind), "metricsql")
+	queryKind := ""
+	if isMetricsQL {
+		queryKind = "metricsql"
+	}
+
 	if len(req.Catalog) == 0 {
 		return nil, CompletionMeta{ProviderMode: "mock"}, ErrInsufficientMetrics
 	}
@@ -83,7 +89,11 @@ func (m *MockClient) GenerateIR(ctx context.Context, req GenerateRequest) ([]byt
 		}
 		expr := fmt.Sprintf("%s%s", matched.Name, selector)
 		if strings.EqualFold(matched.Type, "counter") || strings.HasSuffix(matched.Name, "_total") {
-			expr = fmt.Sprintf("rate(%s%s[5m])", matched.Name, selector)
+			if isMetricsQL {
+				expr = fmt.Sprintf("rate(%s%s[5m]) default 0", matched.Name, selector)
+			} else {
+				expr = fmt.Sprintf("rate(%s%s[5m])", matched.Name, selector)
+			}
 		}
 		doc := ir.DashboardIR{
 			SchemaVersion: ir.SchemaVersion,
@@ -98,7 +108,7 @@ func (m *MockClient) GenerateIR(ctx context.Context, req GenerateRequest) ([]byt
 					Type:          "timeseries",
 					Title:         matched.Name,
 					DatasourceRef: ir.SelectedDatasourceRef,
-					Query:         ir.QueryIR{Expr: expr, LegendFormat: "{{instance}}"},
+					Query:         ir.QueryIR{Kind: queryKind, Expr: expr, LegendFormat: "{{instance}}"},
 					Unit:          inferUnit(matched),
 					Layout:        ir.LayoutHint{Row: 0, Col: 0, Width: "full"},
 				},
@@ -116,6 +126,9 @@ func (m *MockClient) GenerateIR(ctx context.Context, req GenerateRequest) ([]byt
 
 	if hasReq && (wantReq || (!wantError && !wantLatency && !wantCPU && !wantMem)) {
 		expr := fmt.Sprintf("sum by (status) (rate(%s%s[5m]))", reqMetric.Name, selector)
+		if isMetricsQL {
+			expr = fmt.Sprintf("sum by (status) (rate(%s%s[5m])) default 0", reqMetric.Name, selector)
+		}
 		if m.InjectSyntaxErrorOnFirstGenerate && count == 1 {
 			expr = fmt.Sprintf("sum by (status) (rate(%s%s[5m]))))", reqMetric.Name, selector)
 		}
@@ -133,7 +146,7 @@ func (m *MockClient) GenerateIR(ctx context.Context, req GenerateRequest) ([]byt
 			Title:         "Request Rate",
 			Description:   "Requests per second grouped by HTTP status.",
 			DatasourceRef: ir.SelectedDatasourceRef,
-			Query:         ir.QueryIR{Expr: expr, LegendFormat: "{{status}}"},
+			Query:         ir.QueryIR{Kind: queryKind, Expr: expr, LegendFormat: "{{status}}"},
 			Unit:          "reqps",
 			Layout:        ir.LayoutHint{Row: 0, Col: 0, Width: "half"},
 		})
@@ -147,6 +160,12 @@ func (m *MockClient) GenerateIR(ctx context.Context, req GenerateRequest) ([]byt
 			"sum(rate(%s%s[5m])) / clamp_min(sum(rate(%s%s[5m])), 1e-9)",
 			reqMetric.Name, errSelector, reqMetric.Name, selector,
 		)
+		if isMetricsQL {
+			expr = fmt.Sprintf(
+				"sum(increase_pure(%s%s[5m])) / clamp_min(sum(increase_pure(%s%s[5m])), 1e-9) default 0",
+				reqMetric.Name, errSelector, reqMetric.Name, selector,
+			)
+		}
 		errPanelType := "stat"
 		if containsAny(lowerIntent, "gauge", "ゲージ") && !containsAny(lowerIntent, "bargauge") {
 			errPanelType = "gauge"
@@ -157,7 +176,7 @@ func (m *MockClient) GenerateIR(ctx context.Context, req GenerateRequest) ([]byt
 			Title:         "5xx Error Ratio",
 			Description:   "Share of HTTP 5xx responses over total requests.",
 			DatasourceRef: ir.SelectedDatasourceRef,
-			Query:         ir.QueryIR{Expr: expr, LegendFormat: "5xx ratio"},
+			Query:         ir.QueryIR{Kind: queryKind, Expr: expr, LegendFormat: "5xx ratio"},
 			Unit:          "percentunit",
 			Thresholds: []ir.ThresholdIR{
 				{Value: 0, Color: "green"},
@@ -185,12 +204,13 @@ func (m *MockClient) GenerateIR(ctx context.Context, req GenerateRequest) ([]byt
 		if wantMultiQuery {
 			latPanel.Title = "Request Latency (p50 / p95 / p99)"
 			latPanel.Queries = []ir.QueryIR{
-				{RefID: "A", Expr: fmt.Sprintf("histogram_quantile(0.50, sum by (le) (rate(%s%s[5m])))", durMetric.Name, selector), LegendFormat: "p50"},
-				{RefID: "B", Expr: fmt.Sprintf("histogram_quantile(0.95, sum by (le) (rate(%s%s[5m])))", durMetric.Name, selector), LegendFormat: "p95"},
-				{RefID: "C", Expr: fmt.Sprintf("histogram_quantile(0.99, sum by (le) (rate(%s%s[5m])))", durMetric.Name, selector), LegendFormat: "p99"},
+				{RefID: "A", Kind: queryKind, Expr: fmt.Sprintf("histogram_quantile(0.50, sum by (le) (rate(%s%s[5m])))", durMetric.Name, selector), LegendFormat: "p50"},
+				{RefID: "B", Kind: queryKind, Expr: fmt.Sprintf("histogram_quantile(0.95, sum by (le) (rate(%s%s[5m])))", durMetric.Name, selector), LegendFormat: "p95"},
+				{RefID: "C", Kind: queryKind, Expr: fmt.Sprintf("histogram_quantile(0.99, sum by (le) (rate(%s%s[5m])))", durMetric.Name, selector), LegendFormat: "p99"},
 			}
 		} else {
 			latPanel.Query = ir.QueryIR{
+				Kind:         queryKind,
 				Expr:         fmt.Sprintf("histogram_quantile(0.95, sum by (le) (rate(%s%s[5m])))", durMetric.Name, selector),
 				LegendFormat: "p95",
 			}
@@ -203,7 +223,7 @@ func (m *MockClient) GenerateIR(ctx context.Context, req GenerateRequest) ([]byt
 			Type:          "timeseries",
 			Title:         "CPU Usage Rate",
 			DatasourceRef: ir.SelectedDatasourceRef,
-			Query:         ir.QueryIR{Expr: fmt.Sprintf("sum(rate(%s%s[5m]))", cpuMetric.Name, selector), LegendFormat: "cpu"},
+			Query:         ir.QueryIR{Kind: queryKind, Expr: fmt.Sprintf("sum(rate(%s%s[5m]))", cpuMetric.Name, selector), LegendFormat: "cpu"},
 			Unit:          "short",
 			Layout:        ir.LayoutHint{Row: 2, Col: 0, Width: "half"},
 		})
@@ -218,7 +238,7 @@ func (m *MockClient) GenerateIR(ctx context.Context, req GenerateRequest) ([]byt
 			Type:          memType,
 			Title:         "Resident Memory",
 			DatasourceRef: ir.SelectedDatasourceRef,
-			Query:         ir.QueryIR{Expr: fmt.Sprintf("avg(%s%s)", memMetric.Name, selector), LegendFormat: "memory"},
+			Query:         ir.QueryIR{Kind: queryKind, Expr: fmt.Sprintf("avg(%s%s)", memMetric.Name, selector), LegendFormat: "memory"},
 			Unit:          "bytes",
 			Layout:        ir.LayoutHint{Row: 2, Col: 1, Width: "half"},
 		})
@@ -230,11 +250,15 @@ func (m *MockClient) GenerateIR(ctx context.Context, req GenerateRequest) ([]byt
 
 	assignCompactGrid(panels)
 
+	desc := "Generated by dev mock LLM from scoped Prometheus metadata."
+	if isMetricsQL {
+		desc = "Generated by dev mock LLM from scoped VictoriaMetrics metadata (MetricsQL)."
+	}
 	doc := ir.DashboardIR{
 		SchemaVersion: ir.SchemaVersion,
 		Revision:      1,
 		Title:         titleFromScope(req.Scope, "Service Observability Overview"),
-		Description:   "Generated by dev mock LLM from scoped Prometheus metadata.",
+		Description:   desc,
 		TimeRange:     ir.TimeRange{From: "now-15m", To: "now"},
 		Variables:     variables,
 		Panels:        panels,
@@ -357,6 +381,13 @@ func (m *MockClient) RepairPanels(ctx context.Context, req RepairRequest) ([]byt
 	selector := buildScopeMatcher(req.Scope)
 	hasReq, reqMetric := findMetric(req.Catalog, "http_requests_total", "requests_total")
 
+	isMetricsQL := strings.EqualFold(strings.TrimSpace(req.QueryKind), "metricsql")
+	var kindPtr *string
+	if isMetricsQL {
+		k := "metricsql"
+		kindPtr = &k
+	}
+
 	var ops []ir.PatchOperation
 	for _, t := range req.Targets {
 		if len(t.Queries) > 0 {
@@ -364,10 +395,19 @@ func (m *MockClient) RepairPanels(ctx context.Context, req RepairRequest) ([]byt
 			for i, q := range t.Queries {
 				repaired := strings.TrimSuffix(strings.TrimSpace(q.Expr), "))")
 				if i == 0 && hasReq {
-					repaired = fmt.Sprintf("sum by (status) (rate(%s%s[5m]))", reqMetric.Name, selector)
+					if isMetricsQL {
+						repaired = fmt.Sprintf("sum by (status) (rate(%s%s[5m])) default 0", reqMetric.Name, selector)
+					} else {
+						repaired = fmt.Sprintf("sum by (status) (rate(%s%s[5m]))", reqMetric.Name, selector)
+					}
+				}
+				qKind := q.Kind
+				if qKind == "" && isMetricsQL {
+					qKind = "metricsql"
 				}
 				repairedQueries[i] = ir.QueryIR{
 					RefID:        q.RefID,
+					Kind:         qKind,
 					Expr:         repaired,
 					LegendFormat: q.LegendFormat,
 				}
@@ -383,21 +423,29 @@ func (m *MockClient) RepairPanels(ctx context.Context, req RepairRequest) ([]byt
 		}
 		repaired := strings.TrimSuffix(strings.TrimSpace(t.Expr), "))")
 		if hasReq {
-			repaired = fmt.Sprintf("sum by (status) (rate(%s%s[5m]))", reqMetric.Name, selector)
+			if isMetricsQL {
+				repaired = fmt.Sprintf("sum by (status) (rate(%s%s[5m])) default 0", reqMetric.Name, selector)
+			} else {
+				repaired = fmt.Sprintf("sum by (status) (rate(%s%s[5m]))", reqMetric.Name, selector)
+			}
 		}
 		ops = append(ops, ir.PatchOperation{
 			Op:      "update_panel",
 			PanelID: t.PanelID,
 			Panel: &ir.PanelUpdate{
-				Query: &ir.QueryUpdate{Expr: repaired},
+				Query: &ir.QueryUpdate{Kind: kindPtr, Expr: repaired},
 			},
 		})
 	}
 
+	dialectName := "PromQL"
+	if isMetricsQL {
+		dialectName = "MetricsQL"
+	}
 	patch := ir.DashboardPatch{
 		SchemaVersion: ir.SchemaVersion,
 		BaseRevision:  req.CurrentIR.Revision,
-		Summary:       "Repaired PromQL syntax error while retaining scope filters",
+		Summary:       fmt.Sprintf("Repaired %s syntax error while retaining scope filters", dialectName),
 		Operations:    ops,
 	}
 	raw, err := json.Marshal(patch)

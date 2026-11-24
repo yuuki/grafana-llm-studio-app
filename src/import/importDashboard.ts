@@ -17,6 +17,7 @@ import {
   PanelIR,
   PanelType,
   QueryIR,
+  QueryKind,
   SELECTED_DATASOURCE_REF,
   ThresholdColor,
   ThresholdIR,
@@ -56,6 +57,7 @@ export interface ImportConversionReport {
 export interface ImportConversionOptions {
   selectedDatasourceUid: string;
   selectedDatasourceName?: string;
+  queryKind?: QueryKind;
   maxPanels?: number;
 }
 
@@ -372,6 +374,15 @@ export function convertGrafanaDashboardToIR(
     const rawName = typeof v.name === 'string' ? v.name.trim() : '';
     const rawType = typeof v.type === 'string' ? v.type.trim() : 'unknown';
 
+    if (v.hide === 2) {
+      skippedVariables.push({
+        title: rawName || '(unnamed)',
+        type: rawType,
+        reason: 'hidden dashboard variables (e.g., VictoriaMetrics WITH template variables) are not imported into IR v1.1',
+      });
+      continue;
+    }
+
     if (variables.length >= MAX_VARIABLES) {
       skippedVariables.push({
         title: rawName || '(unnamed)',
@@ -529,6 +540,7 @@ export function convertGrafanaDashboardToIR(
     const importedQueries: QueryIR[] = [];
     let skippedTargetsCount = 0;
     let skippedUndeclaredVarCount = 0;
+    let skippedWithTemplateCount = 0;
 
     for (const rt of rawTargets) {
       if (!rt || typeof rt !== 'object' || Array.isArray(rt)) {
@@ -543,6 +555,13 @@ export function convertGrafanaDashboardToIR(
       const targetDs = hasTargetDs ? target.datasource : rp.datasource;
       if (!isDatasourceCompatible(targetDs, options)) {
         skippedTargetsCount++;
+        continue;
+      }
+      if (typeof target.withTemplate === 'string' && target.withTemplate.trim() !== '') {
+        skippedWithTemplateCount++;
+        warnings.push(
+          `Panel "${safeTitle}": skipped query referencing external VictoriaMetrics WITH template`
+        );
         continue;
       }
       if (typeof target.expr !== 'string' || target.expr.trim() === '') {
@@ -577,6 +596,7 @@ export function convertGrafanaDashboardToIR(
       }
       importedQueries.push({
         refId: ALLOWED_QUERY_REF_IDS[importedQueries.length],
+        ...(options.queryKind ? { kind: options.queryKind } : {}),
         expr: cleanExpr,
         ...(legend ? { legendFormat: legend } : {}),
       });
@@ -588,10 +608,13 @@ export function convertGrafanaDashboardToIR(
       );
     }
     if (importedQueries.length === 0) {
+      const dialectLabel = options.queryKind === 'metricsql' ? 'MetricsQL' : 'Prometheus PromQL';
       const reason =
-        skippedUndeclaredVarCount > 0
-          ? 'queries referenced undeclared or unsupported template variables'
-          : 'no compatible Prometheus PromQL queries found for selected datasource';
+        skippedWithTemplateCount > 0
+          ? 'queries referenced unsupported external VictoriaMetrics WITH templates'
+          : skippedUndeclaredVarCount > 0
+            ? 'queries referenced undeclared or unsupported template variables'
+            : `no compatible ${dialectLabel} queries found for selected datasource`;
       skippedPanels.push({
         title: safeTitle,
         type: pType,
@@ -631,6 +654,7 @@ export function convertGrafanaDashboardToIR(
       ...(importedQueries.length === 1
         ? {
             query: {
+              ...(importedQueries[0].kind ? { kind: importedQueries[0].kind } : {}),
               expr: importedQueries[0].expr,
               ...(importedQueries[0].legendFormat
                 ? { legendFormat: importedQueries[0].legendFormat }
@@ -743,9 +767,33 @@ function parseLabelValuesQuery(
   if (typeof rawQuery === 'string') {
     queryStr = rawQuery.trim();
   } else if (rawQuery && typeof rawQuery === 'object' && !Array.isArray(rawQuery)) {
-    const qObj = rawQuery as { query?: unknown };
-    if (typeof qObj.query === 'string') {
+    const qObj = rawQuery as {
+      query?: unknown;
+      qryType?: unknown;
+      label?: unknown;
+      metric?: unknown;
+      labelFilters?: unknown;
+    };
+    if (typeof qObj.query === 'string' && qObj.query.trim() !== '') {
       queryStr = qObj.query.trim();
+    } else if (qObj.qryType === 1 && typeof qObj.label === 'string') {
+      // Grafana 10+ Prometheus & victoriametrics-metrics-datasource object-form Label Values variable.
+      // Reject non-empty labelFilters so import never silently widens variable scope.
+      if (Array.isArray(qObj.labelFilters) && qObj.labelFilters.length > 0) {
+        return null;
+      }
+      const labelName = qObj.label.trim();
+      const metricName = typeof qObj.metric === 'string' ? qObj.metric.trim() : '';
+      if (!VALID_LABEL_NAME.test(labelName) || labelName === '__name__') {
+        return null;
+      }
+      if (metricName) {
+        if (!VALID_METRIC_NAME.test(metricName)) {
+          return null;
+        }
+        return { metricName, labelName };
+      }
+      return { labelName };
     }
   }
   if (!queryStr) {

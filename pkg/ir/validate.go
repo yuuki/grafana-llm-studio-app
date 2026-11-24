@@ -79,6 +79,11 @@ var (
 		"C": true,
 	}
 
+	allowedQueryKinds = map[string]bool{
+		"promql":    true,
+		"metricsql": true,
+	}
+
 	allowedVariableTypes = map[string]bool{
 		"query":  true,
 		"custom": true,
@@ -450,6 +455,9 @@ func validatePanelQueries(prefix string, p PanelIR) []string {
 			}
 			seenRefIDs[refID] = true
 		}
+		if q.Kind != "" && !allowedQueryKinds[q.Kind] {
+			issues = append(issues, fmt.Sprintf("%s.kind %q is not allowed (allowed: promql, metricsql)", qPrefix, q.Kind))
+		}
 		if err := validateExprText(qPrefix+".expr", q.Expr, 1, MaxExprLen); err != nil {
 			issues = append(issues, err.Error())
 		}
@@ -545,7 +553,7 @@ func validateVariableValue(field, val string, minRunes, maxRunes int, isCustom b
 	if err := validatePlainText(field, val, minRunes, maxRunes); err != nil {
 		return err
 	}
-	if strings.ContainsAny(val, "\"\\`$") || strings.Contains(val, "[[") {
+	if strings.ContainsAny(val, "\"'\\`$") || strings.Contains(val, "[[") {
 		return fmt.Errorf("%s contains forbidden quote, backslash, backtick, or variable token", field)
 	}
 	if isCustom {

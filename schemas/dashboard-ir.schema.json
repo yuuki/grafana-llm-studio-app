@@ -171,18 +171,23 @@
             "type": "object",
             "additionalProperties": false,
             "required": ["expr"],
-            "description": "Single PromQL query (v1.0 compatible). Mutually exclusive with queries.",
+            "description": "Single query (v1.0 compatible). Mutually exclusive with queries.",
             "properties": {
               "refId": {
                 "type": "string",
                 "enum": ["A", "B", "C"],
                 "description": "Optional deterministic query refId (defaults to A)."
               },
+              "kind": {
+                "type": "string",
+                "enum": ["promql", "metricsql"],
+                "description": "Optional query dialect (inherits job dialect when omitted; defaults to promql)."
+              },
               "expr": {
                 "type": "string",
                 "minLength": 1,
                 "maxLength": 512,
-                "description": "PromQL expression validated deterministically against syntax, policy, variables, and scoped catalog."
+                "description": "Query expression validated deterministically against syntax, policy, variables, and scoped catalog."
               },
               "legendFormat": {
                 "type": "string",
@@ -194,7 +199,7 @@
             "type": "array",
             "minItems": 1,
             "maxItems": 3,
-            "description": "Bounded multi-query list (1 to 3 PromQL queries per panel). Mutually exclusive with query.",
+            "description": "Bounded multi-query list (1 to 3 queries per panel). Mutually exclusive with query.",
             "items": {
               "type": "object",
               "additionalProperties": false,
@@ -205,11 +210,16 @@
                   "enum": ["A", "B", "C"],
                   "description": "Optional unique query refId (defaults to A, B, C in order)."
                 },
+                "kind": {
+                  "type": "string",
+                  "enum": ["promql", "metricsql"],
+                  "description": "Optional query dialect (inherits job dialect when omitted; defaults to promql)."
+                },
                 "expr": {
                   "type": "string",
                   "minLength": 1,
                   "maxLength": 512,
-                  "description": "PromQL expression validated deterministically against syntax, policy, variables, and scoped catalog."
+                  "description": "Query expression validated deterministically against syntax, policy, variables, and scoped catalog."
                 },
                 "legendFormat": {
                   "type": "string",

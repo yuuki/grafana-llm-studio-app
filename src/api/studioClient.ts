@@ -6,13 +6,32 @@ import {
   MetricCatalogItem,
   PanelValidationResult,
   PublicConfig,
+  QueryKind,
   ScopeFilter,
 } from '../ir/types';
 
 const PLUGIN_RESOURCE_BASE = '/api/plugins/yuuki-llmstudio-app/resources';
 
+const GENERIC_HTTP_ERROR_LABELS = new Set([
+  'bad request',
+  'unauthorized',
+  'forbidden',
+  'not found',
+  'method not allowed',
+  'request timeout',
+  'conflict',
+  'unprocessable entity',
+  'unprocessable content',
+  'too many requests',
+  'internal server error',
+  'bad gateway',
+  'service unavailable',
+  'gateway timeout',
+]);
+
 export interface GenerateJobRequest {
   datasourceUid: string;
+  queryKind?: QueryKind;
   scope?: ScopeFilter;
   userIntent: string;
   catalog: MetricCatalogItem[];
@@ -20,6 +39,7 @@ export interface GenerateJobRequest {
 
 export interface ImportJobRequest {
   datasourceUid: string;
+  queryKind?: QueryKind;
   scope?: ScopeFilter;
   draft: DashboardIR;
   importSource?: ImportSource;
@@ -41,6 +61,7 @@ export interface RepairJobRequest {
 
 /**
  * Formats Error objects and Grafana FetchError plain objects without producing "[object Object]" (M-13).
+ * Prefers specific `data.message` when `data.error` is only a generic HTTP status phrase (e.g., VM plugin VMAPIQuery).
  */
 export function extractApiError(err: unknown): string {
   if (err instanceof Error && err.message) {
@@ -53,7 +74,13 @@ export function extractApiError(err: unknown): string {
       statusText?: unknown;
       status?: number;
     };
-    const candidates = [e.data?.error, e.data?.message, e.message, e.statusText];
+    const dataErr = typeof e.data?.error === 'string' ? e.data.error.trim() : '';
+    const dataMsg = typeof e.data?.message === 'string' ? e.data.message.trim() : '';
+    const primary =
+      dataErr && GENERIC_HTTP_ERROR_LABELS.has(dataErr.toLowerCase()) && dataMsg
+        ? dataMsg
+        : dataErr || dataMsg;
+    const candidates = [primary, e.message, e.statusText];
     const msg = candidates.find(
       (c): c is string => typeof c === 'string' && c.trim().length > 0
     );

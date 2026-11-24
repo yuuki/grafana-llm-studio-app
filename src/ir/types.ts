@@ -52,6 +52,9 @@ export type LayoutWidth = (typeof ALLOWED_WIDTHS)[number];
 export const ALLOWED_QUERY_REF_IDS = ['A', 'B', 'C'] as const;
 export type QueryRefId = (typeof ALLOWED_QUERY_REF_IDS)[number];
 
+export const ALLOWED_QUERY_KINDS = ['promql', 'metricsql'] as const;
+export type QueryKind = (typeof ALLOWED_QUERY_KINDS)[number];
+
 export const ALLOWED_VARIABLE_TYPES = ['query', 'custom'] as const;
 export type VariableType = (typeof ALLOWED_VARIABLE_TYPES)[number];
 
@@ -86,6 +89,7 @@ export interface VariableIR {
 
 export interface QueryIR {
   refId?: QueryRefId;
+  kind?: QueryKind;
   expr: string;
   legendFormat?: string;
 }
@@ -192,6 +196,7 @@ export interface JobSnapshot {
   jobId: string;
   status: JobStatus;
   datasourceUid: string;
+  queryKind?: QueryKind;
   scope?: ScopeFilter;
   importSource?: ImportSource;
   currentIR?: DashboardIR;
@@ -208,6 +213,7 @@ export interface JobSnapshot {
 
 export interface PublicConfig {
   allowedDatasourceUids: string[];
+  datasourceDialects?: Record<string, QueryKind>;
   llmMode: 'grafana-llm-app' | 'mock';
   modelTier: 'base' | 'large';
   maxPanels: number;
@@ -346,6 +352,7 @@ export function validateVariableValueClient(
   }
   if (
     value.includes('"') ||
+    value.includes("'") ||
     value.includes('\\') ||
     value.includes('`') ||
     value.includes('$') ||
@@ -627,6 +634,9 @@ export function validateIRClient(doc: DashboardIR, maxPanels = 6): string[] {
           issues.push(`Duplicate query refId on ${p.id}: ${refId}`);
         } else {
           seenRefIds.add(refId);
+        }
+        if (q.kind !== undefined && !ALLOWED_QUERY_KINDS.includes(q.kind)) {
+          issues.push(`Invalid query kind on ${p.id}[${qi}]: ${q.kind}`);
         }
       });
     }

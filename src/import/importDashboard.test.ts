@@ -339,4 +339,99 @@ describe('Safe Grafana dashboard import into constrained IR v1.1 draft', () => {
     expect(report.skippedPanels).toHaveLength(3);
     expect(validateIRClient(draft)).toEqual([]);
   });
+
+  test('imports VictoriaMetrics MetricsQL dashboards: stamps query.kind, skips hide=2 vars and withTemplate targets, and parses unfiltered qryType:1 object variables', () => {
+    const vmDashboard = {
+      title: 'VictoriaMetrics Service Overview',
+      time: { from: 'now-15m', to: 'now' },
+      templating: {
+        list: [
+          {
+            name: 'service',
+            type: 'query',
+            datasource: { type: 'victoriametrics-metrics-datasource', uid: 'vm-ds' },
+            query: { qryType: 1, label: 'service', metric: 'http_requests_total' },
+            current: { value: 'checkout' },
+          },
+          {
+            name: 'filtered_service',
+            type: 'query',
+            datasource: { type: 'victoriametrics-metrics-datasource', uid: 'vm-ds' },
+            query: {
+              qryType: 1,
+              label: 'service',
+              metric: 'http_requests_total',
+              labelFilters: [{ label: 'tenant', operator: '=', value: 'acme' }],
+            },
+            current: { value: 'checkout' },
+          },
+          {
+            name: 'hidden_tenant',
+            type: 'query',
+            hide: 2,
+            datasource: { type: 'victoriametrics-metrics-datasource', uid: 'vm-ds' },
+            query: 'label_values(http_requests_total, tenant)',
+            current: { value: 'acme' },
+          },
+        ],
+      },
+      panels: [
+        {
+          type: 'timeseries',
+          title: 'Checkout Pure Rate',
+          datasource: { type: 'victoriametrics-metrics-datasource', uid: 'vm-ds' },
+          gridPos: { x: 0, y: 0, w: 12, h: 8 },
+          fieldConfig: { defaults: { unit: 'reqps' } },
+          targets: [
+            {
+              expr: 'sum(rate(http_requests_total{service="$service"}[5m])) default 0',
+              legendFormat: '{{service}}',
+            },
+          ],
+        },
+        {
+          type: 'timeseries',
+          title: 'Panel With Template',
+          datasource: { type: 'victoriametrics-metrics-datasource', uid: 'vm-ds' },
+          gridPos: { x: 12, y: 0, w: 12, h: 8 },
+          targets: [
+            {
+              expr: 'my_macro(http_requests_total)',
+              withTemplate: 'WITH (my_macro(x) = rate(x[5m]))',
+            },
+          ],
+        },
+      ],
+    };
+
+    const { draft, report } = convertGrafanaDashboardToIR(vmDashboard, {
+      selectedDatasourceUid: 'vm-ds',
+      selectedDatasourceName: 'VictoriaMetrics',
+      queryKind: 'metricsql',
+    });
+
+    // Only unfiltered object-form qryType:1 variable imported; filtered and hide=2 skipped
+    expect(draft.variables).toHaveLength(1);
+    expect(draft.variables?.[0]).toMatchObject({
+      name: 'service',
+      type: 'query',
+      labelName: 'service',
+      metricName: 'http_requests_total',
+      defaultValue: 'checkout',
+    });
+    expect(report.skippedVariables).toHaveLength(2);
+    expect(report.skippedVariables.some((v) => v.title === 'hidden_tenant')).toBe(true);
+    expect(report.skippedVariables.some((v) => v.title === 'filtered_service')).toBe(true);
+
+    // Valid MetricsQL panel stamped with kind: 'metricsql'; target.withTemplate panel skipped
+    expect(draft.panels).toHaveLength(1);
+    expect(draft.panels[0].query?.kind).toBe('metricsql');
+    expect(draft.panels[0].query?.expr).toBe(
+      'sum(rate(http_requests_total{service="$service"}[5m])) default 0'
+    );
+    expect(report.skippedPanels).toHaveLength(1);
+    expect(report.skippedPanels[0].title).toBe('Panel With Template');
+    expect(report.warnings.some((w) => w.includes('WITH template'))).toBe(true);
+    expect(validateIRClient(draft)).toEqual([]);
+  });
 });

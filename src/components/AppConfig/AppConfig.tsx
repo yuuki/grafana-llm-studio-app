@@ -14,9 +14,11 @@ import {
 import { lastValueFrom } from 'rxjs';
 import { extractApiError } from '../../api/studioClient';
 import { useStudioTranslation } from '../../i18n';
+import { QueryKind } from '../../ir/types';
 
 export interface StudioJsonData {
   allowedDatasourceUids?: string[];
+  datasourceDialects?: Record<string, QueryKind>;
   llmMode?: 'grafana-llm-app' | 'mock';
   allowMockInDev?: boolean;
   grafanaUrl?: string;
@@ -39,6 +41,17 @@ export const AppConfig: React.FC<PluginConfigPageProps<AppPluginMeta<StudioJsonD
   const { enabled, pinned, jsonData, secureJsonFields } = plugin.meta;
 
   const [allowedDsText, setAllowedDsText] = useState((jsonData?.allowedDatasourceUids ?? []).join(', '));
+  const [datasourceDialects, setDatasourceDialects] = useState<Record<string, QueryKind | ''>>(() => {
+    const init: Record<string, QueryKind | ''> = {};
+    if (jsonData?.datasourceDialects) {
+      for (const [uid, kind] of Object.entries(jsonData.datasourceDialects)) {
+        if (uid.trim() && (kind === 'promql' || kind === 'metricsql')) {
+          init[uid.trim()] = kind;
+        }
+      }
+    }
+    return init;
+  });
   const [llmMode, setLlmMode] = useState<'grafana-llm-app' | 'mock'>(jsonData?.llmMode ?? 'grafana-llm-app');
   const [allowMockInDev, setAllowMockInDev] = useState(Boolean(jsonData?.allowMockInDev));
   const [grafanaUrl, setGrafanaUrl] = useState(jsonData?.grafanaUrl ?? 'http://localhost:3000');
@@ -72,6 +85,15 @@ export const AppConfig: React.FC<PluginConfigPageProps<AppPluginMeta<StudioJsonD
   const [saving, setSaving] = useState(false);
   const [statusMessage, setStatusMessage] = useState<{ severity: 'success' | 'error'; text: string } | null>(
     null
+  );
+
+  const parsedAllowedUids = Array.from(
+    new Set(
+      allowedDsText
+        .split(',')
+        .map((s) => s.trim())
+        .filter(Boolean)
+    )
   );
 
   const validateBeforeSave = (): string | null => {
@@ -110,15 +132,22 @@ export const AppConfig: React.FC<PluginConfigPageProps<AppPluginMeta<StudioJsonD
     setSaving(true);
     setStatusMessage(null);
     try {
-      const allowedDatasourceUids = allowedDsText
-        .split(',')
-        .map((s) => s.trim())
-        .filter(Boolean);
+      const allowedDatasourceUids = parsedAllowedUids;
+      // Always write an explicit object (even `{}`) so H-11 `...(jsonData ?? {})` spread
+      // never retains previously pinned dialects when all UIDs are reset back to Auto.
+      const cleanedDialects: Record<string, QueryKind> = {};
+      for (const uid of allowedDatasourceUids) {
+        const d = datasourceDialects[uid];
+        if (d === 'promql' || d === 'metricsql') {
+          cleanedDialects[uid] = d;
+        }
+      }
 
       // Preserve any existing jsonData fields (H-11) and normalize allowMockInDev=false outside mock mode (M-13).
       const nextJsonData: StudioJsonData = {
         ...(jsonData ?? {}),
         allowedDatasourceUids,
+        datasourceDialects: cleanedDialects,
         llmMode,
         allowMockInDev: llmMode === 'mock' ? allowMockInDev : false,
         grafanaUrl: grafanaUrl.trim(),
@@ -210,6 +239,37 @@ export const AppConfig: React.FC<PluginConfigPageProps<AppPluginMeta<StudioJsonD
             placeholder="prom-main"
           />
         </Field>
+
+        {parsedAllowedUids.length > 0 && (
+          <Field
+            label={t('appConfig.datasource.dialectsLabel')}
+            description={t('appConfig.datasource.dialectsDescription')}
+          >
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+              {parsedAllowedUids.map((uid) => (
+                <div
+                  key={uid}
+                  style={{ display: 'grid', gridTemplateColumns: '180px 1fr', gap: 8, alignItems: 'center' }}
+                >
+                  <code style={{ fontSize: 12 }}>{uid}</code>
+                  <Select
+                    aria-label={`Query dialect for ${uid}`}
+                    options={[
+                      { label: t('appConfig.datasource.dialectAuto'), value: '' },
+                      { label: t('appConfig.datasource.dialectPromql'), value: 'promql' },
+                      { label: t('appConfig.datasource.dialectMetricsql'), value: 'metricsql' },
+                    ]}
+                    value={datasourceDialects[uid] ?? ''}
+                    onChange={(v) => {
+                      const nextVal = (v.value ?? '') as QueryKind | '';
+                      setDatasourceDialects((prev) => ({ ...prev, [uid]: nextVal }));
+                    }}
+                  />
+                </div>
+              ))}
+            </div>
+          </Field>
+        )}
       </FieldSet>
 
       <FieldSet label={t('appConfig.llm.fieldset')}>

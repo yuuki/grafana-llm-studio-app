@@ -106,18 +106,43 @@ func (p PanelIR) EffectiveQueries() []QueryIR {
 	return nil
 }
 
-// QueryIR defines one PromQL query for a panel.
+// QueryIR defines one query for a panel.
 type QueryIR struct {
 	RefID        string `json:"refId,omitempty"`
+	Kind         string `json:"kind,omitempty"`
 	Expr         string `json:"expr"`
 	LegendFormat string `json:"legendFormat,omitempty"`
 }
 
-// QueryUpdate carries patch query updates; pointer LegendFormat/RefID distinguish omitted from explicit clear.
+// QueryUpdate carries patch query updates; pointer RefID/Kind/LegendFormat distinguish omitted from explicit value.
 type QueryUpdate struct {
 	RefID        *string `json:"refId,omitempty"`
+	Kind         *string `json:"kind,omitempty"`
 	Expr         string  `json:"expr"`
 	LegendFormat *string `json:"legendFormat,omitempty"`
+}
+
+// StampQueryKind fills empty query.Kind fields across all panels with kind.
+// Explicit non-empty kinds are preserved so downstream validation can reject dialect mismatches.
+func (d *DashboardIR) StampQueryKind(kind string) {
+	if d == nil || strings.TrimSpace(kind) == "" {
+		return
+	}
+	k := strings.TrimSpace(kind)
+	for i := range d.Panels {
+		p := &d.Panels[i]
+		if len(p.Queries) > 0 {
+			for qi := range p.Queries {
+				if strings.TrimSpace(p.Queries[qi].Kind) == "" {
+					p.Queries[qi].Kind = k
+				}
+			}
+		} else if p.Query != (QueryIR{}) {
+			if strings.TrimSpace(p.Query.Kind) == "" {
+				p.Query.Kind = k
+			}
+		}
+	}
 }
 
 // ThresholdIR defines an absolute threshold step.

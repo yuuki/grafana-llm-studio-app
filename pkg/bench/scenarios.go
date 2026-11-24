@@ -21,6 +21,7 @@ const (
 type Scenario struct {
 	ID          string
 	Kind        ScenarioKind
+	QueryKind   string
 	Description string
 	Scope       *ir.ScopeFilter
 	Catalog     []ir.MetricCatalogItem
