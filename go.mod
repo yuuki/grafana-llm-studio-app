@@ -4,15 +4,18 @@ go 1.24.3
 
 require (
 	github.com/VictoriaMetrics/metricsql v0.87.6
+	github.com/alicebob/miniredis/v2 v2.34.0
 	github.com/grafana/grafana-llm-app/llmclient v0.20.0
 	github.com/grafana/grafana-plugin-sdk-go v0.278.0
 	github.com/prometheus/prometheus v0.305.0
+	github.com/redis/go-redis/v9 v9.7.3
 	github.com/sashabaranov/go-openai v1.41.1
 )
 
 require (
 	github.com/BurntSushi/toml v1.4.0 // indirect
 	github.com/VictoriaMetrics/metrics v1.35.3 // indirect
+	github.com/alicebob/gopher-json v0.0.0-20230218143504-906a9b012302 // indirect
 	github.com/apache/arrow-go/v18 v18.3.0 // indirect
 	github.com/beorn7/perks v1.0.1 // indirect
 	github.com/cenkalti/backoff/v5 v5.0.2 // indirect
@@ -21,6 +24,7 @@ require (
 	github.com/chromedp/cdproto v0.0.0-20250429231605-6ed5b53462d4 // indirect
 	github.com/cpuguy83/go-md2man/v2 v2.0.5 // indirect
 	github.com/dennwc/varint v1.0.0 // indirect
+	github.com/dgryski/go-rendezvous v0.0.0-20200823014737-9f7001d12a5f // indirect
 	github.com/elazarl/goproxy v1.7.2 // indirect
 	github.com/fatih/color v1.16.0 // indirect
 	github.com/getkin/kin-openapi v0.132.0 // indirect
@@ -78,6 +82,7 @@ require (
 	github.com/urfave/cli v1.22.16 // indirect
 	github.com/valyala/fastrand v1.1.0 // indirect
 	github.com/valyala/histogram v1.2.0 // indirect
+	github.com/yuin/gopher-lua v1.1.1 // indirect
 	github.com/zeebo/xxh3 v1.0.2 // indirect
 	go.opentelemetry.io/auto/sdk v1.1.0 // indirect
 	go.opentelemetry.io/contrib/instrumentation/google.golang.org/grpc/otelgrpc v0.60.0 // indirect

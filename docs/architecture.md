@@ -23,7 +23,7 @@ flowchart LR
 
   subgraph Backend["Custom App Go Backend (yuuki-llmstudio-app)"]
     Auth["PluginContext Verification\n(OrgID + User.Login)"]
-    Jobs["In-Memory Job Manager\n(Owner Isolation, Budgets, TTL)"]
+    Jobs["Job Manager + Pluggable JobStore\n(Memory Default / Optional Redis HA)"]
     Prompt["Prompt Builder\n(Sanitization & Size Caps)"]
     IRVal["IR & PromQL AST Validator\n(Catalog & Scope Enforcement)"]
     LLMCli["llmclient v0.20.0 Adapter\n(Structured Output)"]
@@ -100,7 +100,7 @@ sequenceDiagram
 - Two panel types only (**`timeseries`** and **`stat`**), fixed grid layout, and **auto-refresh disabled**.
 - Create-only dashboard saving, in-draft partial panel edits, and clean JSON export.
 - Scoped metadata fetched per session in browser memory and single-request scope only (no shared persistent metadata index).
-- In-memory job state with TTL, per-user limits, and global caps inside a single backend process (jobs do not survive Grafana restarts or span multiple replicas).
+- Pluggable `JobStore` in `pkg/jobs`: defaults to a zero-dependency process-local in-memory store (`jobStoreBackend: "memory"`), with an optional persistent Redis/Valkey backend (`jobStoreBackend: "redis"`) for HA multi-replica Grafana deployments enforcing atomic `(OrgID, UserLogin)` owner isolation, lease-based per-user/global concurrency limits, atomic repair-budget accounting, fencing tokens for `Undo`/`Cancel`, and native TTL expiration.
 
 ### 4.2 Serving Users with Different Data-Access Scopes (Out of Scope for MVP)
 - Within a single Grafana OSS organization (`12.4.15` / `13.3.1`), datasource-level RBAC and LBAC are Enterprise/Cloud features. Folder permissions and UI hiding do **not** restrict Prometheus metric access.
@@ -113,7 +113,7 @@ sequenceDiagram
 ### 4.3 Deferred Features (Future Extension Points)
 - Additional datasources (Loki, Tempo, ClickHouse) — extensible by adding query kinds to the IR and per-datasource AST validators.
 - Complex template variables, repeat panels, and full import of arbitrary existing Dashboard JSON.
-- Automated GitOps sync, MCP, arbitrary tool execution, vector databases, general-purpose agent frameworks, and distributed job persistence (multi-replica job persistence can be added later behind a storage interface in `pkg/jobs`).
+- Automated GitOps sync, MCP, arbitrary tool execution, vector databases, and general-purpose agent frameworks.
 
 ## 5. Browser State Clearing Policy
 - **Logout / Page Unmount:** React state holding metric catalogs, drafts, validation results, and Scenes previews is discarded, and in-flight HTTP requests are cancelled via RxJS `unsubscribe` / `AbortController`.

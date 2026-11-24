@@ -240,6 +240,43 @@ describe.each(SUPPORTED_LOCALES)(
       await waitFor(() => expect(mockFetch).toHaveBeenCalledTimes(2));
       expect(mockFetch.mock.calls[1][0].data.jsonData.datasourceDialects).toEqual({});
     });
+
+    test('validates redisAddr, saves HA Redis job store settings, and supports resetting redisPassword secret', async () => {
+      const plugin = makePlugin(
+        {
+          allowedDatasourceUids: ['prom-main'],
+          llmMode: 'grafana-llm-app',
+          jobStoreBackend: 'memory',
+        },
+        { redisPassword: true }
+      );
+
+      render(<AppConfig plugin={plugin as never} query={{}} />);
+
+      const storeSelect = screen.getByLabelText('Job store backend');
+      fireEvent.change(storeSelect, { target: { value: 'redis' } });
+
+      // Saving redis without redisAddr MUST fail client-side validation before fetch.
+      fireEvent.click(screen.getByText(t('appConfig.actions.save')));
+      await waitFor(() =>
+        expect(screen.getByText(t('appConfig.validation.redisAddrRequired'))).toBeTruthy()
+      );
+      expect(mockFetch).not.toHaveBeenCalled();
+
+      // Enter valid host:port, reset existing redisPassword, and enable TLS.
+      fireEvent.change(screen.getByPlaceholderText('redis:6379'), { target: { value: 'redis.ha:6379' } });
+      fireEvent.click(screen.getByText('Reset Secret'));
+      fireEvent.click(screen.getByRole('checkbox'));
+
+      fireEvent.click(screen.getByText(t('appConfig.actions.save')));
+      await waitFor(() => expect(mockFetch).toHaveBeenCalledTimes(1));
+      const payload = mockFetch.mock.calls[0][0].data;
+      expect(payload.jsonData.jobStoreBackend).toBe('redis');
+      expect(payload.jsonData.redisAddr).toBe('redis.ha:6379');
+      expect(payload.jsonData.redisKeyPrefix).toBe('llmstudio:jobs');
+      expect(payload.jsonData.redisTls).toBe(true);
+      expect(payload.secureJsonData).toEqual({ redisPassword: '' });
+    });
   }
 );
 

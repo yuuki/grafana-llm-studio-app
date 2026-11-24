@@ -34,6 +34,33 @@ export interface StudioJsonData {
   maxConcurrentJobs?: number;
   validationTimeoutSeconds?: number;
   maxConcurrentQueries?: number;
+  jobStoreBackend?: 'memory' | 'redis';
+  jobTtlMinutes?: number;
+  redisAddr?: string;
+  redisDb?: number;
+  redisKeyPrefix?: string;
+  redisTls?: boolean;
+  redisUsername?: string;
+}
+
+const REDIS_KEY_PREFIX_RE = /^[a-zA-Z0-9:_-]{1,64}$/;
+
+function isValidRedisHostPort(raw: string): boolean {
+  const addr = raw.trim();
+  if (!addr || addr.includes('://') || addr.includes('@')) {
+    return false;
+  }
+  const lastColon = addr.lastIndexOf(':');
+  if (lastColon <= 0 || lastColon === addr.length - 1) {
+    return false;
+  }
+  const host = addr.slice(0, lastColon).trim();
+  const portStr = addr.slice(lastColon + 1).trim();
+  if (!host || !/^\d+$/.test(portStr)) {
+    return false;
+  }
+  const port = Number(portStr);
+  return Number.isInteger(port) && port >= 1 && port <= 65535;
 }
 
 export const AppConfig: React.FC<PluginConfigPageProps<AppPluginMeta<StudioJsonData>>> = ({ plugin }) => {
@@ -76,11 +103,27 @@ export const AppConfig: React.FC<PluginConfigPageProps<AppPluginMeta<StudioJsonD
     jsonData?.maxConcurrentQueries ?? 2
   );
 
+  const [jobStoreBackend, setJobStoreBackend] = useState<'memory' | 'redis'>(
+    jsonData?.jobStoreBackend === 'redis' ? 'redis' : 'memory'
+  );
+  const [jobTtlMinutes, setJobTtlMinutes] = useState(jsonData?.jobTtlMinutes ?? 30);
+  const [redisAddr, setRedisAddr] = useState(jsonData?.redisAddr ?? '');
+  const [redisDb, setRedisDb] = useState(jsonData?.redisDb ?? 0);
+  const [redisKeyPrefix, setRedisKeyPrefix] = useState(jsonData?.redisKeyPrefix ?? 'llmstudio:jobs');
+  const [redisTls, setRedisTls] = useState(Boolean(jsonData?.redisTls));
+  const [redisUsername, setRedisUsername] = useState(jsonData?.redisUsername ?? '');
+
   const [isTokenConfigured, setIsTokenConfigured] = useState(
     Boolean(secureJsonFields?.llmServiceAccountToken)
   );
   const [wasTokenReset, setWasTokenReset] = useState(false);
   const [llmServiceAccountToken, setLlmServiceAccountToken] = useState('');
+
+  const [isRedisPasswordConfigured, setIsRedisPasswordConfigured] = useState(
+    Boolean(secureJsonFields?.redisPassword)
+  );
+  const [wasRedisPasswordReset, setWasRedisPasswordReset] = useState(false);
+  const [redisPassword, setRedisPassword] = useState('');
 
   const [saving, setSaving] = useState(false);
   const [statusMessage, setStatusMessage] = useState<{ severity: 'success' | 'error'; text: string } | null>(
@@ -109,7 +152,11 @@ export const AppConfig: React.FC<PluginConfigPageProps<AppPluginMeta<StudioJsonD
       [t('appConfig.validation.fields.maxConcurrentJobs'), maxConcurrentJobs, 1, 16],
       [t('appConfig.validation.fields.validationTimeoutSeconds'), validationTimeoutSeconds, 2, 30],
       [t('appConfig.validation.fields.maxConcurrentQueries'), maxConcurrentQueries, 1, 4],
+      [t('appConfig.validation.fields.jobTtlMinutes'), jobTtlMinutes, 1, 1440],
     ];
+    if (jobStoreBackend === 'redis') {
+      checks.push([t('appConfig.validation.fields.redisDb'), redisDb, 0, 15]);
+    }
     for (const [label, val, minVal, maxVal] of checks) {
       if (!Number.isFinite(val) || val < minVal || val > maxVal) {
         return t('appConfig.validation.numberRange', { label, min: minVal, max: maxVal });
@@ -118,6 +165,15 @@ export const AppConfig: React.FC<PluginConfigPageProps<AppPluginMeta<StudioJsonD
     const normalizedEffort = reasoningEffort.trim().toLowerCase();
     if (!['', 'low', 'medium', 'high'].includes(normalizedEffort)) {
       return t('appConfig.validation.reasoningEffort');
+    }
+    if (jobStoreBackend === 'redis') {
+      if (!isValidRedisHostPort(redisAddr)) {
+        return t('appConfig.validation.redisAddrRequired');
+      }
+      const trimmedPrefix = redisKeyPrefix.trim();
+      if (trimmedPrefix && !REDIS_KEY_PREFIX_RE.test(trimmedPrefix)) {
+        return t('appConfig.validation.redisKeyPrefixInvalid');
+      }
     }
     return null;
   };
@@ -163,15 +219,28 @@ export const AppConfig: React.FC<PluginConfigPageProps<AppPluginMeta<StudioJsonD
         maxConcurrentJobs: Math.trunc(Number(maxConcurrentJobs)),
         validationTimeoutSeconds: Math.trunc(Number(validationTimeoutSeconds)),
         maxConcurrentQueries: Math.trunc(Number(maxConcurrentQueries)),
+        jobStoreBackend,
+        jobTtlMinutes: Math.trunc(Number(jobTtlMinutes)),
+        redisAddr: redisAddr.trim(),
+        redisDb: Math.trunc(Number(redisDb)),
+        redisKeyPrefix: redisKeyPrefix.trim() || 'llmstudio:jobs',
+        redisTls,
+        redisUsername: redisUsername.trim(),
       };
 
       // Explicitly send empty string on reset so Grafana clears the stored encrypted secret (H-11).
-      let secureJsonData: Record<string, string> | undefined;
+      const secureJsonData: Record<string, string> = {};
       if (llmServiceAccountToken.trim().length > 0) {
-        secureJsonData = { llmServiceAccountToken: llmServiceAccountToken.trim() };
+        secureJsonData.llmServiceAccountToken = llmServiceAccountToken.trim();
       } else if (wasTokenReset) {
-        secureJsonData = { llmServiceAccountToken: '' };
+        secureJsonData.llmServiceAccountToken = '';
       }
+      if (redisPassword.length > 0) {
+        secureJsonData.redisPassword = redisPassword;
+      } else if (wasRedisPasswordReset) {
+        secureJsonData.redisPassword = '';
+      }
+      const hasSecureJsonData = Object.keys(secureJsonData).length > 0;
 
       await lastValueFrom(
         getBackendSrv().fetch({
@@ -182,7 +251,7 @@ export const AppConfig: React.FC<PluginConfigPageProps<AppPluginMeta<StudioJsonD
             enabled,
             pinned,
             jsonData: nextJsonData,
-            ...(secureJsonData ? { secureJsonData } : {}),
+            ...(hasSecureJsonData ? { secureJsonData } : {}),
           },
         })
       );
@@ -194,6 +263,14 @@ export const AppConfig: React.FC<PluginConfigPageProps<AppPluginMeta<StudioJsonD
       } else if (wasTokenReset) {
         setIsTokenConfigured(false);
         setWasTokenReset(false);
+      }
+      if (redisPassword.length > 0) {
+        setIsRedisPasswordConfigured(true);
+        setWasRedisPasswordReset(false);
+        setRedisPassword('');
+      } else if (wasRedisPasswordReset) {
+        setIsRedisPasswordConfigured(false);
+        setWasRedisPasswordReset(false);
       }
       setStatusMessage({
         severity: 'success',
@@ -456,6 +533,96 @@ export const AppConfig: React.FC<PluginConfigPageProps<AppPluginMeta<StudioJsonD
             onChange={(e) => setMaxConcurrentQueries(Number(e.currentTarget.value))}
           />
         </Field>
+      </FieldSet>
+
+      <FieldSet label={t('appConfig.jobStorage.fieldset')}>
+        <Field
+          label={t('appConfig.jobStorage.backendLabel')}
+          description={t('appConfig.jobStorage.backendDescription')}
+        >
+          <Select
+            aria-label="Job store backend"
+            options={[
+              { label: t('appConfig.jobStorage.backendMemory'), value: 'memory' },
+              { label: t('appConfig.jobStorage.backendRedis'), value: 'redis' },
+            ]}
+            value={jobStoreBackend}
+            onChange={(v) => setJobStoreBackend((v.value as 'memory' | 'redis') ?? 'memory')}
+          />
+        </Field>
+        <Field label={t('appConfig.jobStorage.jobTtlMinutesLabel')}>
+          <Input
+            type="number"
+            min={1}
+            max={1440}
+            value={jobTtlMinutes}
+            onChange={(e) => setJobTtlMinutes(Number(e.currentTarget.value))}
+          />
+        </Field>
+
+        {jobStoreBackend === 'redis' && (
+          <>
+            <Field
+              label={t('appConfig.jobStorage.redisAddrLabel')}
+              description={t('appConfig.jobStorage.redisAddrDescription')}
+            >
+              <Input
+                value={redisAddr}
+                onChange={(e) => setRedisAddr(e.currentTarget.value)}
+                placeholder="redis:6379"
+              />
+            </Field>
+            <Field label={t('appConfig.jobStorage.redisDbLabel')}>
+              <Input
+                type="number"
+                min={0}
+                max={15}
+                value={redisDb}
+                onChange={(e) => setRedisDb(Number(e.currentTarget.value))}
+              />
+            </Field>
+            <Field
+              label={t('appConfig.jobStorage.redisKeyPrefixLabel')}
+              description={t('appConfig.jobStorage.redisKeyPrefixDescription')}
+            >
+              <Input
+                value={redisKeyPrefix}
+                onChange={(e) => setRedisKeyPrefix(e.currentTarget.value)}
+                placeholder="llmstudio:jobs"
+              />
+            </Field>
+            <Field label={t('appConfig.jobStorage.redisUsernameLabel')}>
+              <Input
+                value={redisUsername}
+                onChange={(e) => setRedisUsername(e.currentTarget.value)}
+                placeholder="default"
+              />
+            </Field>
+            <Field
+              label={t('appConfig.jobStorage.redisPasswordLabel')}
+              description={t('appConfig.jobStorage.redisPasswordDescription')}
+            >
+              <SecretInput
+                isConfigured={isRedisPasswordConfigured}
+                value={redisPassword}
+                onChange={(e) => setRedisPassword(e.currentTarget.value)}
+                onReset={() => {
+                  setIsRedisPasswordConfigured(false);
+                  setWasRedisPasswordReset(true);
+                  setRedisPassword('');
+                }}
+                placeholder="redis-password"
+              />
+            </Field>
+            <Field label={t('appConfig.jobStorage.redisTlsLabel')}>
+              <Checkbox
+                value={redisTls}
+                onChange={(e) => setRedisTls(e.currentTarget.checked)}
+                label={t('appConfig.jobStorage.redisTlsCheckbox')}
+              />
+            </Field>
+          </>
+        )}
       </FieldSet>
 
       <Button onClick={handleSave} disabled={saving}>

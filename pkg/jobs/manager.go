@@ -28,6 +28,7 @@ var (
 	ErrNoUndoHistory       = errors.New("no previous revision available to undo")
 	ErrDatasourceDenied    = errors.New("selected datasource UID is not in admin allowlist")
 	ErrJobCancelled        = errors.New("job was cancelled")
+	ErrStoreUnavailable    = errors.New("job store unavailable")
 )
 
 // Owner identifies the authenticated Grafana caller from trusted PluginContext only.
@@ -50,8 +51,8 @@ const (
 	StatusFailed              JobStatus = "failed"
 )
 
-// Config configures single-backend bounded in-memory job management.
-// Multi-replica continuation across Grafana instances is explicitly out of MVP scope.
+// Config configures bounded job management backed by a pluggable JobStore.
+// When Store is nil, NewManager defaults to the zero-dependency in-memory MemoryStore.
 type Config struct {
 	MaxJobs                  int
 	MaxJobsPerUser           int
@@ -64,26 +65,34 @@ type Config struct {
 	MaxRepairAttempts    int
 	MaxRepairAttemptsSet bool
 	JobDeadline          time.Duration
-	AllowedDSUIDs        []string
-	DatasourceDialects   map[string]string
-	QueryRegistry        *query.Registry
+	// OpLeaseTTL overrides the per-operation distributed lock/slot lease TTL.
+	// Defaults to JobDeadline + 15s so crashed replicas cannot permanently hold slots.
+	OpLeaseTTL         time.Duration
+	AllowedDSUIDs      []string
+	DatasourceDialects map[string]string
+	QueryRegistry      *query.Registry
+	// Store optionally supplies a persistent / multi-replica JobStore (e.g. RedisStore).
+	// When nil, NewManager creates a process-local MemoryStore.
+	Store JobStore
+	// NowFunc optionally overrides wall-clock time for deterministic tests.
+	NowFunc func() time.Time
 }
 
 func (c *Config) normalize() {
 	if c.MaxJobs <= 0 {
-		c.MaxJobs = 200
+		c.MaxJobs = defaultMaxJobs
 	}
 	if c.MaxJobsPerUser <= 0 {
-		c.MaxJobsPerUser = 20
+		c.MaxJobsPerUser = defaultMaxJobsPerUser
 	}
 	if c.JobTTL <= 0 {
-		c.JobTTL = 30 * time.Minute
+		c.JobTTL = defaultJobTTL
 	}
 	if c.MaxConcurrentJobs <= 0 {
-		c.MaxConcurrentJobs = 4
+		c.MaxConcurrentJobs = defaultMaxConcurrentJobs
 	}
 	if c.MaxConcurrentJobsPerUser <= 0 {
-		c.MaxConcurrentJobsPerUser = 1
+		c.MaxConcurrentJobsPerUser = defaultMaxConcurrentJobsPerUser
 	}
 	if c.MaxPanels <= 0 || c.MaxPanels > ir.MaxPanelsHardCap {
 		c.MaxPanels = ir.DefaultMaxPanels
@@ -101,6 +110,21 @@ func (c *Config) normalize() {
 	}
 	if c.JobDeadline <= 0 {
 		c.JobDeadline = 90 * time.Second
+	}
+	if c.OpLeaseTTL <= 0 {
+		c.OpLeaseTTL = c.JobDeadline + defaultOpLeaseGrace
+	}
+}
+
+func (c Config) storeLimits() StoreLimits {
+	return StoreLimits{
+		MaxJobs:                  c.MaxJobs,
+		MaxJobsPerUser:           c.MaxJobsPerUser,
+		JobTTL:                   c.JobTTL,
+		MaxConcurrentJobs:        c.MaxConcurrentJobs,
+		MaxConcurrentJobsPerUser: c.MaxConcurrentJobsPerUser,
+		MaxUndoHistory:           defaultMaxUndoHistory,
+		OpLeaseTTL:               c.OpLeaseTTL,
 	}
 }
 
@@ -124,42 +148,24 @@ type JobSnapshot struct {
 	UpdatedAt          time.Time           `json:"updatedAt"`
 }
 
-type jobRecord struct {
-	id                 string
-	owner              Owner
-	datasourceUID      string
-	queryKind          query.Kind
-	scope              *ir.ScopeFilter
-	importSource       *ir.ImportSource
-	status             JobStatus
-	currentIR          *ir.DashboardIR
-	history            []ir.DashboardIR
-	lastDiff           []ir.DiffEntry
-	summary            string
-	warnings           []string
-	errorMessage       string
-	repairAttemptsUsed int
-	maxRepairAttempts  int
-	llmMeta            *llm.CompletionMeta
-	knownGauges        map[string]bool
-	createdAt          time.Time
-	updatedAt          time.Time
-	activeOpToken      uint64
-	activeCancel       context.CancelFunc
+type localCancelEntry struct {
+	opToken uint64
+	cancel  context.CancelFunc
 }
 
-// Manager coordinates bounded in-memory draft jobs with strict per-user/org isolation.
+// Manager coordinates bounded draft jobs with strict per-user/org isolation across
+// either a process-local MemoryStore (default) or a shared persistent JobStore for HA Grafana.
 // Notice: metric catalogs are NEVER stored in a cross-user shared index; only job-private
 // metric type guards (knownGauges) stay scoped to the single job owner and expire with the job.
 type Manager struct {
-	mu           sync.Mutex
 	cfg          Config
 	client       llm.Client
 	registry     *query.Registry
-	jobs         map[string]*jobRecord
-	activeGlobal int
-	activeByUser map[Owner]int
+	store        JobStore
+	ownsStore    bool
 	nowFunc      func() time.Time
+	localMu      sync.Mutex
+	localCancels map[string]localCancelEntry
 }
 
 // NewManager creates a new bounded job manager.
@@ -172,26 +178,56 @@ func NewManager(client llm.Client, cfg Config) *Manager {
 			metricsql.NewAdapter(metricsql.DefaultPolicy()),
 		)
 	}
+	store := cfg.Store
+	ownsStore := false
+	if store == nil {
+		store = NewMemoryStore()
+		ownsStore = true
+	}
+	nowFn := cfg.NowFunc
+	if nowFn == nil {
+		nowFn = time.Now
+	}
 	return &Manager{
 		cfg:          cfg,
 		client:       client,
 		registry:     reg,
-		jobs:         make(map[string]*jobRecord),
-		activeByUser: make(map[Owner]int),
-		nowFunc:      time.Now,
+		store:        store,
+		ownsStore:    ownsStore,
+		nowFunc:      nowFn,
+		localCancels: make(map[string]localCancelEntry),
 	}
 }
 
-// Close cancels all active in-flight job contexts during plugin shutdown/reload.
+// Ping verifies connectivity to the underlying JobStore.
+func (m *Manager) Ping(ctx context.Context) error {
+	return m.store.Ping(ctx)
+}
+
+// CleanupExpired triggers explicit cleanup of expired non-active jobs and slot leases.
+func (m *Manager) CleanupExpired(ctx context.Context) error {
+	return m.store.CleanupExpired(ctx, m.nowFunc())
+}
+
+// Close cancels all active in-flight local job contexts during plugin shutdown/reload.
+// If the Manager created its own default MemoryStore, Close also closes it; externally
+// supplied stores remain owned by the caller.
 func (m *Manager) Close() {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	for _, rec := range m.jobs {
-		rec.activeOpToken++
-		if rec.activeCancel != nil {
-			rec.activeCancel()
-			rec.activeCancel = nil
+	m.localMu.Lock()
+	cancels := make([]context.CancelFunc, 0, len(m.localCancels))
+	for id, entry := range m.localCancels {
+		if entry.cancel != nil {
+			cancels = append(cancels, entry.cancel)
 		}
+		delete(m.localCancels, id)
+	}
+	m.localMu.Unlock()
+
+	for _, cancel := range cancels {
+		cancel()
+	}
+	if m.ownsStore {
+		_ = m.store.Close()
 	}
 }
 
@@ -266,46 +302,33 @@ func (m *Manager) Generate(ctx context.Context, owner Owner, in GenerateInput) (
 
 	now := m.nowFunc()
 	jobID := newJobID()
+	slotID := newSlotID()
 	opCtx, cancel := context.WithTimeout(ctx, m.cfg.JobDeadline)
 	defer cancel()
 
-	knownGauges := make(map[string]bool)
-	recordKnownGauges(knownGauges, boundedCatalog)
-
-	m.mu.Lock()
-	m.evictExpiredLocked(now)
-	if m.activeGlobal >= m.cfg.MaxConcurrentJobs || m.activeByUser[owner] >= m.cfg.MaxConcurrentJobsPerUser {
-		m.mu.Unlock()
-		return JobSnapshot{}, ErrConcurrencyLimited
-	}
-	if err := m.ensureCapacityLocked(owner); err != nil {
-		m.mu.Unlock()
+	lease, err := m.store.CreateGenerating(ctx, CreateGeneratingParams{
+		JobID:             jobID,
+		Owner:             owner,
+		DatasourceUID:     dsUID,
+		QueryKind:         qKind,
+		Scope:             cloneScope(safeScope),
+		MaxRepairAttempts: m.cfg.MaxRepairAttempts,
+		KnownGauges:       extractGaugeNames(boundedCatalog),
+		SlotID:            slotID,
+		Now:               now,
+		Limits:            m.cfg.storeLimits(),
+	})
+	if err != nil {
 		return JobSnapshot{}, err
 	}
-	rec := &jobRecord{
-		id:                jobID,
-		owner:             owner,
-		datasourceUID:     dsUID,
-		queryKind:         qKind,
-		scope:             cloneScope(safeScope),
-		status:            StatusGenerating,
-		maxRepairAttempts: m.cfg.MaxRepairAttempts,
-		knownGauges:       knownGauges,
-		createdAt:         now,
-		updatedAt:         now,
-		activeOpToken:     1,
-		activeCancel:      cancel,
-	}
-	m.jobs[jobID] = rec
-	m.activeGlobal++
-	m.activeByUser[owner]++
-	opToken := rec.activeOpToken
-	m.mu.Unlock()
-	defer m.releaseSlot(owner)
+	opToken := lease.OpToken
+	m.registerLocalCancel(jobID, opToken, cancel)
+	defer m.unregisterLocalCancel(jobID, opToken)
+	defer m.releaseSlot(ctx, owner, lease.SlotID)
 
 	raw, meta, err := m.client.GenerateIR(opCtx, llm.GenerateRequest{
 		UserIntent:   in.UserIntent,
-		Scope:        rec.scope,
+		Scope:        cloneScope(safeScope),
 		Catalog:      boundedCatalog,
 		MaxPanels:    m.cfg.MaxPanels,
 		QueryKind:    string(qKind),
@@ -313,19 +336,19 @@ func (m *Manager) Generate(ctx context.Context, owner Owner, in GenerateInput) (
 	})
 	if err != nil {
 		if errors.Is(err, context.Canceled) || opCtx.Err() == context.Canceled {
-			return m.finishJob(jobID, opToken, StatusCancelled, nil, nil, "", nil, "生成はキャンセルされました。", &meta)
+			return m.finishJob(ctx, owner, jobID, opToken, StatusCancelled, nil, nil, "", nil, "生成はキャンセルされました。", &meta)
 		}
 		if errors.Is(err, llm.ErrInsufficientMetrics) {
-			return m.finishJob(jobID, opToken, StatusInsufficientMetrics, nil, nil, "", nil, "要求に合致するメトリクスが選択スコープ内に見つかりませんでした。", &meta)
+			return m.finishJob(ctx, owner, jobID, opToken, StatusInsufficientMetrics, nil, nil, "", nil, "要求に合致するメトリクスが選択スコープ内に見つかりませんでした。", &meta)
 		}
-		return m.finishJob(jobID, opToken, StatusFailed, nil, nil, "", nil, err.Error(), &meta)
+		return m.finishJob(ctx, owner, jobID, opToken, StatusFailed, nil, nil, "", nil, err.Error(), &meta)
 	}
 
-	m.setStatusIfToken(jobID, opToken, StatusValidatingIR)
+	m.setStatusIfToken(ctx, owner, jobID, opToken, StatusValidatingIR)
 
 	doc, err := ir.DecodeStrictIR(raw)
 	if err != nil {
-		return m.finishJob(jobID, opToken, StatusFailed, nil, nil, "", nil, fmt.Sprintf("IR JSON Schema 検査に失敗しました: %v", err), &meta)
+		return m.finishJob(ctx, owner, jobID, opToken, StatusFailed, nil, nil, "", nil, fmt.Sprintf("IR JSON Schema 検査に失敗しました: %v", err), &meta)
 	}
 	doc.Revision = 1
 	if qKind != query.KindPromQL {
@@ -336,18 +359,18 @@ func (m *Manager) Generate(ctx context.Context, owner Owner, in GenerateInput) (
 		adapter,
 		doc,
 		boundedCatalog,
-		rec.scope,
+		safeScope,
 		ir.ValidateOptions{MaxPanels: m.cfg.MaxPanels},
 		query.ValidateOptions{RequireCatalogMatch: true},
 	)
 	if err != nil {
 		if errors.Is(err, query.ErrMetricNotInCatalog) {
-			return m.finishJob(jobID, opToken, StatusInsufficientMetrics, nil, nil, "", nil, fmt.Sprintf("カタログ外のメトリクス参照を検出し拒否しました: %v", err), &meta)
+			return m.finishJob(ctx, owner, jobID, opToken, StatusInsufficientMetrics, nil, nil, "", nil, fmt.Sprintf("カタログ外のメトリクス参照を検出し拒否しました: %v", err), &meta)
 		}
-		return m.finishJob(jobID, opToken, StatusFailed, nil, nil, "", nil, fmt.Sprintf("IR/%s 検査に失敗しました: %v", adapter.DisplayName(), err), &meta)
+		return m.finishJob(ctx, owner, jobID, opToken, StatusFailed, nil, nil, "", nil, fmt.Sprintf("IR/%s 検査に失敗しました: %v", adapter.DisplayName(), err), &meta)
 	}
 
-	return m.finishJob(jobID, opToken, StatusAwaitingPreview, &doc, nil, "初期ドラフトを生成しました。検証・プレビューを実行して内容を確認してください。", warnings, "", &meta)
+	return m.finishJob(ctx, owner, jobID, opToken, StatusAwaitingPreview, &doc, nil, "初期ドラフトを生成しました。検証・プレビューを実行して内容を確認してください。", warnings, "", &meta)
 }
 
 // Import validates a constrained DashboardIR converted from an existing Grafana dashboard
@@ -355,6 +378,11 @@ func (m *Manager) Generate(ctx context.Context, owner Owner, in GenerateInput) (
 // Static IR schema + dialect AST/regex/range safety policies are ALWAYS enforced; catalog membership
 // is additionally enforced whenever a non-empty scoped catalog is supplied.
 func (m *Manager) Import(owner Owner, in ImportInput) (JobSnapshot, error) {
+	return m.ImportContext(context.Background(), owner, in)
+}
+
+// ImportContext is the context-aware variant of Import.
+func (m *Manager) ImportContext(ctx context.Context, owner Owner, in ImportInput) (JobSnapshot, error) {
 	if err := validateOwner(owner); err != nil {
 		return JobSnapshot{}, err
 	}
@@ -399,9 +427,6 @@ func (m *Manager) Import(owner Owner, in ImportInput) (JobSnapshot, error) {
 		return JobSnapshot{}, fmt.Errorf("imported IR validation failed: %w", err)
 	}
 
-	knownGauges := make(map[string]bool)
-	recordKnownGauges(knownGauges, boundedCatalog)
-
 	now := m.nowFunc()
 	jobID := newJobID()
 	summary := "既存ダッシュボードを安全な IR ドラフトとしてインポートしました。検証・プレビューを実行して内容を確認してください。"
@@ -409,32 +434,21 @@ func (m *Manager) Import(owner Owner, in ImportInput) (JobSnapshot, error) {
 		summary = fmt.Sprintf("既存ダッシュボード (%s) を安全な IR ドラフトとしてインポートしました。検証・プレビューを実行して内容を確認してください。", in.ImportSource.UID)
 	}
 
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	m.evictExpiredLocked(now)
-	if err := m.ensureImportCapacityLocked(owner); err != nil {
-		return JobSnapshot{}, err
-	}
-	docCopy := doc.Clone()
-	rec := &jobRecord{
-		id:                jobID,
-		owner:             owner,
-		datasourceUID:     dsUID,
-		queryKind:         qKind,
-		scope:             cloneScope(safeScope),
-		importSource:      cloneImportSource(in.ImportSource),
-		status:            StatusAwaitingPreview,
-		currentIR:         &docCopy,
-		summary:           summary,
-		warnings:          warnings,
-		maxRepairAttempts: m.cfg.MaxRepairAttempts,
-		knownGauges:       knownGauges,
-		createdAt:         now,
-		updatedAt:         now,
-		activeOpToken:     1,
-	}
-	m.jobs[jobID] = rec
-	return snapshotLocked(rec), nil
+	return m.store.CreateImported(ctx, CreateImportedParams{
+		JobID:             jobID,
+		Owner:             owner,
+		DatasourceUID:     dsUID,
+		QueryKind:         qKind,
+		Scope:             cloneScope(safeScope),
+		ImportSource:      cloneImportSource(in.ImportSource),
+		Draft:             doc,
+		Summary:           summary,
+		Warnings:          warnings,
+		MaxRepairAttempts: m.cfg.MaxRepairAttempts,
+		KnownGauges:       extractGaugeNames(boundedCatalog),
+		Now:               now,
+		Limits:            m.cfg.storeLimits(),
+	})
 }
 
 // Patch performs a partial edit anchored to baseRevision without regenerating untouched panels.
@@ -450,101 +464,81 @@ func (m *Manager) Patch(ctx context.Context, owner Owner, jobID string, in Patch
 	if len(boundedCatalog) == 0 {
 		return JobSnapshot{}, errors.New("non-empty scoped metric catalog is required")
 	}
-
-	m.mu.Lock()
-	rec, err := m.getOwnedLocked(owner, jobID)
-	if err != nil {
-		m.mu.Unlock()
-		return JobSnapshot{}, err
-	}
-	if rec.currentIR == nil {
-		m.mu.Unlock()
-		return JobSnapshot{}, errors.New("job has no active IR draft to patch")
-	}
-	if in.BaseRevision != rec.currentIR.Revision {
-		curRev := rec.currentIR.Revision
-		m.mu.Unlock()
-		return JobSnapshot{}, fmt.Errorf("%w: request baseRevision=%d != current revision=%d", ir.ErrRevisionConflict, in.BaseRevision, curRev)
-	}
 	targetPanelID := strings.TrimSpace(in.TargetPanelID)
-	if targetPanelID != "" && !panelExists(rec.currentIR.Panels, targetPanelID) {
-		m.mu.Unlock()
-		return JobSnapshot{}, fmt.Errorf("%w: %q", ir.ErrPanelNotFound, targetPanelID)
-	}
-	if rec.activeCancel != nil {
-		m.mu.Unlock()
-		return JobSnapshot{}, ErrOperationInProgress
-	}
-	if m.activeGlobal >= m.cfg.MaxConcurrentJobs || m.activeByUser[owner] >= m.cfg.MaxConcurrentJobsPerUser {
-		m.mu.Unlock()
-		return JobSnapshot{}, ErrConcurrencyLimited
-	}
-
-	// Preserve and monotonically expand known gauge types so clients cannot spoof gauge->counter across revisions.
-	boundedCatalog = enforceKnownGaugeTypes(boundedCatalog, rec.knownGauges)
-	recordKnownGauges(rec.knownGauges, boundedCatalog)
 
 	opCtx, cancel := context.WithTimeout(ctx, m.cfg.JobDeadline)
 	defer cancel()
-	rec.activeOpToken++
-	opToken := rec.activeOpToken
-	rec.activeCancel = cancel
-	rec.status = StatusGenerating
-	rec.updatedAt = m.nowFunc()
-	m.activeGlobal++
-	m.activeByUser[owner]++
-	currentCopy := rec.currentIR.Clone()
-	scopeCopy := cloneScope(rec.scope)
-	qKind := rec.queryKind
+
+	op, err := m.store.BeginPatch(ctx, BeginPatchParams{
+		Owner:         owner,
+		JobID:         jobID,
+		BaseRevision:  in.BaseRevision,
+		TargetPanelID: targetPanelID,
+		CatalogGauges: extractGaugeNames(boundedCatalog),
+		SlotID:        newSlotID(),
+		Now:           m.nowFunc(),
+		Limits:        m.cfg.storeLimits(),
+	})
+	if err != nil {
+		return JobSnapshot{}, err
+	}
+	opToken := op.OpToken
+	m.registerLocalCancel(jobID, opToken, cancel)
+	defer m.unregisterLocalCancel(jobID, opToken)
+	defer m.releaseSlot(ctx, owner, op.SlotID)
+
+	qKind := op.QueryKind
 	if qKind == "" {
 		qKind = query.KindPromQL
 	}
 	adapter, err := m.registry.Get(qKind)
 	if err != nil {
-		m.mu.Unlock()
-		return JobSnapshot{}, err
+		return m.recordEditFailure(ctx, owner, jobID, opToken, err.Error(), nil)
 	}
-	m.mu.Unlock()
-	defer m.releaseSlot(owner)
+
+	// Preserve and monotonically expand known gauge types across revisions/replicas so clients cannot spoof gauge->counter.
+	boundedCatalog = enforceKnownGaugeTypes(boundedCatalog, op.KnownGauges)
 
 	raw, meta, err := m.client.GeneratePatch(opCtx, llm.PatchRequest{
-		CurrentIR:     currentCopy,
+		CurrentIR:     op.CurrentIR,
 		TargetPanelID: targetPanelID,
 		EditIntent:    in.EditIntent,
-		Scope:         scopeCopy,
+		Scope:         op.Scope,
 		Catalog:       boundedCatalog,
 		QueryKind:     string(qKind),
 		DialectRules:  adapter.PromptRules(),
 	})
 	if err != nil {
 		if errors.Is(err, context.Canceled) || opCtx.Err() == context.Canceled {
-			return m.revertToPreviousOnCancel(jobID, opToken)
+			return m.revertToPreviousOnCancel(ctx, owner, jobID, opToken)
 		}
-		return m.recordEditFailure(jobID, opToken, err.Error(), &meta)
+		return m.recordEditFailure(ctx, owner, jobID, opToken, err.Error(), &meta)
 	}
 
 	patch, err := ir.DecodeStrictPatch(raw)
 	if err != nil {
-		return m.recordEditFailure(jobID, opToken, fmt.Sprintf("パッチ JSON 検査に失敗しました: %v", err), &meta)
+		return m.recordEditFailure(ctx, owner, jobID, opToken, fmt.Sprintf("パッチ JSON 検査に失敗しました: %v", err), &meta)
 	}
 
 	// When user explicitly targeted a single panel, enforce that the LLM only updates that panel.
 	if targetPanelID != "" {
-		for _, op := range patch.Operations {
-			if op.Op != "update_panel" || op.PanelID != targetPanelID {
+		for _, pOp := range patch.Operations {
+			if pOp.Op != "update_panel" || pOp.PanelID != targetPanelID {
 				return m.recordEditFailure(
+					ctx,
+					owner,
 					jobID,
 					opToken,
-					fmt.Sprintf("対象パネル指定 (%s) に反するパッチ操作 (%s:%s) を拒否しました", targetPanelID, op.Op, op.PanelID),
+					fmt.Sprintf("対象パネル指定 (%s) に反するパッチ操作 (%s:%s) を拒否しました", targetPanelID, pOp.Op, pOp.PanelID),
 					&meta,
 				)
 			}
 		}
 	}
 
-	nextIR, diffs, err := ir.ApplyPatch(currentCopy, patch, ir.ValidateOptions{MaxPanels: m.cfg.MaxPanels})
+	nextIR, diffs, err := ir.ApplyPatch(op.CurrentIR, patch, ir.ValidateOptions{MaxPanels: m.cfg.MaxPanels})
 	if err != nil {
-		return m.recordEditFailure(jobID, opToken, fmt.Sprintf("パッチ適用に失敗しました: %v", err), &meta)
+		return m.recordEditFailure(ctx, owner, jobID, opToken, fmt.Sprintf("パッチ適用に失敗しました: %v", err), &meta)
 	}
 	if qKind != query.KindPromQL {
 		nextIR.StampQueryKind(string(qKind))
@@ -554,15 +548,15 @@ func (m *Manager) Patch(ctx context.Context, owner Owner, jobID string, in Patch
 		adapter,
 		nextIR,
 		boundedCatalog,
-		scopeCopy,
+		op.Scope,
 		ir.ValidateOptions{MaxPanels: m.cfg.MaxPanels},
 		query.ValidateOptions{RequireCatalogMatch: true},
 	)
 	if err != nil {
-		return m.recordEditFailure(jobID, opToken, fmt.Sprintf("パッチ後の %s 検査に失敗しました: %v", adapter.DisplayName(), err), &meta)
+		return m.recordEditFailure(ctx, owner, jobID, opToken, fmt.Sprintf("パッチ後の %s 検査に失敗しました: %v", adapter.DisplayName(), err), &meta)
 	}
 
-	return m.commitRevision(jobID, opToken, currentCopy.Revision, nextIR, diffs, patch.Summary, warnings, &meta)
+	return m.commitRevision(ctx, owner, jobID, opToken, op.CurrentIR.Revision, nextIR, diffs, patch.Summary, warnings, &meta)
 }
 
 // Repair attempts a bounded repair ONLY for syntax_error panels matching the current IR revision and queryHash.
@@ -578,36 +572,30 @@ func (m *Manager) Repair(ctx context.Context, owner Owner, jobID string, in Repa
 		return JobSnapshot{}, errors.New("non-empty scoped metric catalog is required for repair")
 	}
 
-	m.mu.Lock()
-	rec, err := m.getOwnedLocked(owner, jobID)
+	// Pre-read job state to validate syntax_error targets before atomically consuming repair budget.
+	// BeginRepair re-verifies ownership, revision, active op lock, repair budget, and concurrency slots atomically.
+	cand, err := m.store.GetRepairCandidate(ctx, owner, jobID, m.nowFunc())
 	if err != nil {
-		m.mu.Unlock()
 		return JobSnapshot{}, err
 	}
-	if rec.currentIR == nil {
-		m.mu.Unlock()
+	if cand.CurrentIR == nil {
 		return JobSnapshot{}, errors.New("job has no active IR draft to repair")
 	}
-	if in.BaseRevision != rec.currentIR.Revision {
-		curRev := rec.currentIR.Revision
-		m.mu.Unlock()
-		return JobSnapshot{}, fmt.Errorf("%w: repair baseRevision=%d != current revision=%d", ir.ErrRevisionConflict, in.BaseRevision, curRev)
+	if in.BaseRevision != cand.CurrentIR.Revision {
+		return JobSnapshot{}, formatRevisionConflict("repair", in.BaseRevision, cand.CurrentIR.Revision)
 	}
-	if rec.activeCancel != nil {
-		m.mu.Unlock()
+	if cand.HasActiveOp {
 		return JobSnapshot{}, ErrOperationInProgress
 	}
-	if rec.repairAttemptsUsed >= rec.maxRepairAttempts {
-		m.mu.Unlock()
-		return JobSnapshot{}, fmt.Errorf("%w: used %d of %d repair attempts", ErrBudgetExhausted, rec.repairAttemptsUsed, rec.maxRepairAttempts)
+	if cand.RepairAttemptsUsed >= cand.MaxRepairAttempts {
+		return JobSnapshot{}, fmt.Errorf("%w: used %d of %d repair attempts", ErrBudgetExhausted, cand.RepairAttemptsUsed, cand.MaxRepairAttempts)
 	}
-	if len(in.Results) > len(rec.currentIR.Panels) {
-		m.mu.Unlock()
-		return JobSnapshot{}, fmt.Errorf("results count %d exceeds panel count %d", len(in.Results), len(rec.currentIR.Panels))
+	if len(in.Results) > len(cand.CurrentIR.Panels) {
+		return JobSnapshot{}, fmt.Errorf("results count %d exceeds panel count %d", len(in.Results), len(cand.CurrentIR.Panels))
 	}
 
-	panelByID := make(map[string]ir.PanelIR, len(rec.currentIR.Panels))
-	for _, p := range rec.currentIR.Panels {
+	panelByID := make(map[string]ir.PanelIR, len(cand.CurrentIR.Panels))
+	for _, p := range cand.CurrentIR.Panels {
 		panelByID[p.ID] = p
 	}
 
@@ -650,65 +638,62 @@ func (m *Manager) Repair(ctx context.Context, owner Owner, jobID string, in Repa
 	}
 
 	if len(targets) == 0 {
-		m.mu.Unlock()
 		if len(rejectedReasons) > 0 {
 			return JobSnapshot{}, fmt.Errorf("%w (%s)", ErrNotRepairable, strings.Join(rejectedReasons, "; "))
 		}
 		return JobSnapshot{}, fmt.Errorf("%w: no syntax_error panel matched current revision", ErrNotRepairable)
 	}
 
-	if m.activeGlobal >= m.cfg.MaxConcurrentJobs || m.activeByUser[owner] >= m.cfg.MaxConcurrentJobsPerUser {
-		m.mu.Unlock()
-		return JobSnapshot{}, ErrConcurrencyLimited
-	}
-
-	qKind := rec.queryKind
+	qKind := cand.QueryKind
 	if qKind == "" {
 		qKind = query.KindPromQL
 	}
 	adapter, err := m.registry.Get(qKind)
 	if err != nil {
-		m.mu.Unlock()
 		return JobSnapshot{}, err
 	}
 
-	boundedCatalog = enforceKnownGaugeTypes(boundedCatalog, rec.knownGauges)
-	recordKnownGauges(rec.knownGauges, boundedCatalog)
-
-	// Consume repair budget BEFORE calling LLM so repeated requests cannot bypass budget.
-	rec.repairAttemptsUsed++
 	opCtx, cancel := context.WithTimeout(ctx, m.cfg.JobDeadline)
 	defer cancel()
-	rec.activeOpToken++
-	opToken := rec.activeOpToken
-	rec.activeCancel = cancel
-	rec.status = StatusRepairing
-	rec.updatedAt = m.nowFunc()
-	m.activeGlobal++
-	m.activeByUser[owner]++
-	currentCopy := rec.currentIR.Clone()
-	scopeCopy := cloneScope(rec.scope)
-	m.mu.Unlock()
-	defer m.releaseSlot(owner)
+
+	// Atomically verify revision/lock/budget/concurrency and consume repair budget BEFORE calling LLM.
+	op, err := m.store.BeginRepair(ctx, BeginRepairParams{
+		Owner:         owner,
+		JobID:         jobID,
+		BaseRevision:  in.BaseRevision,
+		CatalogGauges: extractGaugeNames(boundedCatalog),
+		SlotID:        newSlotID(),
+		Now:           m.nowFunc(),
+		Limits:        m.cfg.storeLimits(),
+	})
+	if err != nil {
+		return JobSnapshot{}, err
+	}
+	opToken := op.OpToken
+	m.registerLocalCancel(jobID, opToken, cancel)
+	defer m.unregisterLocalCancel(jobID, opToken)
+	defer m.releaseSlot(ctx, owner, op.SlotID)
+
+	boundedCatalog = enforceKnownGaugeTypes(boundedCatalog, op.KnownGauges)
 
 	raw, meta, err := m.client.RepairPanels(opCtx, llm.RepairRequest{
-		CurrentIR:    currentCopy,
+		CurrentIR:    op.CurrentIR,
 		Targets:      targets,
-		Scope:        scopeCopy,
+		Scope:        op.Scope,
 		Catalog:      boundedCatalog,
 		QueryKind:    string(qKind),
 		DialectRules: adapter.PromptRules(),
 	})
 	if err != nil {
 		if errors.Is(err, context.Canceled) || opCtx.Err() == context.Canceled {
-			return m.revertToPreviousOnCancel(jobID, opToken)
+			return m.revertToPreviousOnCancel(ctx, owner, jobID, opToken)
 		}
-		return m.recordEditFailure(jobID, opToken, fmt.Sprintf("自動修復に失敗しました: %v", err), &meta)
+		return m.recordEditFailure(ctx, owner, jobID, opToken, fmt.Sprintf("自動修復に失敗しました: %v", err), &meta)
 	}
 
 	patch, err := ir.DecodeStrictPatch(raw)
 	if err != nil {
-		return m.recordEditFailure(jobID, opToken, fmt.Sprintf("修復パッチ JSON 検査に失敗しました: %v", err), &meta)
+		return m.recordEditFailure(ctx, owner, jobID, opToken, fmt.Sprintf("修復パッチ JSON 検査に失敗しました: %v", err), &meta)
 	}
 
 	// Enforce that repair ONLY touches Query or Queries on the failing syntax_error panels
@@ -717,32 +702,32 @@ func (m *Manager) Repair(ctx context.Context, owner Owner, jobID string, in Repa
 	for _, t := range targets {
 		allowedTargetIDs[t.PanelID] = true
 	}
-	for _, op := range patch.Operations {
-		if op.Op != "update_panel" || !allowedTargetIDs[op.PanelID] || op.Panel == nil || (op.Panel.Query == nil && op.Panel.Queries == nil) {
-			return m.recordEditFailure(jobID, opToken, fmt.Sprintf("修復パッチが対象外パネル/操作 (%s:%s) を含んでいたため拒否しました", op.Op, op.PanelID), &meta)
+	for _, pOp := range patch.Operations {
+		if pOp.Op != "update_panel" || !allowedTargetIDs[pOp.PanelID] || pOp.Panel == nil || (pOp.Panel.Query == nil && pOp.Panel.Queries == nil) {
+			return m.recordEditFailure(ctx, owner, jobID, opToken, fmt.Sprintf("修復パッチが対象外パネル/操作 (%s:%s) を含んでいたため拒否しました", pOp.Op, pOp.PanelID), &meta)
 		}
-		p := op.Panel
+		p := pOp.Panel
 		if p.DatasourceRef != "" && p.DatasourceRef != ir.SelectedDatasourceRef {
-			return m.recordEditFailure(jobID, opToken, "修復パッチによるデータソース変更は禁止されています", &meta)
+			return m.recordEditFailure(ctx, owner, jobID, opToken, "修復パッチによるデータソース変更は禁止されています", &meta)
 		}
 		if p.Type != "" || p.Title != "" || p.Description != nil || p.Unit != "" || p.Thresholds != nil || p.Layout != nil {
-			return m.recordEditFailure(jobID, opToken, fmt.Sprintf("修復パッチは失敗パネルの %s クエリのみ変更可能です", adapter.DisplayName()), &meta)
+			return m.recordEditFailure(ctx, owner, jobID, opToken, fmt.Sprintf("修復パッチは失敗パネルの %s クエリのみ変更可能です", adapter.DisplayName()), &meta)
 		}
 		if p.Query != nil && p.Query.Kind != nil && *p.Query.Kind != "" && *p.Query.Kind != string(qKind) {
-			return m.recordEditFailure(jobID, opToken, fmt.Sprintf("修復パッチによるクエリ方言変更 (%q -> %q) は禁止されています", qKind, *p.Query.Kind), &meta)
+			return m.recordEditFailure(ctx, owner, jobID, opToken, fmt.Sprintf("修復パッチによるクエリ方言変更 (%q -> %q) は禁止されています", qKind, *p.Query.Kind), &meta)
 		}
 		if p.Queries != nil {
 			for _, q := range *p.Queries {
 				if q.Kind != "" && q.Kind != string(qKind) {
-					return m.recordEditFailure(jobID, opToken, fmt.Sprintf("修復パッチによるクエリ方言変更 (%q -> %q) は禁止されています", qKind, q.Kind), &meta)
+					return m.recordEditFailure(ctx, owner, jobID, opToken, fmt.Sprintf("修復パッチによるクエリ方言変更 (%q -> %q) は禁止されています", qKind, q.Kind), &meta)
 				}
 			}
 		}
 	}
 
-	nextIR, diffs, err := ir.ApplyPatch(currentCopy, patch, ir.ValidateOptions{MaxPanels: m.cfg.MaxPanels})
+	nextIR, diffs, err := ir.ApplyPatch(op.CurrentIR, patch, ir.ValidateOptions{MaxPanels: m.cfg.MaxPanels})
 	if err != nil {
-		return m.recordEditFailure(jobID, opToken, fmt.Sprintf("修復パッチ適用に失敗しました: %v", err), &meta)
+		return m.recordEditFailure(ctx, owner, jobID, opToken, fmt.Sprintf("修復パッチ適用に失敗しました: %v", err), &meta)
 	}
 	if qKind != query.KindPromQL {
 		nextIR.StampQueryKind(string(qKind))
@@ -752,105 +737,72 @@ func (m *Manager) Repair(ctx context.Context, owner Owner, jobID string, in Repa
 		adapter,
 		nextIR,
 		boundedCatalog,
-		scopeCopy,
+		op.Scope,
 		ir.ValidateOptions{MaxPanels: m.cfg.MaxPanels},
 		query.ValidateOptions{RequireCatalogMatch: true},
 	)
 	if err != nil {
-		return m.recordEditFailure(jobID, opToken, fmt.Sprintf("修復後の %s/スコープ検査に失敗しました: %v", adapter.DisplayName(), err), &meta)
+		return m.recordEditFailure(ctx, owner, jobID, opToken, fmt.Sprintf("修復後の %s/スコープ検査に失敗しました: %v", adapter.DisplayName(), err), &meta)
 	}
 
-	return m.commitRevision(jobID, opToken, currentCopy.Revision, nextIR, diffs, "構文エラーのパネルを修復しました。変更パネルを再検証してください。", warnings, &meta)
+	return m.commitRevision(ctx, owner, jobID, opToken, op.CurrentIR.Revision, nextIR, diffs, "構文エラーのパネルを修復しました。変更パネルを再検証してください。", warnings, &meta)
 }
 
 // Undo restores the immediately preceding IR revision as a new monotonic revision,
 // cancelling any in-flight operation so late failures cannot overwrite the restored draft.
 func (m *Manager) Undo(owner Owner, jobID string) (JobSnapshot, error) {
+	return m.UndoContext(context.Background(), owner, jobID)
+}
+
+// UndoContext is the context-aware variant of Undo.
+func (m *Manager) UndoContext(ctx context.Context, owner Owner, jobID string) (JobSnapshot, error) {
 	if err := validateOwner(owner); err != nil {
 		return JobSnapshot{}, err
 	}
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	rec, err := m.getOwnedLocked(owner, jobID)
+	snap, err := m.store.Undo(ctx, owner, jobID, m.nowFunc(), m.cfg.JobTTL)
 	if err != nil {
 		return JobSnapshot{}, err
 	}
-	if len(rec.history) == 0 || rec.currentIR == nil {
-		return JobSnapshot{}, ErrNoUndoHistory
-	}
-	if rec.currentIR.Revision >= ir.MaxRevision {
-		return JobSnapshot{}, fmt.Errorf("revision limit %d reached", ir.MaxRevision)
-	}
-
-	// Cancel and invalidate any in-flight Patch/Repair so stale results cannot corrupt Undo state.
-	rec.activeOpToken++
-	if rec.activeCancel != nil {
-		rec.activeCancel()
-		rec.activeCancel = nil
-	}
-
-	prev := rec.history[len(rec.history)-1]
-	rec.history = rec.history[:len(rec.history)-1]
-	restored := prev.Clone()
-	restored.Revision = rec.currentIR.Revision + 1
-	rec.currentIR = &restored
-	rec.lastDiff = []ir.DiffEntry{{
-		Op:     "undo",
-		Field:  "revision",
-		Before: fmt.Sprintf("rev %d", restored.Revision-1),
-		After:  fmt.Sprintf("restored from rev %d as rev %d", prev.Revision, restored.Revision),
-	}}
-	rec.summary = "直前のドラフト状態を取り消して復元しました。"
-	rec.status = StatusAwaitingPreview
-	rec.errorMessage = ""
-	rec.updatedAt = m.nowFunc()
-	return snapshotLocked(rec), nil
+	// Cancel any local in-flight LLM goroutine AFTER store ownership check succeeded.
+	m.cancelLocalOp(jobID)
+	return snap, nil
 }
 
 // Cancel aborts any in-flight LLM operation for an owner's job and prevents stale results from applying.
 func (m *Manager) Cancel(owner Owner, jobID string) (JobSnapshot, error) {
+	return m.CancelContext(context.Background(), owner, jobID)
+}
+
+// CancelContext is the context-aware variant of Cancel.
+func (m *Manager) CancelContext(ctx context.Context, owner Owner, jobID string) (JobSnapshot, error) {
 	if err := validateOwner(owner); err != nil {
 		return JobSnapshot{}, err
 	}
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	rec, err := m.getOwnedLocked(owner, jobID)
+	snap, err := m.store.Cancel(ctx, owner, jobID, m.nowFunc(), m.cfg.JobTTL)
 	if err != nil {
 		return JobSnapshot{}, err
 	}
-	rec.activeOpToken++
-	if rec.activeCancel != nil {
-		rec.activeCancel()
-		rec.activeCancel = nil
-	}
-	if rec.currentIR == nil {
-		rec.status = StatusCancelled
-	} else {
-		rec.status = StatusAwaitingPreview
-	}
-	rec.summary = "実行中の処理をキャンセルしました。"
-	rec.updatedAt = m.nowFunc()
-	return snapshotLocked(rec), nil
+	// Cancel any local in-flight LLM goroutine AFTER store ownership check succeeded.
+	m.cancelLocalOp(jobID)
+	return snap, nil
 }
 
 // Get returns the current state of an owner's job.
 func (m *Manager) Get(owner Owner, jobID string) (JobSnapshot, error) {
+	return m.GetContext(context.Background(), owner, jobID)
+}
+
+// GetContext is the context-aware variant of Get.
+func (m *Manager) GetContext(ctx context.Context, owner Owner, jobID string) (JobSnapshot, error) {
 	if err := validateOwner(owner); err != nil {
 		return JobSnapshot{}, err
 	}
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	rec, err := m.getOwnedLocked(owner, jobID)
-	if err != nil {
-		return JobSnapshot{}, err
-	}
-	return snapshotLocked(rec), nil
+	return m.store.Get(ctx, owner, jobID, m.nowFunc())
 }
 
 func (m *Manager) finishJob(
+	parentCtx context.Context,
+	owner Owner,
 	jobID string,
 	opToken uint64,
 	status JobStatus,
@@ -861,35 +813,27 @@ func (m *Manager) finishJob(
 	errMsg string,
 	meta *llm.CompletionMeta,
 ) (JobSnapshot, error) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	rec, ok := m.jobs[jobID]
-	if !ok {
-		return JobSnapshot{}, ErrJobNotFound
-	}
-	if rec.activeOpToken != opToken {
-		return snapshotLocked(rec), ErrJobCancelled
-	}
-	rec.activeCancel = nil
-	rec.status = status
-	if doc != nil {
-		c := doc.Clone()
-		rec.currentIR = &c
-	}
-	rec.lastDiff = diffs
-	rec.summary = summary
-	rec.warnings = warnings
-	rec.errorMessage = errMsg
-	if meta != nil {
-		mc := *meta
-		rec.llmMeta = &mc
-	}
-	rec.updatedAt = m.nowFunc()
-	return snapshotLocked(rec), nil
+	storeCtx, cancel := detachedStoreContext(parentCtx)
+	defer cancel()
+	return m.store.FinishJob(storeCtx, FinishJobParams{
+		Owner:        owner,
+		JobID:        jobID,
+		OpToken:      opToken,
+		Status:       status,
+		Doc:          doc,
+		Diffs:        diffs,
+		Summary:      summary,
+		Warnings:     warnings,
+		ErrorMessage: errMsg,
+		LLMMeta:      meta,
+		Now:          m.nowFunc(),
+		JobTTL:       m.cfg.JobTTL,
+	})
 }
 
 func (m *Manager) commitRevision(
+	parentCtx context.Context,
+	owner Owner,
 	jobID string,
 	opToken uint64,
 	expectedRev int,
@@ -899,210 +843,90 @@ func (m *Manager) commitRevision(
 	warnings []string,
 	meta *llm.CompletionMeta,
 ) (JobSnapshot, error) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	rec, ok := m.jobs[jobID]
-	if !ok {
-		return JobSnapshot{}, ErrJobNotFound
-	}
-	if rec.activeOpToken != opToken {
-		return snapshotLocked(rec), ErrJobCancelled
-	}
-	if rec.currentIR == nil || rec.currentIR.Revision != expectedRev {
-		return snapshotLocked(rec), ir.ErrRevisionConflict
-	}
-	rec.history = append(rec.history, rec.currentIR.Clone())
-	if len(rec.history) > 10 {
-		rec.history = rec.history[len(rec.history)-10:]
-	}
-	c := nextIR.Clone()
-	rec.currentIR = &c
-	rec.lastDiff = diffs
-	rec.summary = summary
-	rec.warnings = warnings
-	rec.errorMessage = ""
-	rec.status = StatusAwaitingPreview
-	rec.activeCancel = nil
-	if meta != nil {
-		mc := *meta
-		rec.llmMeta = &mc
-	}
-	rec.updatedAt = m.nowFunc()
-	return snapshotLocked(rec), nil
+	storeCtx, cancel := detachedStoreContext(parentCtx)
+	defer cancel()
+	return m.store.CommitRevision(storeCtx, CommitRevisionParams{
+		Owner:          owner,
+		JobID:          jobID,
+		OpToken:        opToken,
+		ExpectedRev:    expectedRev,
+		NextIR:         nextIR,
+		Diffs:          diffs,
+		Summary:        summary,
+		Warnings:       warnings,
+		LLMMeta:        meta,
+		Now:            m.nowFunc(),
+		JobTTL:         m.cfg.JobTTL,
+		MaxUndoHistory: defaultMaxUndoHistory,
+	})
 }
 
-func (m *Manager) revertToPreviousOnCancel(jobID string, opToken uint64) (JobSnapshot, error) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	rec, ok := m.jobs[jobID]
-	if !ok {
-		return JobSnapshot{}, ErrJobNotFound
-	}
-	if rec.activeOpToken == opToken {
-		rec.activeCancel = nil
-		if rec.currentIR != nil {
-			rec.status = StatusAwaitingPreview
-		} else {
-			rec.status = StatusCancelled
-		}
-		rec.summary = "処理がキャンセルされたためドラフトは変更されていません。"
-		rec.updatedAt = m.nowFunc()
-	}
-	return snapshotLocked(rec), ErrJobCancelled
+func (m *Manager) revertToPreviousOnCancel(parentCtx context.Context, owner Owner, jobID string, opToken uint64) (JobSnapshot, error) {
+	storeCtx, cancel := detachedStoreContext(parentCtx)
+	defer cancel()
+	return m.store.RevertOnCancel(storeCtx, owner, jobID, opToken, m.nowFunc(), m.cfg.JobTTL)
 }
 
-func (m *Manager) recordEditFailure(jobID string, opToken uint64, errMsg string, meta *llm.CompletionMeta) (JobSnapshot, error) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	rec, ok := m.jobs[jobID]
-	if !ok {
-		return JobSnapshot{}, ErrJobNotFound
-	}
-	if rec.activeOpToken != opToken {
-		return snapshotLocked(rec), ErrJobCancelled
-	}
-	rec.activeCancel = nil
-	rec.status = StatusFailed
-	rec.errorMessage = errMsg
-	if meta != nil {
-		mc := *meta
-		rec.llmMeta = &mc
-	}
-	rec.updatedAt = m.nowFunc()
-	return snapshotLocked(rec), errors.New(errMsg)
+func (m *Manager) recordEditFailure(parentCtx context.Context, owner Owner, jobID string, opToken uint64, errMsg string, meta *llm.CompletionMeta) (JobSnapshot, error) {
+	storeCtx, cancel := detachedStoreContext(parentCtx)
+	defer cancel()
+	return m.store.RecordEditFailure(storeCtx, RecordEditFailureParams{
+		Owner:        owner,
+		JobID:        jobID,
+		OpToken:      opToken,
+		ErrorMessage: errMsg,
+		LLMMeta:      meta,
+		Now:          m.nowFunc(),
+		JobTTL:       m.cfg.JobTTL,
+	})
 }
 
-func (m *Manager) setStatusIfToken(jobID string, opToken uint64, status JobStatus) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	if rec, ok := m.jobs[jobID]; ok && rec.activeOpToken == opToken {
-		rec.status = status
-		rec.updatedAt = m.nowFunc()
+func (m *Manager) setStatusIfToken(parentCtx context.Context, owner Owner, jobID string, opToken uint64, status JobStatus) {
+	storeCtx, cancel := detachedStoreContext(parentCtx)
+	defer cancel()
+	_ = m.store.SetStatus(storeCtx, owner, jobID, opToken, status, m.nowFunc(), m.cfg.JobTTL)
+}
+
+func (m *Manager) releaseSlot(parentCtx context.Context, owner Owner, slotID string) {
+	if slotID == "" {
+		return
+	}
+	storeCtx, cancel := detachedStoreContext(parentCtx)
+	defer cancel()
+	_ = m.store.ReleaseSlot(storeCtx, owner, slotID, m.nowFunc())
+}
+
+func (m *Manager) registerLocalCancel(jobID string, opToken uint64, cancel context.CancelFunc) {
+	m.localMu.Lock()
+	m.localCancels[jobID] = localCancelEntry{opToken: opToken, cancel: cancel}
+	m.localMu.Unlock()
+}
+
+func (m *Manager) unregisterLocalCancel(jobID string, opToken uint64) {
+	m.localMu.Lock()
+	if entry, ok := m.localCancels[jobID]; ok && entry.opToken == opToken {
+		delete(m.localCancels, jobID)
+	}
+	m.localMu.Unlock()
+}
+
+func (m *Manager) cancelLocalOp(jobID string) {
+	m.localMu.Lock()
+	entry, ok := m.localCancels[jobID]
+	if ok {
+		delete(m.localCancels, jobID)
+	}
+	m.localMu.Unlock()
+	if ok && entry.cancel != nil {
+		entry.cancel()
 	}
 }
 
-func (m *Manager) getOwnedLocked(owner Owner, jobID string) (*jobRecord, error) {
-	m.evictExpiredLocked(m.nowFunc())
-	rec, ok := m.jobs[jobID]
-	if !ok {
-		return nil, ErrJobNotFound
+func detachedStoreContext(parent context.Context) (context.Context, context.CancelFunc) {
+	if parent == nil {
+		parent = context.Background()
 	}
-	if rec.owner.OrgID != owner.OrgID || rec.owner.UserLogin != owner.UserLogin {
-		return nil, ErrForbidden
-	}
-	return rec, nil
-}
-
-func (m *Manager) evictExpiredLocked(now time.Time) {
-	for id, rec := range m.jobs {
-		if now.Sub(rec.updatedAt) > m.cfg.JobTTL && rec.activeCancel == nil {
-			delete(m.jobs, id)
-		}
-	}
-}
-
-// ensureCapacityLocked enforces per-user and global job limits while NEVER evicting
-// another user's currently active (in-flight) job.
-func (m *Manager) ensureCapacityLocked(caller Owner) error {
-	// 1. Enforce per-user retained job cap first (evict caller's own oldest non-active job).
-	userCount := 0
-	var callerOldestInactive string
-	var callerOldestTime time.Time
-	for id, rec := range m.jobs {
-		if rec.owner == caller {
-			userCount++
-			if rec.activeCancel == nil && (callerOldestInactive == "" || rec.updatedAt.Before(callerOldestTime)) {
-				callerOldestInactive = id
-				callerOldestTime = rec.updatedAt
-			}
-		}
-	}
-	if userCount >= m.cfg.MaxJobsPerUser {
-		if callerOldestInactive == "" {
-			return ErrConcurrencyLimited
-		}
-		delete(m.jobs, callerOldestInactive)
-	}
-
-	// 2. Enforce global store cap: evict caller's oldest inactive -> any oldest inactive.
-	if len(m.jobs) < m.cfg.MaxJobs {
-		return nil
-	}
-	if callerOldestInactive != "" {
-		if _, stillThere := m.jobs[callerOldestInactive]; stillThere {
-			delete(m.jobs, callerOldestInactive)
-			return nil
-		}
-	}
-	var oldestInactive string
-	var oldestTime time.Time
-	for id, rec := range m.jobs {
-		if rec.activeCancel == nil && (oldestInactive == "" || rec.updatedAt.Before(oldestTime)) {
-			oldestInactive = id
-			oldestTime = rec.updatedAt
-		}
-	}
-	if oldestInactive == "" {
-		// All stored jobs are actively executing for other users; refuse instead of killing them.
-		return ErrConcurrencyLimited
-	}
-	delete(m.jobs, oldestInactive)
-	return nil
-}
-
-// ensureImportCapacityLocked enforces per-user and global caps for synchronous Import jobs.
-// Unlike Generate, Import does not consume an LLM concurrency slot, so it MUST NEVER evict
-// another user's non-expired job (preventing cross-user job-eviction DoS).
-func (m *Manager) ensureImportCapacityLocked(caller Owner) error {
-	userCount := 0
-	var callerOldestInactive string
-	var callerOldestTime time.Time
-	for id, rec := range m.jobs {
-		if rec.owner == caller {
-			userCount++
-			if rec.activeCancel == nil && (callerOldestInactive == "" || rec.updatedAt.Before(callerOldestTime)) {
-				callerOldestInactive = id
-				callerOldestTime = rec.updatedAt
-			}
-		}
-	}
-	if userCount >= m.cfg.MaxJobsPerUser {
-		if callerOldestInactive == "" {
-			return ErrConcurrencyLimited
-		}
-		delete(m.jobs, callerOldestInactive)
-	}
-	if len(m.jobs) < m.cfg.MaxJobs {
-		return nil
-	}
-	// Global cap reached: only evict another of the caller's own inactive jobs.
-	var callerNextOldest string
-	var callerNextTime time.Time
-	for id, rec := range m.jobs {
-		if rec.owner == caller && rec.activeCancel == nil && (callerNextOldest == "" || rec.updatedAt.Before(callerNextTime)) {
-			callerNextOldest = id
-			callerNextTime = rec.updatedAt
-		}
-	}
-	if callerNextOldest == "" {
-		return ErrConcurrencyLimited
-	}
-	delete(m.jobs, callerNextOldest)
-	return nil
-}
-
-func (m *Manager) releaseSlot(owner Owner) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	if m.activeGlobal > 0 {
-		m.activeGlobal--
-	}
-	if m.activeByUser[owner] > 1 {
-		m.activeByUser[owner]--
-	} else {
-		delete(m.activeByUser, owner)
-	}
+	return context.WithTimeout(context.WithoutCancel(parent), defaultStoreOpTimeout)
 }
 
 func (m *Manager) isDatasourceAllowed(uid string) bool {
@@ -1141,17 +965,6 @@ func (m *Manager) resolveAdapter(dsUID string, clientKind string) (query.Kind, q
 		return "", nil, err
 	}
 	return k, adapter, nil
-}
-
-func recordKnownGauges(dst map[string]bool, catalog []ir.MetricCatalogItem) {
-	if dst == nil {
-		return
-	}
-	for _, item := range catalog {
-		if strings.EqualFold(strings.TrimSpace(item.Type), "gauge") && strings.TrimSpace(item.Name) != "" {
-			dst[item.Name] = true
-		}
-	}
 }
 
 func panelExists(panels []ir.PanelIR, panelID string) bool {
@@ -1198,51 +1011,6 @@ func cloneImportSource(s *ir.ImportSource) *ir.ImportSource {
 	}
 	cp := *s
 	return &cp
-}
-
-func snapshotLocked(rec *jobRecord) JobSnapshot {
-	var irCopy *ir.DashboardIR
-	if rec.currentIR != nil {
-		c := rec.currentIR.Clone()
-		irCopy = &c
-	}
-	var diffs []ir.DiffEntry
-	if len(rec.lastDiff) > 0 {
-		diffs = make([]ir.DiffEntry, len(rec.lastDiff))
-		copy(diffs, rec.lastDiff)
-	}
-	var warns []string
-	if len(rec.warnings) > 0 {
-		warns = make([]string, len(rec.warnings))
-		copy(warns, rec.warnings)
-	}
-	var metaCopy *llm.CompletionMeta
-	if rec.llmMeta != nil {
-		mc := *rec.llmMeta
-		metaCopy = &mc
-	}
-	qKind := rec.queryKind
-	if qKind == "" {
-		qKind = query.KindPromQL
-	}
-	return JobSnapshot{
-		JobID:              rec.id,
-		Status:             rec.status,
-		DatasourceUID:      rec.datasourceUID,
-		QueryKind:          string(qKind),
-		Scope:              cloneScope(rec.scope),
-		ImportSource:       cloneImportSource(rec.importSource),
-		CurrentIR:          irCopy,
-		LastDiff:           diffs,
-		Summary:            rec.summary,
-		Warnings:           warns,
-		ErrorMessage:       rec.errorMessage,
-		RepairAttemptsUsed: rec.repairAttemptsUsed,
-		MaxRepairAttempts:  rec.maxRepairAttempts,
-		CanUndo:            len(rec.history) > 0,
-		LLM:                metaCopy,
-		UpdatedAt:          rec.updatedAt,
-	}
 }
 
 func newJobID() string {

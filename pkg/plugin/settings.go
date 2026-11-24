@@ -12,13 +12,16 @@ import (
 	"github.com/grafana/grafana-llm-app/llmclient"
 	"github.com/grafana/grafana-plugin-sdk-go/backend"
 	"github.com/yuuki/grafana-llm-studio-app/pkg/ir"
+	"github.com/yuuki/grafana-llm-studio-app/pkg/jobs"
 	"github.com/yuuki/grafana-llm-studio-app/pkg/llm"
 	"github.com/yuuki/grafana-llm-studio-app/pkg/query"
 )
 
 const (
-	LLMModeGrafanaLLMApp = "grafana-llm-app"
-	LLMModeMock          = "mock"
+	LLMModeGrafanaLLMApp  = "grafana-llm-app"
+	LLMModeMock           = "mock"
+	JobStoreBackendMemory = "memory"
+	JobStoreBackendRedis  = "redis"
 )
 
 var allowedReasoningEfforts = map[string]bool{
@@ -57,6 +60,13 @@ type JSONSettings struct {
 	MaxConcurrentJobs     int               `json:"maxConcurrentJobs"`
 	ValidationTimeoutSec  int               `json:"validationTimeoutSeconds"`
 	MaxConcurrentQueries  int               `json:"maxConcurrentQueries"`
+	JobStoreBackend       string            `json:"jobStoreBackend,omitempty"`
+	JobTTLMinutes         int               `json:"jobTtlMinutes,omitempty"`
+	RedisAddr             string            `json:"redisAddr,omitempty"`
+	RedisDB               int               `json:"redisDb,omitempty"`
+	RedisKeyPrefix        string            `json:"redisKeyPrefix,omitempty"`
+	RedisTLS              bool              `json:"redisTls,omitempty"`
+	RedisUsername         string            `json:"redisUsername,omitempty"`
 }
 
 // Settings combines validated jsonData and decrypted secureJsonData.
@@ -67,6 +77,9 @@ type Settings struct {
 	// llmServiceAccountToken is strictly scoped for llmclient calls to grafana-llm-app ONLY.
 	// It MUST NEVER be reused for datasource queries or dashboard persistence.
 	llmServiceAccountToken string
+	// redisPassword is the optional decrypted secret for jobStoreBackend=redis.
+	// It MUST NEVER be exposed in PublicConfig, health responses, or logs.
+	redisPassword string
 }
 
 // PublicConfig is the secret-free subset exposed to the Frontend via GET /config/public.
@@ -246,9 +259,42 @@ func LoadSettings(appSettings backend.AppInstanceSettings, trustedGrafanaAppURL 
 		return Settings{}, errors.New("llmMode=mock requires explicit allowMockInDev=true (dev/test only)")
 	}
 
+	js.JobStoreBackend = strings.TrimSpace(strings.ToLower(js.JobStoreBackend))
+	if js.JobStoreBackend == "" {
+		js.JobStoreBackend = JobStoreBackendMemory
+	}
+	if js.JobStoreBackend != JobStoreBackendMemory && js.JobStoreBackend != JobStoreBackendRedis {
+		return Settings{}, fmt.Errorf("unsupported jobStoreBackend %q (must be %q or %q)", js.JobStoreBackend, JobStoreBackendMemory, JobStoreBackendRedis)
+	}
+	if js.JobTTLMinutes <= 0 || js.JobTTLMinutes > 1440 {
+		js.JobTTLMinutes = 30
+	}
+	js.RedisAddr = strings.TrimSpace(js.RedisAddr)
+	js.RedisKeyPrefix = strings.TrimSpace(js.RedisKeyPrefix)
+	js.RedisUsername = strings.TrimSpace(js.RedisUsername)
+	if len(js.RedisUsername) > 128 {
+		return Settings{}, errors.New("redisUsername exceeds maximum length of 128 characters")
+	}
+	if js.JobStoreBackend == JobStoreBackendRedis {
+		if err := jobs.ValidateRedisAddr(js.RedisAddr); err != nil {
+			return Settings{}, err
+		}
+		if js.RedisDB < 0 || js.RedisDB > 15 {
+			return Settings{}, fmt.Errorf("redisDb must be between 0 and 15, got %d", js.RedisDB)
+		}
+		if err := jobs.ValidateRedisKeyPrefix(js.RedisKeyPrefix); err != nil {
+			return Settings{}, err
+		}
+		if js.RedisKeyPrefix == "" {
+			js.RedisKeyPrefix = jobs.DefaultRedisKeyPrefix
+		}
+	}
+
 	var token string
+	var redisPass string
 	if appSettings.DecryptedSecureJSONData != nil {
 		token = strings.TrimSpace(appSettings.DecryptedSecureJSONData["llmServiceAccountToken"])
+		redisPass = appSettings.DecryptedSecureJSONData["redisPassword"]
 	}
 
 	return Settings{
@@ -256,6 +302,7 @@ func LoadSettings(appSettings backend.AppInstanceSettings, trustedGrafanaAppURL 
 		EffectiveReasoningEffort: reasoning,
 		EffectiveMaxRepairs:      effectiveRepairs,
 		llmServiceAccountToken:   token,
+		redisPassword:            redisPass,
 	}, nil
 }
 
@@ -299,4 +346,11 @@ func (s Settings) LLMTimeout() time.Duration {
 
 func (s Settings) JobDeadline() time.Duration {
 	return time.Duration(s.JobDeadlineSeconds) * time.Second
+}
+
+func (s Settings) JobTTL() time.Duration {
+	if s.JobTTLMinutes <= 0 {
+		return 30 * time.Minute
+	}
+	return time.Duration(s.JobTTLMinutes) * time.Minute
 }

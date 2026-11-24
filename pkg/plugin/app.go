@@ -32,6 +32,8 @@ type App struct {
 	settings        Settings
 	llmClient       llm.Client
 	llmInitErr      error
+	jobStore        jobs.JobStore
+	storeInitErr    error
 	jobManager      *jobs.Manager
 	resourceHandler backend.CallResourceHandler
 }
@@ -84,27 +86,56 @@ func NewApp(ctx context.Context, appSettings backend.AppInstanceSettings) (insta
 		initErr = fmt.Errorf("unsupported llmMode: %s", settings.LLMMode)
 	}
 
-	return newAppWithClient(settings, client, initErr), nil
+	var (
+		store        jobs.JobStore
+		storeInitErr error
+	)
+	switch settings.JobStoreBackend {
+	case "", JobStoreBackendMemory:
+		store = jobs.NewMemoryStore()
+	case JobStoreBackendRedis:
+		// Never silently fall back to single-process memory when Redis is explicitly configured for HA.
+		store, storeInitErr = jobs.NewRedisStore(jobs.RedisConfig{
+			Addr:      settings.RedisAddr,
+			Username:  settings.RedisUsername,
+			Password:  settings.redisPassword,
+			DB:        settings.RedisDB,
+			KeyPrefix: settings.RedisKeyPrefix,
+			TLS:       settings.RedisTLS,
+		})
+	default:
+		storeInitErr = fmt.Errorf("unsupported jobStoreBackend: %s", settings.JobStoreBackend)
+	}
+
+	return newAppWithClientAndStore(settings, client, initErr, store, storeInitErr), nil
 }
 
 func newAppWithClient(settings Settings, client llm.Client, initErr error) *App {
+	return newAppWithClientAndStore(settings, client, initErr, jobs.NewMemoryStore(), nil)
+}
+
+func newAppWithClientAndStore(settings Settings, client llm.Client, initErr error, store jobs.JobStore, storeInitErr error) *App {
 	var mgr *jobs.Manager
-	if client != nil {
+	if client != nil && store != nil && storeInitErr == nil {
 		mgr = jobs.NewManager(client, jobs.Config{
 			MaxPanels:            settings.MaxPanels,
 			MaxRepairAttempts:    settings.EffectiveMaxRepairs,
 			MaxRepairAttemptsSet: true,
 			JobDeadline:          settings.JobDeadline(),
+			JobTTL:               settings.JobTTL(),
 			MaxConcurrentJobs:    settings.MaxConcurrentJobs,
 			AllowedDSUIDs:        settings.AllowedDatasourceUIDs,
 			DatasourceDialects:   settings.DatasourceDialects,
+			Store:                store,
 		})
 	}
 	a := &App{
-		settings:   settings,
-		llmClient:  client,
-		llmInitErr: initErr,
-		jobManager: mgr,
+		settings:     settings,
+		llmClient:    client,
+		llmInitErr:   initErr,
+		jobStore:     store,
+		storeInitErr: storeInitErr,
+		jobManager:   mgr,
 	}
 	mux := http.NewServeMux()
 	a.registerRoutes(mux)
@@ -112,10 +143,13 @@ func newAppWithClient(settings Settings, client llm.Client, initErr error) *App 
 	return a
 }
 
-// Dispose cancels all active in-flight jobs when Grafana recycles the plugin instance.
+// Dispose cancels all active in-flight jobs and closes the job store when Grafana recycles the plugin instance.
 func (a *App) Dispose() {
 	if a.jobManager != nil {
 		a.jobManager.Close()
+	}
+	if a.jobStore != nil {
+		_ = a.jobStore.Close()
 	}
 }
 
@@ -124,12 +158,24 @@ func (a *App) CallResource(ctx context.Context, req *backend.CallResourceRequest
 	return a.resourceHandler.CallResource(ctx, req, sender)
 }
 
-// CheckHealth verifies configuration and connectivity to grafana-llm-app (or explicit dev mock).
+// CheckHealth verifies configuration, job store connectivity, and connectivity to grafana-llm-app (or explicit dev mock).
 func (a *App) CheckHealth(ctx context.Context, _ *backend.CheckHealthRequest) (*backend.CheckHealthResult, error) {
 	if a.llmInitErr != nil || a.llmClient == nil {
 		return &backend.CheckHealthResult{
 			Status:  backend.HealthStatusError,
 			Message: fmt.Sprintf("LLM client not initialized (%s): %v", a.settings.LLMMode, a.llmInitErr),
+		}, nil
+	}
+	if a.storeInitErr != nil || a.jobStore == nil {
+		return &backend.CheckHealthResult{
+			Status:  backend.HealthStatusError,
+			Message: fmt.Sprintf("Job store not initialized (%s): %v", a.settings.JobStoreBackend, a.storeInitErr),
+		}, nil
+	}
+	if err := a.jobStore.Ping(ctx); err != nil {
+		return &backend.CheckHealthResult{
+			Status:  backend.HealthStatusError,
+			Message: fmt.Sprintf("Job store health check failed (%s): %v", a.settings.JobStoreBackend, err),
 		}, nil
 	}
 	if len(a.settings.AllowedDatasourceUIDs) == 0 {
@@ -151,9 +197,13 @@ func (a *App) CheckHealth(ctx context.Context, _ *backend.CheckHealthRequest) (*
 			Message: "grafana-llm-app is unavailable, unauthorized, or no LLM provider is enabled/configured.",
 		}, nil
 	}
+	storeBackend := a.settings.JobStoreBackend
+	if storeBackend == "" {
+		storeBackend = JobStoreBackendMemory
+	}
 	return &backend.CheckHealthResult{
 		Status:  backend.HealthStatusOk,
-		Message: fmt.Sprintf("LLM Dashboard Studio ready (mode=%s, modelTier=%s, allowedDatasources=%d)", a.settings.LLMMode, a.settings.ModelTier, len(a.settings.AllowedDatasourceUIDs)),
+		Message: fmt.Sprintf("LLM Dashboard Studio ready (mode=%s, modelTier=%s, jobStore=%s, allowedDatasources=%d)", a.settings.LLMMode, a.settings.ModelTier, storeBackend, len(a.settings.AllowedDatasourceUIDs)),
 	}, nil
 }
 
@@ -176,10 +226,14 @@ func (a *App) handleHealth(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	isAdmin := pCtx.User != nil && strings.EqualFold(pCtx.User.Role, "Admin")
-	if a.llmInitErr != nil || a.llmClient == nil || len(a.settings.AllowedDatasourceUIDs) == 0 {
+	if a.llmInitErr != nil || a.llmClient == nil || a.storeInitErr != nil || a.jobStore == nil || len(a.settings.AllowedDatasourceUIDs) == 0 {
 		msg := "service not ready"
-		if isAdmin && a.llmInitErr != nil {
-			msg = a.llmInitErr.Error()
+		if isAdmin {
+			if a.llmInitErr != nil {
+				msg = a.llmInitErr.Error()
+			} else if a.storeInitErr != nil {
+				msg = a.storeInitErr.Error()
+			}
 		}
 		writeJSON(w, http.StatusServiceUnavailable, map[string]any{
 			"status":  "ERROR",
@@ -283,7 +337,7 @@ func (a *App) handleImport(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	snap, err := a.jobManager.Import(owner, jobs.ImportInput{
+	snap, err := a.jobManager.ImportContext(r.Context(), owner, jobs.ImportInput{
 		DatasourceUID: req.DatasourceUID,
 		QueryKind:     req.QueryKind,
 		Scope:         req.Scope,
@@ -300,7 +354,7 @@ func (a *App) handleImport(w http.ResponseWriter, r *http.Request) {
 
 func (a *App) handleJobAction(w http.ResponseWriter, r *http.Request) {
 	if a.jobManager == nil {
-		writeError(w, http.StatusServiceUnavailable, "LLM client unavailable; check plugin configuration")
+		writeError(w, http.StatusServiceUnavailable, "LLM client or job store unavailable; check plugin configuration")
 		return
 	}
 	owner, err := callerOwnerFromContext(r.Context())
@@ -323,7 +377,7 @@ func (a *App) handleJobAction(w http.ResponseWriter, r *http.Request) {
 
 	switch {
 	case action == "" && r.Method == http.MethodGet:
-		snap, err := a.jobManager.Get(owner, jobID)
+		snap, err := a.jobManager.GetContext(r.Context(), owner, jobID)
 		if err != nil {
 			writeJobError(w, err, snap)
 			return
@@ -357,7 +411,7 @@ func (a *App) handleJobAction(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, snap)
 
 	case action == "undo" && r.Method == http.MethodPost:
-		snap, err := a.jobManager.Undo(owner, jobID)
+		snap, err := a.jobManager.UndoContext(r.Context(), owner, jobID)
 		if err != nil {
 			writeJobError(w, err, snap)
 			return
@@ -365,7 +419,7 @@ func (a *App) handleJobAction(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, snap)
 
 	case action == "cancel" && r.Method == http.MethodPost:
-		snap, err := a.jobManager.Cancel(owner, jobID)
+		snap, err := a.jobManager.CancelContext(r.Context(), owner, jobID)
 		if err != nil {
 			writeJobError(w, err, snap)
 			return
@@ -415,6 +469,7 @@ func decodeBoundedJSON(body io.Reader, dst any) error {
 
 func writeJobError(w http.ResponseWriter, err error, snap jobs.JobSnapshot) {
 	status := http.StatusBadRequest
+	errMsg := err.Error()
 	switch {
 	case errors.Is(err, jobs.ErrJobNotFound):
 		status = http.StatusNotFound
@@ -426,13 +481,16 @@ func writeJobError(w http.ResponseWriter, err error, snap jobs.JobSnapshot) {
 		status = http.StatusTooManyRequests
 	case errors.Is(err, jobs.ErrNotRepairable), errors.Is(err, jobs.ErrNoUndoHistory), errors.Is(err, ir.ErrNoOpPatch):
 		status = http.StatusUnprocessableEntity
+	case errors.Is(err, jobs.ErrStoreUnavailable):
+		status = http.StatusServiceUnavailable
+		errMsg = jobs.ErrStoreUnavailable.Error()
 	case errors.Is(err, context.DeadlineExceeded):
 		status = http.StatusGatewayTimeout
 	case errors.Is(err, llm.ErrOutputTruncated), errors.Is(err, llm.ErrOutputRefused):
 		status = http.StatusBadGateway
 	}
 	payload := map[string]any{
-		"error": err.Error(),
+		"error": errMsg,
 	}
 	if snap.JobID != "" {
 		payload["job"] = snap
