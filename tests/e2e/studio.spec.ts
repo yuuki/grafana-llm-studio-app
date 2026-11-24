@@ -94,9 +94,9 @@ test.describe('LLM Dashboard Studio live E2E', () => {
     const errors = attachRuntimeErrorMonitor(page);
 
     await gotoAppConfigPage({ pluginId: PLUGIN_ID });
-    await expect(page.getByText('権限とセキュリティ方針')).toBeVisible();
-    await expect(page.getByText('データソース許可設定')).toBeVisible();
-    await expect(page.getByRole('button', { name: '設定を保存' })).toBeVisible();
+    await expect(page.getByText('Permissions & Security Policy')).toBeVisible();
+    await expect(page.getByText('Datasource Allowlist')).toBeVisible();
+    await expect(page.getByRole('button', { name: 'Save settings' })).toBeVisible();
 
     errors.assertClean('AppConfig');
   });
@@ -119,11 +119,11 @@ test.describe('LLM Dashboard Studio live E2E', () => {
       await expect(page.getByText(/Prometheus Main \(prom-main\)/)).toBeVisible();
 
       // 2. Scoped metric catalog loading from live Prometheus
-      await page.getByRole('button', { name: '値候補を取得' }).click();
+      await page.getByRole('button', { name: 'Fetch Values' }).click();
       const scopeInput = page.getByPlaceholder('checkout-api');
       await expect(scopeInput).toHaveValue('checkout-api');
 
-      await page.getByRole('button', { name: 'スコープのメトリクスを取得' }).click();
+      await page.getByRole('button', { name: 'Fetch Scoped Metrics' }).click();
       await expect
         .poll(async () => Number((await page.getByTestId('studio-catalog-count').textContent()) || '0'))
         .toBeGreaterThanOrEqual(3);
@@ -131,27 +131,27 @@ test.describe('LLM Dashboard Studio live E2E', () => {
 
       // 3. Draft generation (mock mode) — Scenes MUST NOT mount or query yet
       const queriesBeforeGenerate = dsQueries.count();
-      const generateBtn = page.getByRole('button', { name: 'ダッシュボード案を生成' });
+      const generateBtn = page.getByRole('button', { name: 'Generate Dashboard Draft' });
       await expect(generateBtn).toBeEnabled();
       await generateBtn.click();
 
       await expect(page.getByTestId('studio-job-status')).toBeVisible();
       await expect(page.getByTestId('studio-job-status')).toContainText('awaiting_preview');
       await expect(page.getByTestId('studio-job-revision')).toHaveText('rev 1');
-      await expect(page.getByRole('button', { name: '新規ダッシュボード保存' })).toBeDisabled();
+      await expect(page.getByRole('button', { name: 'Save New Dashboard' })).toBeDisabled();
       await expect(page.getByTestId('studio-preview-pane')).toContainText(
-        'ドラフト rev 1 の IR 検査が完了しています'
+        'IR checks passed for draft rev 1.'
       );
       expect(dsQueries.count()).toBe(queriesBeforeGenerate);
 
       // 4. Explicit Dry-Run validation & @grafana/scenes rendering
       const queriesBeforeValidate = dsQueries.count();
-      await page.getByRole('button', { name: '検証・プレビューを実行' }).click();
+      await page.getByRole('button', { name: 'Validate & Preview' }).click();
 
       await expect(page.getByTestId('studio-validation-results')).toBeVisible();
-      await expect(page.getByTestId('studio-validation-row-panel-request-rate')).toContainText('正常');
-      await expect(page.getByTestId('studio-validation-row-panel-error-rate')).toContainText('正常');
-      await expect(page.getByTestId('studio-validation-row-panel-latency-p95')).toContainText('正常');
+      await expect(page.getByTestId('studio-validation-row-panel-request-rate')).toContainText('OK');
+      await expect(page.getByTestId('studio-validation-row-panel-error-rate')).toContainText('OK');
+      await expect(page.getByTestId('studio-validation-row-panel-latency-p95')).toContainText('OK');
       await expect(page.getByTestId('studio-error-alert')).toHaveCount(0);
 
       const initialDryRuns = dsQueries.dryRunRecordsSince(queriesBeforeValidate);
@@ -164,7 +164,7 @@ test.describe('LLM Dashboard Studio live E2E', () => {
 
       // Wait for initial Scene preview queries to settle
       await expect.poll(() => dsQueries.count()).toBeGreaterThanOrEqual(queriesBeforeValidate + 6);
-      await expect(page.getByRole('button', { name: '新規ダッシュボード保存' })).toBeEnabled();
+      await expect(page.getByRole('button', { name: 'Save New Dashboard' })).toBeEnabled();
 
       // 5. Tab switching MUST NOT unmount EmbeddedScene or trigger unexpected re-queries (H-8)
       await page.waitForTimeout(500);
@@ -182,27 +182,30 @@ test.describe('LLM Dashboard Studio live E2E', () => {
       expect(parsedFoundation.schemaVersion).toBe(42);
       expect(parsedFoundation.panels).toHaveLength(3);
 
-      await page.getByRole('button', { name: 'Scenes プレビュー' }).click();
+      await page.getByRole('button', { name: 'Scenes Preview' }).click();
       await expect(previewPane.getByText('Request Rate')).toBeVisible();
       await page.waitForTimeout(1000);
       expect(dsQueries.count(), 'tab switching must not re-issue datasource queries').toBe(
         queriesBeforeTabs
       );
 
-      // 6. Partial panel edit (patch) — updates only panel-error-rate and re-validates only changed panel
-      const promptArea = page.getByPlaceholder(/エラー率のパネルだけ/);
-      await promptArea.fill('エラー率のパネルを 4xx と 5xx を含む timeseries に変更して');
+      const studio = page.getByTestId('studio-page');
+      const undoBtn = studio.getByRole('button', { name: 'Undo', exact: true });
 
-      await page.getByRole('button', { name: '部分修正を適用' }).click();
+      // 6. Partial panel edit (patch) — updates only panel-error-rate and re-validates only changed panel
+      const promptArea = studio.getByPlaceholder(/Change only the error rate panel/);
+      await promptArea.fill('Change the error rate panel to a timeseries covering both 4xx and 5xx');
+
+      await studio.getByRole('button', { name: 'Apply Partial Edit', exact: true }).click();
       await expect(page.getByTestId('studio-job-revision')).toHaveText('rev 2');
       await expect(page.getByTestId('studio-job-diff')).toContainText('panel-error-rate');
-      await expect(page.getByRole('button', { name: '取り消し (Undo)' })).toBeVisible();
-      await expect(page.getByRole('button', { name: '新規ダッシュボード保存' })).toBeDisabled();
+      await expect(undoBtn).toBeVisible();
+      await expect(studio.getByRole('button', { name: 'Save New Dashboard', exact: true })).toBeDisabled();
 
       const queriesBeforePatchValidate = dsQueries.count();
-      await page.getByRole('button', { name: '検証・プレビューを実行' }).click();
+      await studio.getByRole('button', { name: 'Validate & Preview', exact: true }).click();
       await expect(previewPane.getByText('4xx & 5xx Error Ratio')).toBeVisible();
-      await expect(page.getByTestId('studio-validation-row-panel-error-rate')).toContainText('正常');
+      await expect(page.getByTestId('studio-validation-row-panel-error-rate')).toContainText('OK');
 
       const patchDryRuns = dsQueries.dryRunRecordsSince(queriesBeforePatchValidate);
       expect(
@@ -212,19 +215,19 @@ test.describe('LLM Dashboard Studio live E2E', () => {
       expect(patchDryRuns[0].queries[0]?.expr).toContain('4..|5..');
 
       // 7. Undo — restores rev 1 panels as monotonic rev 3
-      await page.getByRole('button', { name: '取り消し (Undo)' }).click();
+      await undoBtn.click();
       await expect(page.getByTestId('studio-job-revision')).toHaveText('rev 3');
       await expect(page.getByTestId('studio-job-diff')).toContainText('restored from rev 1 as rev 3');
-      await expect(page.getByRole('button', { name: '新規ダッシュボード保存' })).toBeDisabled();
+      await expect(studio.getByRole('button', { name: 'Save New Dashboard', exact: true })).toBeDisabled();
 
       // Re-validate rev 3 so it is save-ready
-      await page.getByRole('button', { name: '検証・プレビューを実行' }).click();
+      await studio.getByRole('button', { name: 'Validate & Preview', exact: true }).click();
       await expect(previewPane.getByText('5xx Error Ratio')).toBeVisible();
-      await expect(page.getByRole('button', { name: '新規ダッシュボード保存' })).toBeEnabled();
+      await expect(studio.getByRole('button', { name: 'Save New Dashboard', exact: true })).toBeEnabled();
 
       // 8. JSON Export — downloads clean Foundation SDK Dashboard JSON without UID
       const downloadPromise = page.waitForEvent('download');
-      await page.getByRole('button', { name: 'JSONエクスポート' }).click();
+      await studio.getByRole('button', { name: 'Export JSON', exact: true }).click();
       const download = await downloadPromise;
       expect(download.suggestedFilename()).toBe('dashboard-rev-3.json');
 
@@ -256,7 +259,7 @@ test.describe('LLM Dashboard Studio live E2E', () => {
           res.url().endsWith('/dashboards')
       );
 
-      await page.getByRole('button', { name: '新規ダッシュボード保存' }).click();
+      await studio.getByRole('button', { name: 'Save New Dashboard', exact: true }).click();
       const saveResponse = await saveResponsePromise;
       page.off('request', putWatch);
 
@@ -269,7 +272,7 @@ test.describe('LLM Dashboard Studio live E2E', () => {
 
       const savedLink = page
         .getByTestId('studio-saved-alert')
-        .getByRole('link', { name: /保存したダッシュボードを開いて/ });
+        .getByRole('link', { name: /Open saved dashboard/ });
       await expect(savedLink).toHaveAttribute('href', `/d/${savedUid}`);
 
       // Verify persisted dashboard via Grafana's Kubernetes-style Dashboard API

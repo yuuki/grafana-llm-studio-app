@@ -1,0 +1,231 @@
+{
+  "studio": {
+    "title": "LLM Dashboard Studio (MVP)",
+    "mockBanner": {
+      "title": "開発・テスト用モックLLMモード",
+      "body": "現在 llmMode=mock で動作しています。本番利用時は App Config で grafana-llm-app モードへ切り替えてください。"
+    },
+    "alert": {
+      "errorTitle": "エラー"
+    },
+    "savedAlert": {
+      "title": "ダッシュボードを新規保存しました",
+      "updatedTitle": "既存ダッシュボードを更新しました（revision 検証済み）",
+      "uidPrefix": "UID:",
+      "revision": "(rev {{revision}})",
+      "openLink": "保存したダッシュボードを開いてクエリ・単位・閾値・配置を確認"
+    },
+    "datasource": {
+      "label": "許可済み Prometheus データソース",
+      "placeholder": "データソースを選択"
+    },
+    "scope": {
+      "labelName": "スコープラベル",
+      "labelValue": "対象サービス / ジョブ値",
+      "placeholder": "checkout-api",
+      "fetchValues": "値候補を取得",
+      "selectValuePlaceholder": "候補から選択"
+    },
+    "catalog": {
+      "fetch": "スコープのメトリクスを取得",
+      "fetching": "取得中...",
+      "loadedPrefix": "読込済みメトリクス候補（ブラウザメモリのみ）:",
+      "loadedUnit": "件",
+      "truncatedSuffix": "（上限で打ち切り）",
+      "staleSuffix": "（スコープ変更済み・再取得が必要）"
+    },
+    "import": {
+      "openButton": "既存ダッシュボードをインポート（任意）",
+      "closeButton": "既存インポートを閉じる",
+      "uidLabel": "既存ダッシュボード UID",
+      "uidPlaceholder": "existing-dashboard-uid",
+      "listButton": "一覧取得",
+      "importButton": "安全な IR としてインポート",
+      "importing": "インポート中...",
+      "selectPlaceholder": "既存ダッシュボードを選択",
+      "reportTitle": "インポート結果:",
+      "reportCounts": "パネル {{panels}} 件 / 変数 {{variables}} 件",
+      "skippedPanels": "スキップしたパネル: {{items}}",
+      "skippedVariables": "スキップした変数: {{items}}",
+      "folderFallback": "インポート元フォルダ ({{uid}})"
+    },
+    "edit": {
+      "label": "編集モード / 対象パネル",
+      "autoPatch": "既存ドラフトを部分修正（自動判定）",
+      "panelPatch": "部分修正: {{title}} ({{id}})",
+      "newDraft": "新規ドラフトとして最初から生成"
+    },
+    "prompt": {
+      "label": "作成・修正したい内容",
+      "defaultText": "選択したサービスのリクエスト数、5xxエラー率、p95レイテンシを見たい",
+      "placeholder": "例: エラー率のパネルだけ timeseries に変更して"
+    },
+    "actions": {
+      "generating": "生成中...",
+      "applyPatch": "部分修正を適用",
+      "generateDraft": "ダッシュボード案を生成",
+      "cancel": "キャンセル",
+      "undo": "取り消し (Undo)"
+    },
+    "job": {
+      "statusLabel": "状態:",
+      "revision": "rev {{revision}}",
+      "variablesLabel": "変数:",
+      "warningsLabel": "警告:",
+      "messageTitle": "生成・検査メッセージ",
+      "diffTitle": "変更内容 (Diff):",
+      "repairBudget": "修復予算: {{used}} / {{max}} 回使用"
+    },
+    "validation": {
+      "heading": "検証結果（Dry-Run: 直近5m / maxDataPoints=10）",
+      "repairing": "修復中...",
+      "repairSyntaxOnly": "構文エラーのみ自動修復",
+      "repairCatalogRequiredHint": "自動修復を実行するには先に「スコープのメトリクスを取得」を実行してください。",
+      "category": {
+        "ok": "正常",
+        "empty_result": "空結果（自動修復対象外）",
+        "syntax_error": "構文エラー（修復可）",
+        "permission_error": "権限エラー（自動修復不可）",
+        "timeout": "タイムアウト（自動修復不可）",
+        "datasource_error": "データソースエラー"
+      }
+    },
+    "save": {
+      "folderLabel": "保存先フォルダ（新規作成のみ）",
+      "folderLabelUpdateLocked": "保存先フォルダ（既存更新時は元のフォルダを維持）",
+      "optInUpdateLabel": "インポート元 ({{uid}}, rv={{rv}}) を revision 検証付きで更新（任意）",
+      "saving": "保存中...",
+      "saveNewDashboard": "新規ダッシュボード保存",
+      "updateExistingDashboard": "既存ダッシュボードを更新",
+      "exportJson": "JSONエクスポート",
+      "requiresValidationHint": "最新リビジョン (rev {{revision}}) の「検証・プレビューを実行」がエラーなしで完了すると保存できます。"
+    },
+    "rightPane": {
+      "tabPreview": "Scenes プレビュー",
+      "tabIr": "IR JSON",
+      "tabFoundation": "Foundation SDK JSON",
+      "validating": "検証中...",
+      "validateAndPreview": "検証・プレビューを実行",
+      "draftReadyHint": "ドラフト rev {{revision}} の IR 検査が完了しています。「検証・プレビューを実行」を押すとクエリ検証と Scenes 描画を行います（自動更新は無効です）。",
+      "emptyHint": "左ペインでデータソースとスコープのメトリクスを読み込み、ダッシュボード案を生成してください。",
+      "noIrYet": "// まだ IR が生成されていません",
+      "noFoundationYet": "// まだ Foundation SDK 出力がありません"
+    },
+    "errors": {
+      "initFailed": "初期化に失敗しました（App Config で許可データソースと LLM モードを確認してください）: {{error}}",
+      "scopeValuesFailed": "スコープ値取得エラー: {{error}}",
+      "scopeRequired": "データソースと対象スコープ値（例: checkout-api）を指定してください。",
+      "metadataFailed": "メタデータ取得エラー: {{error}}",
+      "datasourceRequired": "許可された Prometheus データソースを選択してください。",
+      "catalogRequired": "現在のスコープに対応するメトリクス候補を取得してください（「スコープのメトリクスを取得」を実行）。",
+      "listDashboardsFailed": "ダッシュボード一覧取得エラー: {{error}}",
+      "importFailed": "既存ダッシュボードのインポートに失敗しました: {{error}}",
+      "validationBlocked": "Dry-Run 検証でエラー（構文エラー・権限エラー・タイムアウト等）が検出されたため、Scenes プレビューと保存をブロックしました。",
+      "validationFailed": "検証・プレビューに失敗しました: {{error}}",
+      "previewRequiredBeforeSave": "保存前に「検証・プレビューを実行」して最新ドラフトを確認してください。",
+      "latestDraftUnvalidated": "最新ドラフトが未検証です。先に「検証・プレビューを実行」を完了してください。",
+      "validationErrorsRemain": "検証エラーが残っているドラフトは保存できません。",
+      "exportFailed": "JSON エクスポートに失敗しました: {{error}}"
+    }
+  },
+  "appConfig": {
+    "securityAlert": {
+      "title": "権限とセキュリティ方針",
+      "body": "LLM 呼び出しはすべて grafana-llm-app に一本化されます（閉域ローカル vLLM およびインターネット経由の OpenAI / OpenAI 互換 API のいずれを利用する場合も、接続先 URL・API キー・モデル対応付けは grafana-llm-app 側で設定してください）。ここに入力するサービスアカウントトークンは secureJsonData として暗号化保存され、LLM 中継以外のデータ取得・ダッシュボード保存には一切流用されません。"
+    },
+    "status": {
+      "savedTitle": "保存完了",
+      "errorTitle": "エラー",
+      "savedMessage": "設定を保存しました。変更を反映するためページを再読み込みしてください。",
+      "saveFailed": "設定保存に失敗しました: {{error}}"
+    },
+    "validation": {
+      "allowMockRequired": "llmMode=mock を保存するには allowMockInDev を明示的に有効化してください。",
+      "numberRange": "{{label}} は {{min}}〜{{max}} の数値で指定してください。",
+      "reasoningEffort": "Reasoning Effort は空欄または low / medium / high のいずれかを指定してください。",
+      "fields": {
+        "maxPanels": "最大パネル数",
+        "maxRepairAttempts": "自動構文修復の最大回数",
+        "maxOutputTokens": "LLM 最大出力トークン数",
+        "llmTimeoutSeconds": "LLM タイムアウト(秒)",
+        "jobDeadlineSeconds": "ジョブ全体期限(秒)",
+        "maxConcurrentJobs": "LLM 同時実行ジョブ上限",
+        "validationTimeoutSeconds": "検証クエリタイムアウト(秒)",
+        "maxConcurrentQueries": "データソース並列クエリ上限"
+      }
+    },
+    "datasource": {
+      "fieldset": "データソース許可設定（MVP: 単一 Organization・Prometheus 互換）",
+      "allowedUidsLabel": "許可する Prometheus データソース UID（カンマ区切り）",
+      "allowedUidsDescription": "ここで許可されたデータソースのみ Studio で選択可能になります。LLM が任意の UID を指定することはできません。"
+    },
+    "llm": {
+      "fieldset": "LLM 接続設定（grafana-llm-app 一本化）",
+      "modeLabel": "LLM モード",
+      "modeGrafanaLlmApp": "grafana-llm-app（本番推奨・ローカル vLLM / OpenAI 互換 API 中継）",
+      "modeMock": "mock（開発・テスト専用）",
+      "allowMockLabel": "開発・テスト用モックモードを明示的に許可",
+      "allowMockDescription": "本番運用では必ず無効にしてください。実 LLM 障害時にモックへ自動フォールバックすることはありません。",
+      "allowMockCheckbox": "allowMockInDev を有効化",
+      "grafanaUrlLabel": "Grafana 内部 URL",
+      "grafanaUrlDescription": "Go Backend の llmclient が /api/plugins/grafana-llm-app/resources/llm/v1 へ接続する URL です（loopback または Grafana AppURL 同一オリジンのみ許可）。",
+      "modelTierLabel": "grafana-llm-app モデル抽象化名",
+      "modelTierBase": "base（高速・高スループット）",
+      "modelTierLarge": "large（高精度）",
+      "structuredOutputLabel": "Structured Output 形式",
+      "structuredOutputDescription": "OpenAI (GPT-4o/4.1/5)・Azure OpenAI・OpenRouter・Gemini OpenAI互換・vLLM は json_schema を推奨。json_schema 非対応の OpenAI 互換 API（DeepSeek API 等）は json_object を選択してください。",
+      "structuredOutputSchema": "json_schema（標準・OpenAI / OpenRouter / Gemini互換 / vLLM 推奨）",
+      "structuredOutputObject": "json_object（json_schema 非対応の OpenAI 互換 API 向け）",
+      "tokenLimitLabel": "出力トークン上限パラメータ",
+      "tokenLimitDescription": "OpenAI・Azure OpenAI・OpenRouter・Groq・vLLM は max_completion_tokens。旧式/一部サードパーティ OpenAI 互換 API（DeepSeek API 等）は max_tokens を選択してください。",
+      "tokenLimitCompletion": "max_completion_tokens（推奨・OpenAI / OpenRouter / Groq / vLLM）",
+      "tokenLimitLegacy": "max_tokens（一部サードパーティ OpenAI 互換 API 向け）",
+      "reasoningEffortLabel": "Reasoning Effort（推論モデル向け・任意）",
+      "reasoningEffortDescription": "通常モデル（GPT-4o / GPT-4.1 / Llama / DeepSeek-Chat 等）は未指定（自動）を選択してください。推論モデル（o3 / GPT-5 / GLM-5.3 等）の長考抑制には low を推奨します。",
+      "reasoningEffortAuto": "未指定 / 自動（通常 OpenAI・OpenAI 互換モデル推奨）",
+      "reasoningEffortLow": "low（推論モデル向け・高速）",
+      "reasoningEffortMedium": "medium（推論モデル向け・標準）",
+      "reasoningEffortHigh": "high（推論モデル向け・最大）",
+      "saTokenLabel": "LLM 専用サービスアカウントトークン (secureJsonData)",
+      "saTokenDescription": "Grafana OSS では最小基本ロール Viewer を割り当て、llmclient 専用とします（リセットして空欄保存すると既存トークンを削除します）。"
+    },
+    "limits": {
+      "fieldset": "予算・クエリ上限（初期仮設定・環境に応じて調整）",
+      "maxPanels": "最大パネル数 (1..6)",
+      "maxRepairAttempts": "自動構文修復の最大回数 (0..2、0で無効)",
+      "maxOutputTokens": "LLM 最大出力トークン数 (256..8192)",
+      "llmTimeoutSeconds": "LLM リクエストタイムアウト (秒, 5..120)",
+      "jobDeadlineSeconds": "ジョブ全体期限 (秒, 10..180)",
+      "maxConcurrentJobs": "LLM 同時実行ジョブ上限 (1..16)",
+      "validationTimeoutSeconds": "検証クエリタイムアウト (秒, 2..30)",
+      "maxConcurrentQueries": "データソース並列クエリ上限 (1..4)"
+    },
+    "actions": {
+      "saving": "保存中...",
+      "save": "設定を保存"
+    }
+  },
+  "save": {
+    "folder": {
+      "generalRoot": "General (ルート)"
+    },
+    "errors": {
+      "inFlight": "保存処理がすでに進行中です。完了までお待ちください。",
+      "revisionMismatch": "保存対象リビジョン (rev {{targetRevision}}) が確認済みプレビュー (rev {{previewedRevision}}) と一致しません。先に検証・プレビューを実行してください。",
+      "missingResourceVersion": "既存ダッシュボードの更新には対象 UID とインポート時の resourceVersion が必須です。コピーとして新規保存してください。",
+      "defaultMessage": "ダッシュボードの新規保存に失敗しました",
+      "updateDefaultMessage": "既存ダッシュボードの更新に失敗しました",
+      "permissionDenied": "選択したフォルダへの保存権限がありません (HTTP {{status}}): {{message}}",
+      "updatePermissionDenied": "対象ダッシュボードの更新権限がありません (HTTP {{status}}): {{message}}",
+      "uidConflict": "UID 衝突のため新規作成を中止しました。既存ダッシュボードは上書きされていません (HTTP {{status}}): {{message}}",
+      "revisionConflict": "インポート後に既存ダッシュボードが他で更新されたため上書きを中止しました (HTTP {{status}})。再インポートするか新規コピーとして保存してください: {{message}}",
+      "apiError": "ダッシュボード保存 API エラー (HTTP {{status}}): {{message}}",
+      "updateApiError": "ダッシュボード更新 API エラー (HTTP {{status}}): {{message}}"
+    }
+  },
+  "validator": {
+    "errors": {
+      "timeout": "検証クエリがタイムアウトしました ({{seconds}}s)"
+    }
+  }
+}

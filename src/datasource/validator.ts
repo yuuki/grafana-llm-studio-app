@@ -1,4 +1,5 @@
 import { getBackendSrv } from '@grafana/runtime';
+import { t } from '../i18n';
 import {
   computePanelQueryHash,
   PanelValidationResult,
@@ -288,7 +289,7 @@ async function validateSinglePanel(
         panelId: panel.id,
         queryHash,
         category: 'timeout',
-        errorText: `検証クエリがタイムアウトしました (${Math.round(timeoutMs / 1000)}s)`,
+        errorText: t('validator.errors.timeout', { seconds: Math.round(timeoutMs / 1000) }),
         durationMs,
       };
     }
