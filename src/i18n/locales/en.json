@@ -16,8 +16,11 @@
       "openLink": "Open saved dashboard to review queries, units, thresholds, and layout"
     },
     "datasource": {
-      "label": "Allowlisted Prometheus Datasource",
-      "placeholder": "Select a datasource"
+      "label": "Allowlisted Prometheus / VictoriaMetrics Datasource",
+      "placeholder": "Select a datasource",
+      "dialectLabel": "Query Dialect:",
+      "dialectPinned": "(admin pinned)",
+      "dialectAuto": "(auto-detected)"
     },
     "scope": {
       "labelName": "Scope Label",
@@ -156,8 +159,13 @@
     },
     "datasource": {
       "fieldset": "Datasource Allowlist (MVP: Single Organization, Prometheus-Compatible)",
-      "allowedUidsLabel": "Allowed Prometheus Datasource UIDs (comma-separated)",
-      "allowedUidsDescription": "Only datasources listed here can be selected in Studio. The LLM can never specify arbitrary datasource UIDs."
+      "allowedUidsLabel": "Allowed Prometheus / VictoriaMetrics Datasource UIDs (comma-separated)",
+      "allowedUidsDescription": "Only datasources listed here can be selected in Studio. The LLM can never specify arbitrary datasource UIDs.",
+      "dialectsLabel": "Datasource Query Dialect Overrides (Optional)",
+      "dialectsDescription": "Pin a datasource UID to MetricsQL (e.g., VictoriaMetrics connected via Grafana's built-in Prometheus datasource) or PromQL. Leave Auto to infer from the datasource plugin type.",
+      "dialectAuto": "Auto (infer from datasource type)",
+      "dialectPromql": "PromQL (pinned)",
+      "dialectMetricsql": "MetricsQL / VictoriaMetrics (pinned)"
     },
     "llm": {
       "fieldset": "LLM Connection Settings (Unified via grafana-llm-app)",

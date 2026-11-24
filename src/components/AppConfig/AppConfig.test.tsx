@@ -87,12 +87,14 @@ jest.mock('@grafana/ui', () => ({
     options,
     value,
     onChange,
+    'aria-label': ariaLabel,
   }: {
     options: Array<{ label: string; value: string }>;
     value?: string;
     onChange: (v: { value: string }) => void;
+    'aria-label'?: string;
   }) => (
-    <select value={value} onChange={(e) => onChange({ value: e.target.value })}>
+    <select aria-label={ariaLabel} value={value} onChange={(e) => onChange({ value: e.target.value })}>
       {options.map((o) => (
         <option key={o.value} value={o.value}>
           {o.label}
@@ -174,8 +176,9 @@ describe.each(SUPPORTED_LOCALES)(
       expect(mockFetch).not.toHaveBeenCalled();
 
       // Enable allowMockInDev, then switch back to grafana-llm-app -> saved payload MUST normalize allowMockInDev: false.
+      // Selects: [0]=dialect(prom-main), [1]=llmMode, [2]=modelTier, [3]=structuredOutputMode, [4]=tokenLimitField, [5]=reasoningEffort
       fireEvent.click(screen.getByRole('checkbox'));
-      const modeSelect = screen.getAllByRole('combobox')[0];
+      const modeSelect = screen.getAllByRole('combobox')[1];
       fireEvent.change(modeSelect, { target: { value: 'grafana-llm-app' } });
 
       fireEvent.click(screen.getByText(t('appConfig.actions.save')));
@@ -195,16 +198,47 @@ describe.each(SUPPORTED_LOCALES)(
 
       render(<AppConfig plugin={plugin as never} query={{}} />);
       const selects = screen.getAllByRole('combobox');
-      // Selects: [0]=llmMode, [1]=modelTier, [2]=structuredOutputMode, [3]=tokenLimitField, [4]=reasoningEffort
-      fireEvent.change(selects[2], { target: { value: 'json_object' } });
-      fireEvent.change(selects[3], { target: { value: 'max_tokens' } });
-      fireEvent.change(selects[4], { target: { value: 'low' } });
+      // Selects: [0]=dialect(prom-main), [1]=llmMode, [2]=modelTier, [3]=structuredOutputMode, [4]=tokenLimitField, [5]=reasoningEffort
+      fireEvent.change(selects[3], { target: { value: 'json_object' } });
+      fireEvent.change(selects[4], { target: { value: 'max_tokens' } });
+      fireEvent.change(selects[5], { target: { value: 'low' } });
 
       fireEvent.click(screen.getByText(t('appConfig.actions.save')));
       await waitFor(() => expect(mockFetch).toHaveBeenCalledTimes(1));
       expect(mockFetch.mock.calls[0][0].data.jsonData.structuredOutputMode).toBe('json_object');
       expect(mockFetch.mock.calls[0][0].data.jsonData.tokenLimitField).toBe('max_tokens');
       expect(mockFetch.mock.calls[0][0].data.jsonData.reasoningEffort).toBe('low');
+    });
+
+    test('pins datasourceDialects per allowed UID and explicitly sends empty object {} when cleared back to Auto (H-11)', async () => {
+      const plugin = makePlugin({
+        allowedDatasourceUids: ['prom-main', 'vm-prom'],
+        datasourceDialects: { 'vm-prom': 'metricsql' },
+        llmMode: 'grafana-llm-app',
+      });
+
+      render(<AppConfig plugin={plugin as never} query={{}} />);
+
+      const promDialectSelect = screen.getByLabelText('Query dialect for prom-main');
+      const vmDialectSelect = screen.getByLabelText('Query dialect for vm-prom');
+      expect((promDialectSelect as HTMLSelectElement).value).toBe('');
+      expect((vmDialectSelect as HTMLSelectElement).value).toBe('metricsql');
+
+      // Pin prom-main -> metricsql and save.
+      fireEvent.change(promDialectSelect, { target: { value: 'metricsql' } });
+      fireEvent.click(screen.getByText(t('appConfig.actions.save')));
+      await waitFor(() => expect(mockFetch).toHaveBeenCalledTimes(1));
+      expect(mockFetch.mock.calls[0][0].data.jsonData.datasourceDialects).toEqual({
+        'prom-main': 'metricsql',
+        'vm-prom': 'metricsql',
+      });
+
+      // Reset both back to Auto ("") -> saved payload MUST contain explicit {} rather than omitting the key.
+      fireEvent.change(promDialectSelect, { target: { value: '' } });
+      fireEvent.change(vmDialectSelect, { target: { value: '' } });
+      fireEvent.click(screen.getByText(t('appConfig.actions.save')));
+      await waitFor(() => expect(mockFetch).toHaveBeenCalledTimes(2));
+      expect(mockFetch.mock.calls[1][0].data.jsonData.datasourceDialects).toEqual({});
     });
   }
 );

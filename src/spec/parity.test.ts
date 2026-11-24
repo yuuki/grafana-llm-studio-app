@@ -477,5 +477,92 @@ describe('Scenes and Foundation SDK adapter parity', () => {
         { name: 'b', label: 'b', type: 'custom', query: 'pwned', options: ['pwned'], defaultValue: 'pwned', multi: false, includeAll: false },
       ])
     ).toBe('up{a="$b",b="pwned"}');
+
+    // Escapes single quotes as well to prevent MetricsQL single-quoted string breakout
+    expect(
+      interpolatePromQLVariables('up{a="$a"}', [
+        { name: 'a', label: 'a', type: 'custom', query: "o'clock", options: ["o'clock"], defaultValue: "o'clock", multi: false, includeAll: false },
+      ])
+    ).toBe('up{a="o\\\'clock"}');
+  });
+
+  test('VictoriaMetrics datasource parity with MetricsQL query.kind produces compatible Scene and Foundation targets without leaking Prometheus-only fields', () => {
+    const vmDs = { uid: 'vm-ds', type: 'victoriametrics-metrics-datasource', name: 'VictoriaMetrics' };
+    const metricsqlDoc: DashboardIR = {
+      schemaVersion: '1.1',
+      revision: 1,
+      title: 'VictoriaMetrics RED',
+      timeRange: { from: 'now-15m', to: 'now' },
+      panels: [
+        {
+          id: 'panel-vm-rps',
+          type: 'timeseries',
+          title: 'Checkout Requests',
+          datasourceRef: 'selected_prometheus',
+          query: {
+            kind: 'metricsql',
+            expr: 'sum(increase_pure(http_requests_total{service="checkout"}[5m])) default 0',
+            legendFormat: '{{service}}',
+          },
+          unit: 'reqps',
+          layout: { row: 0, col: 0, width: 'full' },
+        },
+      ],
+    };
+
+    expect(validateIRClient(metricsqlDoc)).toEqual([]);
+
+    // Invalid query.kind or single-quote in variable value must be rejected by validateIRClient
+    const badKindDoc: DashboardIR = {
+      ...metricsqlDoc,
+      variables: [
+        {
+          name: 'svc',
+          type: 'custom',
+          options: ["bad'val"],
+          defaultValue: "bad'val",
+        },
+      ],
+      panels: [
+        {
+          ...metricsqlDoc.panels[0],
+          query: {
+            kind: 'sql' as unknown as 'metricsql',
+            expr: 'up',
+          },
+        },
+      ],
+    };
+    const badIssues = validateIRClient(badKindDoc);
+    expect(badIssues.some((m) => m.includes('Invalid query kind'))).toBe(true);
+    expect(badIssues.some((m) => m.includes('forbidden quote'))).toBe(true);
+
+    const spec = normalizeDashboardIR(metricsqlDoc, vmDs);
+    const scene = buildPreviewScene(spec);
+    const foundationDash = buildFoundationDashboard(spec, { uid: 'llmstudio-vm-parity' });
+
+    const gridLayout = scene.state.body as SceneGridLayout;
+    const sItem = gridLayout.state.children[0] as SceneGridItem;
+    const viz = sItem.state.body as VizPanel;
+    const qr = viz.state.$data as SceneQueryRunner;
+    const sceneQuery = qr.state.queries[0] as Record<string, unknown>;
+
+    const fPanel = foundationDash.panels?.[0] as {
+      datasource?: { uid?: string; type?: string };
+      targets?: Array<Record<string, unknown>>;
+    };
+
+    expect(qr.state.datasource).toEqual({ uid: 'vm-ds', type: 'victoriametrics-metrics-datasource' });
+    expect(fPanel.datasource).toEqual({ uid: 'vm-ds', type: 'victoriametrics-metrics-datasource' });
+    expect(fPanel.targets?.[0]?.refId).toBe(sceneQuery.refId);
+    expect(fPanel.targets?.[0]?.expr).toBe(sceneQuery.expr);
+    expect(fPanel.targets?.[0]?.legendFormat).toBe(sceneQuery.legendFormat);
+    expect(fPanel.targets?.[0]?.datasource).toEqual({
+      uid: 'vm-ds',
+      type: 'victoriametrics-metrics-datasource',
+    });
+    // Non-Prometheus datasource target must not carry Prometheus-only editorMode/range properties
+    expect(fPanel.targets?.[0]).not.toHaveProperty('editorMode');
+    expect(fPanel.targets?.[0]).not.toHaveProperty('range');
   });
 });

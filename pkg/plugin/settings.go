@@ -13,6 +13,7 @@ import (
 	"github.com/grafana/grafana-plugin-sdk-go/backend"
 	"github.com/yuuki/grafana-llm-studio-app/pkg/ir"
 	"github.com/yuuki/grafana-llm-studio-app/pkg/llm"
+	"github.com/yuuki/grafana-llm-studio-app/pkg/query"
 )
 
 const (
@@ -39,22 +40,23 @@ var allowedTokenLimitFields = map[string]bool{
 
 // JSONSettings holds non-secret admin configuration stored in Grafana plugin jsonData.
 type JSONSettings struct {
-	AllowedDatasourceUIDs []string `json:"allowedDatasourceUids"`
-	LLMMode               string   `json:"llmMode"`
-	AllowMockInDev        bool     `json:"allowMockInDev"`
-	GrafanaURL            string   `json:"grafanaUrl"`
-	ModelTier             string   `json:"modelTier"`
-	StructuredOutputMode  string   `json:"structuredOutputMode,omitempty"`
-	TokenLimitField       string   `json:"tokenLimitField,omitempty"`
-	ReasoningEffort       *string  `json:"reasoningEffort,omitempty"`
-	MaxPanels             int      `json:"maxPanels"`
-	MaxRepairAttempts     *int     `json:"maxRepairAttempts,omitempty"`
-	MaxOutputTokens       int      `json:"maxOutputTokens"`
-	LLMTimeoutSeconds     int      `json:"llmTimeoutSeconds"`
-	JobDeadlineSeconds    int      `json:"jobDeadlineSeconds"`
-	MaxConcurrentJobs     int      `json:"maxConcurrentJobs"`
-	ValidationTimeoutSec  int      `json:"validationTimeoutSeconds"`
-	MaxConcurrentQueries  int      `json:"maxConcurrentQueries"`
+	AllowedDatasourceUIDs []string          `json:"allowedDatasourceUids"`
+	DatasourceDialects    map[string]string `json:"datasourceDialects,omitempty"`
+	LLMMode               string            `json:"llmMode"`
+	AllowMockInDev        bool              `json:"allowMockInDev"`
+	GrafanaURL            string            `json:"grafanaUrl"`
+	ModelTier             string            `json:"modelTier"`
+	StructuredOutputMode  string            `json:"structuredOutputMode,omitempty"`
+	TokenLimitField       string            `json:"tokenLimitField,omitempty"`
+	ReasoningEffort       *string           `json:"reasoningEffort,omitempty"`
+	MaxPanels             int               `json:"maxPanels"`
+	MaxRepairAttempts     *int              `json:"maxRepairAttempts,omitempty"`
+	MaxOutputTokens       int               `json:"maxOutputTokens"`
+	LLMTimeoutSeconds     int               `json:"llmTimeoutSeconds"`
+	JobDeadlineSeconds    int               `json:"jobDeadlineSeconds"`
+	MaxConcurrentJobs     int               `json:"maxConcurrentJobs"`
+	ValidationTimeoutSec  int               `json:"validationTimeoutSeconds"`
+	MaxConcurrentQueries  int               `json:"maxConcurrentQueries"`
 }
 
 // Settings combines validated jsonData and decrypted secureJsonData.
@@ -69,21 +71,38 @@ type Settings struct {
 
 // PublicConfig is the secret-free subset exposed to the Frontend via GET /config/public.
 type PublicConfig struct {
-	AllowedDatasourceUIDs    []string `json:"allowedDatasourceUids"`
-	LLMMode                  string   `json:"llmMode"`
-	ModelTier                string   `json:"modelTier"`
-	MaxPanels                int      `json:"maxPanels"`
-	MaxRepairAttempts        int      `json:"maxRepairAttempts"`
-	ValidationTimeoutSeconds int      `json:"validationTimeoutSeconds"`
-	MaxConcurrentQueries     int      `json:"maxConcurrentQueries"`
-	MockBanner               bool     `json:"mockBanner"`
+	AllowedDatasourceUIDs    []string          `json:"allowedDatasourceUids"`
+	DatasourceDialects       map[string]string `json:"datasourceDialects,omitempty"`
+	LLMMode                  string            `json:"llmMode"`
+	ModelTier                string            `json:"modelTier"`
+	MaxPanels                int               `json:"maxPanels"`
+	MaxRepairAttempts        int               `json:"maxRepairAttempts"`
+	ValidationTimeoutSeconds int               `json:"validationTimeoutSeconds"`
+	MaxConcurrentQueries     int               `json:"maxConcurrentQueries"`
+	MockBanner               bool              `json:"mockBanner"`
 }
 
 func (s Settings) Public() PublicConfig {
 	ds := make([]string, len(s.AllowedDatasourceUIDs))
 	copy(ds, s.AllowedDatasourceUIDs)
+	var dialects map[string]string
+	if len(s.DatasourceDialects) > 0 {
+		allowSet := make(map[string]bool, len(ds))
+		for _, uid := range ds {
+			allowSet[uid] = true
+		}
+		for uid, kind := range s.DatasourceDialects {
+			if allowSet[uid] && kind != "" {
+				if dialects == nil {
+					dialects = make(map[string]string)
+				}
+				dialects[uid] = kind
+			}
+		}
+	}
 	return PublicConfig{
 		AllowedDatasourceUIDs:    ds,
+		DatasourceDialects:       dialects,
 		LLMMode:                  s.LLMMode,
 		ModelTier:                s.ModelTier,
 		MaxPanels:                s.MaxPanels,
@@ -197,6 +216,28 @@ func LoadSettings(appSettings backend.AppInstanceSettings, trustedGrafanaAppURL 
 		}
 	}
 	js.AllowedDatasourceUIDs = cleaned
+
+	if len(js.DatasourceDialects) > 0 {
+		normalizedDialects := make(map[string]string, len(js.DatasourceDialects))
+		for rawUID, rawKind := range js.DatasourceDialects {
+			uid := strings.TrimSpace(rawUID)
+			if uid == "" {
+				continue
+			}
+			kStr := strings.TrimSpace(strings.ToLower(rawKind))
+			if kStr == "" {
+				continue
+			}
+			parsed, err := query.ParseKind(kStr)
+			if err != nil {
+				return Settings{}, fmt.Errorf("datasourceDialects[%q]: %w", uid, err)
+			}
+			normalizedDialects[uid] = string(parsed)
+		}
+		js.DatasourceDialects = normalizedDialects
+	} else {
+		js.DatasourceDialects = nil
+	}
 
 	if js.LLMMode != LLMModeGrafanaLLMApp && js.LLMMode != LLMModeMock {
 		return Settings{}, fmt.Errorf("unsupported llmMode %q (must be %q or %q)", js.LLMMode, LLMModeGrafanaLLMApp, LLMModeMock)

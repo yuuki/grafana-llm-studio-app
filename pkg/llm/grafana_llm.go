@@ -115,7 +115,7 @@ func (c *GrafanaLLMClient) GenerateIR(ctx context.Context, req GenerateRequest) 
 	if len(req.Catalog) == 0 {
 		return nil, CompletionMeta{ProviderMode: "grafana-llm-app"}, ErrInsufficientMetrics
 	}
-	msgs, err := prompt.BuildGenerateMessages(req.UserIntent, req.Scope, req.Catalog, req.MaxPanels)
+	msgs, err := prompt.BuildGenerateMessagesWithDialect(req.UserIntent, req.Scope, req.Catalog, req.MaxPanels, req.QueryKind, req.DialectRules)
 	if err != nil {
 		return nil, CompletionMeta{ProviderMode: "grafana-llm-app"}, err
 	}
@@ -126,7 +126,7 @@ func (c *GrafanaLLMClient) GeneratePatch(ctx context.Context, req PatchRequest) 
 	if len(req.Catalog) == 0 {
 		return nil, CompletionMeta{ProviderMode: "grafana-llm-app"}, ErrInsufficientMetrics
 	}
-	msgs, err := prompt.BuildPatchMessages(req.CurrentIR, req.TargetPanelID, req.EditIntent, req.Scope, req.Catalog)
+	msgs, err := prompt.BuildPatchMessagesWithDialect(req.CurrentIR, req.TargetPanelID, req.EditIntent, req.Scope, req.Catalog, req.QueryKind, req.DialectRules)
 	if err != nil {
 		return nil, CompletionMeta{ProviderMode: "grafana-llm-app"}, err
 	}
@@ -134,7 +134,7 @@ func (c *GrafanaLLMClient) GeneratePatch(ctx context.Context, req PatchRequest) 
 }
 
 func (c *GrafanaLLMClient) RepairPanels(ctx context.Context, req RepairRequest) ([]byte, CompletionMeta, error) {
-	msgs, err := prompt.BuildRepairMessages(req.CurrentIR, req.Targets, req.Scope, req.Catalog)
+	msgs, err := prompt.BuildRepairMessagesWithDialect(req.CurrentIR, req.Targets, req.Scope, req.Catalog, req.QueryKind, req.DialectRules)
 	if err != nil {
 		return nil, CompletionMeta{ProviderMode: "grafana-llm-app"}, err
 	}

@@ -308,17 +308,44 @@ async function validateSinglePanel(
   }
 }
 
+const TIMEOUT_TOKEN_REGEX =
+  /(?:^|[^a-z0-9_])(?:timeout|timed out|deadline exceeded|maxqueryduration|context canceled)(?:$|[^a-z0-9_])/i;
+
 export function classifyDatasourceError(
   status?: number,
   message = ''
 ): ValidationCategory {
   const lower = message.toLowerCase();
+  const isPermissionMsg =
+    lower.includes('forbidden') ||
+    lower.includes('unauthorized') ||
+    lower.includes('access denied') ||
+    lower.includes('permission denied');
+  const isTimeoutMsg = TIMEOUT_TOKEN_REGEX.test(message);
+  const isInfraOrLimitMsg =
+    lower.includes('connection refused') ||
+    lower.includes('no such host') ||
+    lower.includes('dial tcp') ||
+    lower.includes('unexpected eof') ||
+    lower.includes('maxuniquetimeseries') ||
+    lower.includes('maxmemory') ||
+    lower.includes('maxsamples') ||
+    lower.includes('out of memory') ||
+    lower.includes('exceeds');
   const isSyntaxMsg =
     lower.includes('parse error') ||
     lower.includes('bad_data') ||
     lower.includes('unexpected') ||
     lower.includes('invalid parameter') ||
-    lower.includes('unknown function');
+    lower.includes('unknown function') ||
+    lower.includes('cannot parse') ||
+    lower.includes('unsupported function') ||
+    lower.includes('invalid number of args') ||
+    lower.includes('unparsed data') ||
+    lower.includes('cannot expand with') ||
+    lower.includes('missing closing') ||
+    lower.includes('many-to-many') ||
+    lower.includes('duplicate match');
 
   // 1. Trust explicit HTTP status codes first so metric names (e.g. http_timeout_total,
   //    auth_permission_checks_total) inside 400 parse errors are never misclassified.
@@ -329,39 +356,39 @@ export function classifyDatasourceError(
     return 'timeout';
   }
   if (status === 400 || status === 422) {
+    // Classify permission, timeout, and network/resource-limit errors BEFORE syntax patterns:
+    // victoriametrics-metrics-datasource maps transport/timeout errors to HTTP 400 and VM maps
+    // -search.maxQueryDuration / -search.maxUniqueTimeseries to HTTP 422.
+    if (isPermissionMsg) {
+      return 'permission_error';
+    }
+    if (isTimeoutMsg) {
+      return 'timeout';
+    }
+    if (isInfraOrLimitMsg) {
+      return 'datasource_error';
+    }
     if (isSyntaxMsg) {
       return 'syntax_error';
     }
-    if (
-      lower.includes('forbidden') ||
-      lower.includes('unauthorized') ||
-      lower.includes('access denied')
-    ) {
-      return 'permission_error';
-    }
-    if (lower.includes('deadline exceeded') || lower.includes('query timed out')) {
-      return 'timeout';
-    }
-    return 'syntax_error';
+    return 'datasource_error';
   }
   if (status !== undefined && status >= 500) {
-    if (lower.includes('timeout') || lower.includes('deadline exceeded')) {
+    if (isTimeoutMsg) {
       return 'timeout';
     }
     return 'datasource_error';
   }
 
   // 2. Fallback heuristic when status is omitted or 200 with embedded error text.
-  if (
-    lower.includes('forbidden') ||
-    lower.includes('unauthorized') ||
-    lower.includes('access denied') ||
-    lower.includes('permission denied')
-  ) {
+  if (isPermissionMsg) {
     return 'permission_error';
   }
-  if (lower.includes('timeout') || lower.includes('deadline exceeded')) {
+  if (isTimeoutMsg) {
     return 'timeout';
+  }
+  if (isInfraOrLimitMsg) {
+    return 'datasource_error';
   }
   if (isSyntaxMsg) {
     return 'syntax_error';

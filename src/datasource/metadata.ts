@@ -3,6 +3,7 @@ import { MetricCatalogItem, ScopeFilter } from '../ir/types';
 
 export interface MetadataFetchOptions {
   datasourceUid: string;
+  datasourceType?: string;
   scope: ScopeFilter;
   /**
    * Lookback window in seconds for scoped series/label discovery (default 3600s = 1h).
@@ -44,6 +45,63 @@ function escapePromLabelValue(val: string): string {
     .replace(/"/g, '\\"')
     .replace(/\n/g, '\\n')
     .replace(/\r/g, '\\r');
+}
+
+function isVMBackendPlugin(datasourceType?: string): boolean {
+  return (datasourceType || '').trim().toLowerCase() === 'victoriametrics-metrics-datasource';
+}
+
+function getHttpErrorStatus(err: unknown): number | undefined {
+  if (typeof err === 'object' && err !== null) {
+    const status = (err as { status?: unknown }).status;
+    if (typeof status === 'number') {
+      return status;
+    }
+  }
+  return undefined;
+}
+
+function buildMetadataBaseUrls(datasourceUid: string, datasourceType?: string): string[] {
+  const encodedUid = encodeURIComponent(datasourceUid);
+  const proxyBase = `/api/datasources/proxy/uid/${encodedUid}/api/v1`;
+  if (isVMBackendPlugin(datasourceType)) {
+    // victoriametrics-metrics-datasource is a backend plugin exposing VMAPIQuery via Grafana's Resource API;
+    // prefer resources so customQueryParameters, Secure Socks Proxy, TLS, and POST settings are honored.
+    return [`/api/datasources/uid/${encodedUid}/resources/api/v1`, proxyBase];
+  }
+  return [proxyBase];
+}
+
+async function fetchPromApiWithBaseFallback<T>(
+  baseUrls: string[],
+  subPath: string,
+  params: Record<string, string>,
+  signal?: AbortSignal
+): Promise<T> {
+  let lastErr: unknown;
+  for (let i = 0; i < baseUrls.length; i++) {
+    try {
+      return await fetchPromApi<T>(
+        {
+          url: `${baseUrls[i]}${subPath}`,
+          method: 'GET',
+          params,
+        },
+        signal
+      );
+    } catch (err) {
+      lastErr = err;
+      if (signal?.aborted) {
+        throw err;
+      }
+      const status = getHttpErrorStatus(err);
+      const canFallback = i + 1 < baseUrls.length && (status === 404 || status === 501);
+      if (!canFallback) {
+        throw err;
+      }
+    }
+  }
+  throw lastErr;
 }
 
 function fetchPromApi<T>(req: BackendSrvRequest, signal?: AbortSignal): Promise<T> {
@@ -111,24 +169,23 @@ export async function fetchScopeLabelValues(
   labelName: string,
   lookbackSeconds = 3600,
   limit = 100,
-  signal?: AbortSignal
+  signal?: AbortSignal,
+  datasourceType?: string
 ): Promise<string[]> {
   if (!VALID_LABEL_NAME.test(labelName) || labelName === '__name__') {
     throw new Error(`Invalid Prometheus label name: ${labelName}`);
   }
   const nowSec = Math.floor(Date.now() / 1000);
   const startSec = nowSec - Math.min(Math.max(lookbackSeconds, 300), 86400);
-  const url = `/api/datasources/proxy/uid/${encodeURIComponent(datasourceUid)}/api/v1/label/${encodeURIComponent(labelName)}/values`;
+  const baseUrls = buildMetadataBaseUrls(datasourceUid, datasourceType);
 
-  const resp = await fetchPromApi<PromResponse<string[]>>(
+  const resp = await fetchPromApiWithBaseFallback<PromResponse<string[]>>(
+    baseUrls,
+    `/label/${encodeURIComponent(labelName)}/values`,
     {
-      url,
-      method: 'GET',
-      params: {
-        start: String(startSec),
-        end: String(nowSec),
-        limit: String(Math.min(limit, 200)),
-      },
+      start: String(startSec),
+      end: String(nowSec),
+      limit: String(Math.min(limit, 200)),
     },
     signal
   );
@@ -151,7 +208,7 @@ export async function fetchScopeLabelValues(
 export async function fetchScopedMetricCatalog(
   options: MetadataFetchOptions
 ): Promise<ScopedCatalogResult> {
-  const { datasourceUid, scope, signal } = options;
+  const { datasourceUid, datasourceType, scope, signal } = options;
   if (!VALID_LABEL_NAME.test(scope.labelName) || scope.labelName === '__name__' || !scope.labelValue.trim()) {
     throw new Error('A valid scope labelName and non-empty labelValue are required');
   }
@@ -164,23 +221,21 @@ export async function fetchScopedMetricCatalog(
   const metadataLimit = Math.min(options.metadataLimit ?? 500, 500);
 
   const matcher = `{${scope.labelName}="${escapePromLabelValue(scope.labelValue.trim())}"}`;
-  const baseUrl = `/api/datasources/proxy/uid/${encodeURIComponent(datasourceUid)}/api/v1`;
+  const baseUrls = buildMetadataBaseUrls(datasourceUid, datasourceType);
 
   // 1. Discover unique metric names via /api/v1/label/__name__/values first (resists single high-cardinality metric starvation).
   const metricLabels = new Map<string, Set<string>>();
   let truncated = false;
 
   try {
-    const namesResp = await fetchPromApi<PromResponse<string[]>>(
+    const namesResp = await fetchPromApiWithBaseFallback<PromResponse<string[]>>(
+      baseUrls,
+      '/label/__name__/values',
       {
-        url: `${baseUrl}/label/__name__/values`,
-        method: 'GET',
-        params: {
-          'match[]': matcher,
-          start: String(startSec),
-          end: String(nowSec),
-          limit: String(metricLimit),
-        },
+        'match[]': matcher,
+        start: String(startSec),
+        end: String(nowSec),
+        limit: String(metricLimit),
       },
       signal
     );
@@ -202,16 +257,14 @@ export async function fetchScopedMetricCatalog(
   }
 
   // 2. Bounded /api/v1/series call scoped strictly to the selected service/job for label enrichment.
-  const seriesResp = await fetchPromApi<PromResponse<Array<Record<string, string>>>>(
+  const seriesResp = await fetchPromApiWithBaseFallback<PromResponse<Array<Record<string, string>>>>(
+    baseUrls,
+    '/series',
     {
-      url: `${baseUrl}/series`,
-      method: 'GET',
-      params: {
-        'match[]': matcher,
-        start: String(startSec),
-        end: String(nowSec),
-        limit: String(seriesLimit),
-      },
+      'match[]': matcher,
+      start: String(startSec),
+      end: String(nowSec),
+      limit: String(seriesLimit),
     },
     signal
   );
@@ -248,12 +301,10 @@ export async function fetchScopedMetricCatalog(
   // 3. Best-effort bounded /api/v1/metadata enrichment (showErrorAlert=false avoids red error toast).
   let metaMap: Record<string, PromMetadataEntry[]> = {};
   try {
-    const metaResp = await fetchPromApi<PromResponse<Record<string, PromMetadataEntry[]>>>(
-      {
-        url: `${baseUrl}/metadata`,
-        method: 'GET',
-        params: { limit: String(metadataLimit) },
-      },
+    const metaResp = await fetchPromApiWithBaseFallback<PromResponse<Record<string, PromMetadataEntry[]>>>(
+      baseUrls,
+      '/metadata',
+      { limit: String(metadataLimit) },
       signal
     );
     if (metaResp.status === 'success' && metaResp.data) {

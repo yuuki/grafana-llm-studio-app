@@ -1,0 +1,36 @@
+# Isolated VictoriaMetrics + MetricsQL verification overlay.
+#
+# Usage (from repository root):
+#   docker compose -f deploy/docker-compose.yml -f deploy/docker-compose.victoriametrics.yml up -d
+#
+# This overlay intentionally leaves deploy/docker-compose.yml untouched so air-gapped
+# default deployments remain strictly Prometheus-only without external plugin downloads.
+#
+# Optional: to also verify the official VictoriaMetrics Grafana datasource plugin
+# (`victoriametrics-metrics-datasource`), stage an offline copy into
+# `deploy/offline-plugins/victoriametrics-metrics-datasource` and uncomment the mount below.
+services:
+  grafana:
+    volumes:
+      - ./victoriametrics/datasources.yml:/etc/grafana/provisioning/datasources/victoriametrics.yml:ro
+      - ./victoriametrics/llm-studio-vm.yml:/etc/grafana/provisioning/plugins/llm-studio-dev.yml:ro
+      # Offline plugin mount for native victoriametrics-metrics-datasource verification:
+      # - ./offline-plugins/victoriametrics-metrics-datasource:/var/lib/grafana/plugins/victoriametrics-metrics-datasource:ro
+    depends_on:
+      - prometheus
+      - victoriametrics
+
+  victoriametrics:
+    image: victoriametrics/victoria-metrics:v1.118.0
+    ports:
+      - "127.0.0.1:8428:8428"
+    command:
+      - "-promscrape.config=/etc/prometheus/prometheus.yml"
+      - "-search.disableCache"
+      - "-search.maxQueryDuration=15s"
+      - "-search.maxConcurrentRequests=10"
+      - "-search.maxUniqueTimeseries=100000"
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    depends_on:
+      - sample-metrics

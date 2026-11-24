@@ -173,6 +173,10 @@
                     "type": "string",
                     "enum": ["A", "B", "C"]
                   },
+                  "kind": {
+                    "type": "string",
+                    "enum": ["promql", "metricsql"]
+                  },
                   "expr": {
                     "type": "string",
                     "minLength": 1,
@@ -196,6 +200,10 @@
                     "refId": {
                       "type": "string",
                       "enum": ["A", "B", "C"]
+                    },
+                    "kind": {
+                      "type": "string",
+                      "enum": ["promql", "metricsql"]
                     },
                     "expr": {
                       "type": "string",

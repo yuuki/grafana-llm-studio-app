@@ -119,20 +119,22 @@ function buildFoundationVariable(v: NormalizedVariableSpec) {
   return cb;
 }
 
+function buildFoundationTarget(target: NormalizedPanelSpec['targets'][number]) {
+  const qb = new prometheus.DataqueryBuilder()
+    .refId(target.refId)
+    .expr(target.expr)
+    .datasource({
+      type: target.datasource.type,
+      uid: target.datasource.uid,
+    });
+  if (target.legendFormat) {
+    qb.legendFormat(target.legendFormat);
+  }
+  return qb;
+}
+
 function buildFoundationPanel(panel: NormalizedPanelSpec) {
-  const queryBuilders = panel.targets.map((target) => {
-    const qb = new prometheus.DataqueryBuilder()
-      .refId(target.refId)
-      .expr(target.expr)
-      .datasource({
-        type: target.datasource.type,
-        uid: target.datasource.uid,
-      });
-    if (target.legendFormat) {
-      qb.legendFormat(target.legendFormat);
-    }
-    return qb;
-  });
+  const queryBuilders = panel.targets.map(buildFoundationTarget);
 
   const thresholdsBuilder = new dashboard.ThresholdsConfigBuilder()
     .mode(dashboard.ThresholdsMode.Absolute)

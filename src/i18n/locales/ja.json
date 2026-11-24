@@ -16,8 +16,11 @@
       "openLink": "保存したダッシュボードを開いてクエリ・単位・閾値・配置を確認"
     },
     "datasource": {
-      "label": "許可済み Prometheus データソース",
-      "placeholder": "データソースを選択"
+      "label": "許可済み Prometheus / VictoriaMetrics データソース",
+      "placeholder": "データソースを選択",
+      "dialectLabel": "クエリ方言:",
+      "dialectPinned": "（管理者固定）",
+      "dialectAuto": "（自動判定）"
     },
     "scope": {
       "labelName": "スコープラベル",
@@ -156,8 +159,13 @@
     },
     "datasource": {
       "fieldset": "データソース許可設定（MVP: 単一 Organization・Prometheus 互換）",
-      "allowedUidsLabel": "許可する Prometheus データソース UID（カンマ区切り）",
-      "allowedUidsDescription": "ここで許可されたデータソースのみ Studio で選択可能になります。LLM が任意の UID を指定することはできません。"
+      "allowedUidsLabel": "許可する Prometheus / VictoriaMetrics データソース UID（カンマ区切り）",
+      "allowedUidsDescription": "ここで許可されたデータソースのみ Studio で選択可能になります。LLM が任意の UID を指定することはできません。",
+      "dialectsLabel": "データソースごとのクエリ方言上書き（任意）",
+      "dialectsDescription": "Grafana 標準 Prometheus プラグイン経由で VictoriaMetrics に接続している場合など、UID 単位で MetricsQL / PromQL を固定できます。Auto の場合はデータソース種別から自動判定します。",
+      "dialectAuto": "Auto（データソース種別から自動判定）",
+      "dialectPromql": "PromQL（固定）",
+      "dialectMetricsql": "MetricsQL / VictoriaMetrics（固定）"
     },
     "llm": {
       "fieldset": "LLM 接続設定（grafana-llm-app 一本化）",

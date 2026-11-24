@@ -97,6 +97,7 @@ func newAppWithClient(settings Settings, client llm.Client, initErr error) *App 
 			JobDeadline:          settings.JobDeadline(),
 			MaxConcurrentJobs:    settings.MaxConcurrentJobs,
 			AllowedDSUIDs:        settings.AllowedDatasourceUIDs,
+			DatasourceDialects:   settings.DatasourceDialects,
 		})
 	}
 	a := &App{
@@ -249,6 +250,7 @@ func (a *App) handleGenerate(w http.ResponseWriter, r *http.Request) {
 
 type importHTTPRequest struct {
 	DatasourceUID string                 `json:"datasourceUid"`
+	QueryKind     string                 `json:"queryKind,omitempty"`
 	Scope         *ir.ScopeFilter        `json:"scope,omitempty"`
 	Draft         json.RawMessage        `json:"draft"`
 	ImportSource  *ir.ImportSource       `json:"importSource,omitempty"`
@@ -283,6 +285,7 @@ func (a *App) handleImport(w http.ResponseWriter, r *http.Request) {
 
 	snap, err := a.jobManager.Import(owner, jobs.ImportInput{
 		DatasourceUID: req.DatasourceUID,
+		QueryKind:     req.QueryKind,
 		Scope:         req.Scope,
 		Draft:         draft,
 		ImportSource:  req.ImportSource,

@@ -16,8 +16,10 @@ import (
 
 	"github.com/yuuki/grafana-llm-studio-app/pkg/ir"
 	"github.com/yuuki/grafana-llm-studio-app/pkg/llm"
+	"github.com/yuuki/grafana-llm-studio-app/pkg/metricsql"
 	"github.com/yuuki/grafana-llm-studio-app/pkg/promql"
 	"github.com/yuuki/grafana-llm-studio-app/pkg/prompt"
+	"github.com/yuuki/grafana-llm-studio-app/pkg/query"
 )
 
 // Config controls a live integration benchmark run through grafana-llm-app.
@@ -125,6 +127,7 @@ type Report struct {
 type Runner struct {
 	cfg        Config
 	client     llm.Client
+	registry   *query.Registry
 	scenarios  []Scenario
 	httpClient *http.Client
 	nowFunc    func() time.Time
@@ -178,8 +181,12 @@ func NewRunnerWithClient(cfg Config, client llm.Client, scenarios []Scenario) (*
 	}
 
 	return &Runner{
-		cfg:        cfg,
-		client:     client,
+		cfg:    cfg,
+		client: client,
+		registry: query.NewRegistry(
+			promql.NewAdapter(promql.DefaultPolicy()),
+			metricsql.NewAdapter(metricsql.DefaultPolicy()),
+		),
 		scenarios:  filtered,
 		httpClient: hc,
 		nowFunc:    time.Now,
@@ -254,6 +261,18 @@ func (r *Runner) runScenario(ctx context.Context, sc Scenario, iteration int) Ca
 	}
 	safeScope := prompt.SanitizeScope(sc.Scope)
 	boundedCatalog := prompt.BoundCatalog(sc.Catalog)
+	qKind, kindErr := query.ParseKind(sc.QueryKind)
+	if kindErr != nil {
+		res.FailureStage = "setup"
+		res.FailureDetail = kindErr.Error()
+		return res
+	}
+	adapter, adapterErr := r.registry.Get(qKind)
+	if adapterErr != nil {
+		res.FailureStage = "setup"
+		res.FailureDetail = adapterErr.Error()
+		return res
+	}
 
 	start := time.Now()
 	var (
@@ -265,10 +284,12 @@ func (r *Runner) runScenario(ctx context.Context, sc Scenario, iteration int) Ca
 	switch sc.Kind {
 	case KindGenerate:
 		raw, meta, err = r.client.GenerateIR(ctx, llm.GenerateRequest{
-			UserIntent: sc.UserIntent,
-			Scope:      safeScope,
-			Catalog:    boundedCatalog,
-			MaxPanels:  maxPanels,
+			UserIntent:   sc.UserIntent,
+			Scope:        safeScope,
+			Catalog:      boundedCatalog,
+			MaxPanels:    maxPanels,
+			QueryKind:    string(qKind),
+			DialectRules: adapter.PromptRules(),
 		})
 	case KindPatch:
 		if sc.BaseIR == nil {
@@ -282,6 +303,8 @@ func (r *Runner) runScenario(ctx context.Context, sc Scenario, iteration int) Ca
 			EditIntent:    sc.EditIntent,
 			Scope:         safeScope,
 			Catalog:       boundedCatalog,
+			QueryKind:     string(qKind),
+			DialectRules:  adapter.PromptRules(),
 		})
 	case KindRepair:
 		if sc.BaseIR == nil || len(sc.RepairTargets) == 0 {
@@ -290,10 +313,12 @@ func (r *Runner) runScenario(ctx context.Context, sc Scenario, iteration int) Ca
 			return res
 		}
 		raw, meta, err = r.client.RepairPanels(ctx, llm.RepairRequest{
-			CurrentIR: sc.BaseIR.Clone(),
-			Targets:   sc.RepairTargets,
-			Scope:     safeScope,
-			Catalog:   boundedCatalog,
+			CurrentIR:    sc.BaseIR.Clone(),
+			Targets:      sc.RepairTargets,
+			Scope:        safeScope,
+			Catalog:      boundedCatalog,
+			QueryKind:    string(qKind),
+			DialectRules: adapter.PromptRules(),
 		})
 	default:
 		res.FailureStage = "setup"
@@ -403,6 +428,9 @@ func (r *Runner) runScenario(ctx context.Context, sc Scenario, iteration int) Ca
 		diffs = appliedDiffs
 	}
 
+	if qKind != query.KindPromQL {
+		finalDoc.StampQueryKind(string(qKind))
+	}
 	res.PanelCount = len(finalDoc.Panels)
 	res.GeneratedExprs = make([]string, 0, len(finalDoc.Panels))
 	for _, p := range finalDoc.Panels {
@@ -416,12 +444,13 @@ func (r *Runner) runScenario(ctx context.Context, sc Scenario, iteration int) Ca
 		}
 	}
 
-	warnings, valErr := promql.ValidateDashboardIR(
+	warnings, valErr := query.ValidateDashboardIR(
+		adapter,
 		finalDoc,
 		boundedCatalog,
 		safeScope,
 		ir.ValidateOptions{MaxPanels: maxPanels},
-		promql.DefaultPolicy(),
+		query.ValidateOptions{RequireCatalogMatch: true},
 	)
 	if valErr != nil {
 		res.FailureStage = "ir_promql_validate"
@@ -442,7 +471,7 @@ func (r *Runner) runScenario(ctx context.Context, sc Scenario, iteration int) Ca
 
 	if strings.TrimSpace(r.cfg.PrometheusURL) != "" {
 		res.PrometheusChecked = true
-		nonEmpty, execErr := r.validateAgainstPrometheus(ctx, finalDoc)
+		nonEmpty, execErr := r.validateAgainstPrometheus(ctx, finalDoc, adapter)
 		res.PrometheusNonEmptyPanels = nonEmpty
 		if execErr != nil {
 			res.FailureStage = "prometheus_exec"
@@ -468,7 +497,7 @@ type promRangeResponse struct {
 	} `json:"data"`
 }
 
-func (r *Runner) validateAgainstPrometheus(ctx context.Context, doc ir.DashboardIR) (int, error) {
+func (r *Runner) validateAgainstPrometheus(ctx context.Context, doc ir.DashboardIR, adapter query.Adapter) (int, error) {
 	base := strings.TrimRight(strings.TrimSpace(r.cfg.PrometheusURL), "/")
 	now := r.nowFunc().UTC()
 	start := now.Add(-5 * time.Minute)
@@ -477,7 +506,7 @@ func (r *Runner) validateAgainstPrometheus(ctx context.Context, doc ir.Dashboard
 	for _, p := range doc.Panels {
 		panelHasSeries := false
 		for _, qry := range p.EffectiveQueries() {
-			expr := promql.InterpolateVariables(qry.Expr, doc.Variables)
+			expr := adapter.InterpolateVariables(qry.Expr, doc.Variables)
 			q := url.Values{}
 			q.Set("query", expr)
 			q.Set("start", strconv.FormatInt(start.Unix(), 10))

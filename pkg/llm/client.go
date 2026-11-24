@@ -30,10 +30,12 @@ type CompletionMeta struct {
 
 // GenerateRequest carries inputs for initial DashboardIR generation.
 type GenerateRequest struct {
-	UserIntent string
-	Scope      *ir.ScopeFilter
-	Catalog    []ir.MetricCatalogItem
-	MaxPanels  int
+	UserIntent   string
+	Scope        *ir.ScopeFilter
+	Catalog      []ir.MetricCatalogItem
+	MaxPanels    int
+	QueryKind    string
+	DialectRules []string
 }
 
 // PatchRequest carries inputs for partial DashboardPatch generation.
@@ -43,14 +45,18 @@ type PatchRequest struct {
 	EditIntent    string
 	Scope         *ir.ScopeFilter
 	Catalog       []ir.MetricCatalogItem
+	QueryKind     string
+	DialectRules  []string
 }
 
 // RepairRequest carries inputs for syntax_error repair patch generation.
 type RepairRequest struct {
-	CurrentIR ir.DashboardIR
-	Targets   []prompt.RepairTarget
-	Scope     *ir.ScopeFilter
-	Catalog   []ir.MetricCatalogItem
+	CurrentIR    ir.DashboardIR
+	Targets      []prompt.RepairTarget
+	Scope        *ir.ScopeFilter
+	Catalog      []ir.MetricCatalogItem
+	QueryKind    string
+	DialectRules []string
 }
 
 // Client abstracts LLM inference behind either grafana-llm-app (production) or explicit dev mock.

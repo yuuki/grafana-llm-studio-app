@@ -103,6 +103,11 @@ func ApplyPatch(current DashboardIR, patch DashboardPatch, opts ValidateOptions)
 					if upd.Query.RefID != nil {
 						newQ.RefID = *upd.Query.RefID
 					}
+					if upd.Query.Kind != nil {
+						newQ.Kind = *upd.Query.Kind
+					} else if len(target.Queries) > 0 {
+						newQ.Kind = target.Queries[0].Kind
+					}
 					if upd.Query.LegendFormat != nil {
 						newQ.LegendFormat = *upd.Query.LegendFormat
 					} else if len(target.Queries) == 1 {
@@ -124,6 +129,10 @@ func ApplyPatch(current DashboardIR, patch DashboardPatch, opts ValidateOptions)
 						diffs = append(diffs, DiffEntry{Op: "update_panel", PanelID: target.ID, Field: "query.expr", Before: target.Query.Expr, After: upd.Query.Expr})
 						target.Query.Expr = upd.Query.Expr
 					}
+					if upd.Query.Kind != nil && *upd.Query.Kind != "" && *upd.Query.Kind != target.Query.Kind {
+						diffs = append(diffs, DiffEntry{Op: "update_panel", PanelID: target.ID, Field: "query.kind", Before: target.Query.Kind, After: *upd.Query.Kind})
+						target.Query.Kind = *upd.Query.Kind
+					}
 					if upd.Query.LegendFormat != nil && *upd.Query.LegendFormat != target.Query.LegendFormat {
 						diffs = append(diffs, DiffEntry{Op: "update_panel", PanelID: target.ID, Field: "query.legendFormat", Before: target.Query.LegendFormat, After: *upd.Query.LegendFormat})
 						target.Query.LegendFormat = *upd.Query.LegendFormat
@@ -141,16 +150,28 @@ func ApplyPatch(current DashboardIR, patch DashboardPatch, opts ValidateOptions)
 				}
 			}
 			if upd.Queries != nil {
-				if !queriesEqual(target.EffectiveQueries(), *upd.Queries) {
+				// Inherit existing panel query kind when omitted in patch queries so edits never downgrade dialect.
+				existingKind := ""
+				if prev := target.EffectiveQueries(); len(prev) > 0 {
+					existingKind = prev[0].Kind
+				}
+				cp := make([]QueryIR, len(*upd.Queries))
+				copy(cp, *upd.Queries)
+				if existingKind != "" {
+					for i := range cp {
+						if cp[i].Kind == "" {
+							cp[i].Kind = existingKind
+						}
+					}
+				}
+				if !queriesEqual(target.EffectiveQueries(), cp) {
 					diffs = append(diffs, DiffEntry{
 						Op:      "update_panel",
 						PanelID: target.ID,
 						Field:   "queries",
 						Before:  formatQueries(target.EffectiveQueries()),
-						After:   formatQueries(*upd.Queries),
+						After:   formatQueries(cp),
 					})
-					cp := make([]QueryIR, len(*upd.Queries))
-					copy(cp, *upd.Queries)
 					target.Query = QueryIR{}
 					target.Queries = cp
 				}
@@ -213,6 +234,9 @@ func ApplyPatch(current DashboardIR, patch DashboardPatch, opts ValidateOptions)
 				newQuery := QueryIR{Expr: op.Panel.Query.Expr}
 				if op.Panel.Query.RefID != nil {
 					newQuery.RefID = *op.Panel.Query.RefID
+				}
+				if op.Panel.Query.Kind != nil {
+					newQuery.Kind = *op.Panel.Query.Kind
 				}
 				if op.Panel.Query.LegendFormat != nil {
 					newQuery.LegendFormat = *op.Panel.Query.LegendFormat
@@ -421,6 +445,7 @@ func queriesEqual(a, b []QueryIR) bool {
 	}
 	for i := range a {
 		if effectiveRefID(a[i].RefID, i) != effectiveRefID(b[i].RefID, i) ||
+			a[i].Kind != b[i].Kind ||
 			a[i].Expr != b[i].Expr ||
 			a[i].LegendFormat != b[i].LegendFormat {
 			return false
@@ -459,10 +484,14 @@ func formatQueries(qs []QueryIR) string {
 	parts := make([]string, len(qs))
 	for i, q := range qs {
 		ref := effectiveRefID(q.RefID, i)
+		prefix := ref
+		if q.Kind != "" {
+			prefix = fmt.Sprintf("%s(%s)", ref, q.Kind)
+		}
 		if q.LegendFormat != "" {
-			parts[i] = fmt.Sprintf("%s:%s[%s]", ref, q.Expr, q.LegendFormat)
+			parts[i] = fmt.Sprintf("%s:%s[%s]", prefix, q.Expr, q.LegendFormat)
 		} else {
-			parts[i] = fmt.Sprintf("%s:%s", ref, q.Expr)
+			parts[i] = fmt.Sprintf("%s:%s", prefix, q.Expr)
 		}
 	}
 	return strings.Join(parts, " | ")

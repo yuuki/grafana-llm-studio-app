@@ -403,4 +403,35 @@ describe('Dry-run validation concurrency and error classification', () => {
       await setStudioLocale(DEFAULT_LOCALE);
     }
   });
+
+  test('hardens VictoriaMetrics HTTP 400/422 classification to prevent false syntax_error repairs', () => {
+    // Transport / DNS / TLS / proxy errors returned as HTTP 400 by VM datasource plugin -> datasource_error
+    expect(classifyDatasourceError(400, 'dial tcp 10.0.0.5:8428: connect: connection refused')).toBe(
+      'datasource_error'
+    );
+    expect(classifyDatasourceError(400, 'Post "https://vm:8428/api/v1/query_range": no such host')).toBe(
+      'datasource_error'
+    );
+    expect(classifyDatasourceError(400, 'x509: certificate signed by unknown authority')).toBe(
+      'datasource_error'
+    );
+    // VM HTTP 422 timeout -> timeout (never syntax_error)
+    expect(
+      classifyDatasourceError(422, 'cannot execute query: timeout exceeded (search.maxQueryDuration=30s)')
+    ).toBe('timeout');
+    // VM HTTP 422 resource limit -> datasource_error (never syntax_error)
+    expect(
+      classifyDatasourceError(
+        422,
+        'error when executing query: the number of matching unique timeseries exceeds -search.maxUniqueTimeseries=300000'
+      )
+    ).toBe('datasource_error');
+    // VM HTTP 422 explicit syntax / function error -> syntax_error
+    expect(classifyDatasourceError(422, 'cannot parse query: unexpected token ")"')).toBe('syntax_error');
+    expect(classifyDatasourceError(422, 'unsupported function "foo_bar"')).toBe('syntax_error');
+    // Metric name containing "timeout" in parse error stays syntax_error
+    expect(classifyDatasourceError(400, 'parse error: http_timeout_total')).toBe('syntax_error');
+    // Unknown HTTP 400 without parse/syntax markers defaults safely to datasource_error
+    expect(classifyDatasourceError(400, 'Bad Request')).toBe('datasource_error');
+  });
 });

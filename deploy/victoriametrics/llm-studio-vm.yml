@@ -1,0 +1,26 @@
+apiVersion: 1
+
+apps:
+  # Local VictoriaMetrics + MetricsQL verification plugin config (dev/mock mode only).
+  - type: yuuki-llmstudio-app
+    org_id: 1
+    disabled: false
+    jsonData:
+      allowedDatasourceUids:
+        - prom-main
+        - vm-prom
+      datasourceDialects:
+        vm-prom: metricsql
+      llmMode: mock
+      allowMockInDev: true
+      grafanaUrl: http://localhost:3000
+      modelTier: base
+      reasoningEffort: low
+      maxPanels: 6
+      maxRepairAttempts: 2
+      maxOutputTokens: 2048
+      llmTimeoutSeconds: 45
+      jobDeadlineSeconds: 90
+      maxConcurrentJobs: 4
+      validationTimeoutSeconds: 10
+      maxConcurrentQueries: 2

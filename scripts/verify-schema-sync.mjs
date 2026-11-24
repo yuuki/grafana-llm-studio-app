@@ -141,6 +141,20 @@ const checks = [
     goMap: 'allowedQueryRefIDs',
   },
   {
+    label: 'panel.query.kind',
+    irEnum: irPanelProps.query.properties.kind.enum,
+    patchEnum: patchPanelProps.query.properties.kind.enum,
+    tsConst: 'ALLOWED_QUERY_KINDS',
+    goMap: 'allowedQueryKinds',
+  },
+  {
+    label: 'panel.queries.kind',
+    irEnum: irPanelProps.queries.items.properties.kind.enum,
+    patchEnum: patchPanelProps.queries.items.properties.kind.enum,
+    tsConst: 'ALLOWED_QUERY_KINDS',
+    goMap: 'allowedQueryKinds',
+  },
+  {
     label: 'variable.type',
     irEnum: irVarProps.type.enum,
     patchEnum: patchVarProps.type.enum,

@@ -3,6 +3,7 @@ module github.com/yuuki/grafana-llm-studio-app
 go 1.24.3
 
 require (
+	github.com/VictoriaMetrics/metricsql v0.87.6
 	github.com/grafana/grafana-llm-app/llmclient v0.20.0
 	github.com/grafana/grafana-plugin-sdk-go v0.278.0
 	github.com/prometheus/prometheus v0.305.0
@@ -11,6 +12,7 @@ require (
 
 require (
 	github.com/BurntSushi/toml v1.4.0 // indirect
+	github.com/VictoriaMetrics/metrics v1.35.3 // indirect
 	github.com/apache/arrow-go/v18 v18.3.0 // indirect
 	github.com/beorn7/perks v1.0.1 // indirect
 	github.com/cenkalti/backoff/v5 v5.0.2 // indirect
@@ -74,6 +76,8 @@ require (
 	github.com/unknwon/com v1.0.1 // indirect
 	github.com/unknwon/log v0.0.0-20150304194804-e617c87089d3 // indirect
 	github.com/urfave/cli v1.22.16 // indirect
+	github.com/valyala/fastrand v1.1.0 // indirect
+	github.com/valyala/histogram v1.2.0 // indirect
 	github.com/zeebo/xxh3 v1.0.2 // indirect
 	go.opentelemetry.io/auto/sdk v1.1.0 // indirect
 	go.opentelemetry.io/contrib/instrumentation/google.golang.org/grpc/otelgrpc v0.60.0 // indirect
