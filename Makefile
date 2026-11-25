@@ -1,4 +1,4 @@
-.PHONY: verify build build-backend build-frontend build-bench test test-go test-ts test-e2e verify-schemas verify-bundle verify-llm-protocol verify-sse clean
+.PHONY: verify build build-backend build-backend-all build-frontend build-bench test test-go test-ts test-release test-e2e verify-schemas verify-bundle verify-package verify-llm-protocol verify-sse sign package package-airgap clean
 
 verify: verify-schemas test build
 
@@ -8,7 +8,7 @@ verify-schemas:
 verify-bundle:
 	npm run verify:bundle
 
-test: test-go test-ts
+test: test-go test-ts test-release
 
 test-go:
 	go vet ./pkg/... ./cmd/...
@@ -17,6 +17,9 @@ test-go:
 test-ts:
 	npm run typecheck
 	npm run test:ci
+
+test-release:
+	npm run test:release
 
 test-e2e:
 	npm run test:e2e
@@ -28,8 +31,24 @@ build-frontend:
 	npm run verify:bundle
 
 build-backend:
-	mkdir -p dist
-	CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o dist/gpx_yuuki_llmstudio_app_linux_amd64 ./pkg
+	node scripts/build-backend.mjs --targets linux/amd64
+
+build-backend-all:
+	node scripts/build-backend.mjs --all
+
+sign:
+	npm run sign
+
+package: build-frontend build-backend-all
+	node scripts/package-release.mjs --sign auto
+	node scripts/verify-release.mjs
+
+package-airgap: build-frontend build-backend-all
+	node scripts/package-release.mjs --sign auto --airgap
+	node scripts/verify-release.mjs --airgap
+
+verify-package:
+	node scripts/verify-release.mjs
 
 build-bench:
 	mkdir -p bin
@@ -46,4 +65,4 @@ verify-sse:
 	node scripts/verify-sse-callresource.mjs
 
 clean:
-	rm -rf dist bin
+	rm -rf dist bin release
