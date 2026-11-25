@@ -170,7 +170,6 @@ func ValidateVariableMatcher(
 	return v, nil
 }
 
-
 // EscapeQueryString escapes a value for safe embedding inside a PromQL/MetricsQL quoted string literal.
 func EscapeQueryString(val string) string {
 	var b strings.Builder

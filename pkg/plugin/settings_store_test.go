@@ -418,4 +418,3 @@ func TestApp_BoundRedisPasswordEndToEnd(t *testing.T) {
 		t.Fatal("expected NewApp to reject redirected redisAddr with bound redisPassword from mr1")
 	}
 }
-

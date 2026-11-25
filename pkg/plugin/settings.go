@@ -131,8 +131,8 @@ func (s Settings) Public() PublicConfig {
 }
 
 const (
-	BoundRedisPasswordPrefix = "llmstudio-redis-bound-v1:"
-	BoundGrafanaTokenPrefix  = "llmstudio-grafana-bound-v1:"
+	BoundRedisPasswordPrefix = "llmstudio-redis-bound-v1:"   //nolint:gosec // G101: envelope format prefix constant, not a credential
+	BoundGrafanaTokenPrefix  = "llmstudio-grafana-bound-v1:" //nolint:gosec // G101: envelope format prefix constant, not a credential
 )
 
 // LoadOptions supplies deployment-level trusted boundaries from Grafana or process environment.
@@ -162,7 +162,7 @@ func EncodeBoundRedisPassword(addr string, tlsEnabled bool, password string) (st
 	if password == "" {
 		return "", errors.New("redis password must not be empty")
 	}
-	b, err := json.Marshal(boundRedisPasswordPayload{
+	b, err := json.Marshal(boundRedisPasswordPayload{ //nolint:gosec // G117: intentionally marshals destination-bound secret envelope for encrypted secureJsonData
 		Addr:     strings.TrimSpace(addr),
 		TLS:      tlsEnabled,
 		Password: password,
@@ -479,10 +479,10 @@ func unwrapBoundGrafanaToken(rawSecret, activeURL, rawConfiguredURL, trustedAppU
 }
 
 // validateGrafanaURL restricts llmclient target URLs to http/https:
-// - When trustedAppURL is configured (from LLMSTUDIO_GRAFANA_URL or GrafanaConfig.AppURL),
-//   rawURL MUST strictly match that trusted base URL (scheme, canonical host:port, and normalized path).
-//   Arbitrary loopback hosts/ports are NOT allowed when trustedAppURL is present.
-// - Only when trustedAppURL is absent (standalone/test context) does it fall back to loopback-only.
+//   - When trustedAppURL is configured (from LLMSTUDIO_GRAFANA_URL or GrafanaConfig.AppURL),
+//     rawURL MUST strictly match that trusted base URL (scheme, canonical host:port, and normalized path).
+//     Arbitrary loopback hosts/ports are NOT allowed when trustedAppURL is present.
+//   - Only when trustedAppURL is absent (standalone/test context) does it fall back to loopback-only.
 func validateGrafanaURL(rawURL, trustedAppURL string) error {
 	targetCanon, err := canonicalGrafanaURL(rawURL)
 	if err != nil {
