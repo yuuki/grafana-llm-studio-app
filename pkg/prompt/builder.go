@@ -188,7 +188,7 @@ func BuildGenerateMessagesWithDialect(
 		"3. Allowed panel types: \"timeseries\", \"stat\", \"table\", \"gauge\", \"bargauge\", \"piechart\", \"state-timeline\". No HTML/JS.",
 		"4. Each panel must define EITHER \"query\" (single query) OR \"queries\" (1 to 3 queries with unique refIds A/B/C), never both.",
 		"5. Optional \"variables\" (max 4) may define scoped \"query\" (labelName + required catalog metricName + defaultValue) or \"custom\" variables. Only declared variables may be referenced in double-quoted label matchers ($name or ${name:regex}; query vars in =~ must use ${name:regex}).",
-		fmt.Sprintf("6. If requiredScope is provided, retain that exact label matcher (labelName=\"labelValue\") on every %s vector selector, or use = with a declared single-value (non-multi, non-includeAll) variable anchored to that exact labelName and defaultValue.", dialectName),
+		fmt.Sprintf("6. If requiredScope is provided, ALWAYS retain that exact literal label matcher (labelName=\"labelValue\") on every %s vector selector; NEVER replace requiredScope with a template variable (use variables only for secondary labels such as instance, status, or method).", dialectName),
 		fmt.Sprintf("7. Query dialect is %s (set query.kind to %q). Keep queries safe: range selectors <= 1h, no catch-all regex like \".*\", no group_left/group_right joins, no negative offset, no @ modifier.", dialectName, kind),
 		"8. Default timeRange to {\"from\":\"now-15m\",\"to\":\"now\"}.",
 	}

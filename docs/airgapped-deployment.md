@@ -119,7 +119,7 @@ GF_SNAPSHOTS_EXTERNAL_ENABLED=false
 
 ### 2.3 Dedicated LLM Service Account Permissions (Grafana OSS 12.4.15 / 13.3.1)
 1. Create a Grafana service account dedicated to `yuuki-llmstudio-app` and assign the minimum OSS basic role **`Viewer`** (the lowest built-in role containing `plugins.app:access`; never grant `Editor` or `Admin`).
-2. To prevent SSRF and token exfiltration, the Go backend restricts `grafanaUrl` in App Config to **loopback (`localhost` / `127.0.0.1` / `::1`) or the same origin as Grafana's `AppURL`**, and disables HTTP redirects.
+2. To prevent SSRF and token exfiltration, the Go backend strictly pins `grafanaUrl` in App Config to Grafana's trusted **`AppURL` base URL** (or the operator-pinned `LLMSTUDIO_GRAFANA_URL` environment variable when Grafana cannot hairpin), rejects arbitrary loopback ports whenever a trusted base URL is configured, binds UI-stored credentials (`llmServiceAccountToken` / `redisPassword`) to their target endpoint, and disables HTTP redirects.
 3. Store the token only in `secureJsonData` (`llmServiceAccountToken`); never commit it to Git or plaintext `.env` files.
 4. **Cluster-Wide LLM Rate Limiting:** In-plugin budgets (`maxConcurrentJobs`, `maxRepairAttempts`, `maxOutputTokens`) govern only requests originating from `yuuki-llmstudio-app`. If `grafana-llm-app` or vLLM is shared across multiple plugins or teams, enforce per-client rate limits, concurrency caps, and timeouts at the reverse proxy (Nginx / Envoy) or vLLM layer as well.
 

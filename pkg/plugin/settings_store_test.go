@@ -68,6 +68,50 @@ func TestLoadSettings_JobStoreValidation(t *testing.T) {
 	if sRedis.JobStoreBackend != plugin.JobStoreBackendRedis || sRedis.RedisKeyPrefix != jobs.DefaultRedisKeyPrefix || sRedis.JobTTLMinutes != 60 || !sRedis.RedisTLS {
 		t.Fatalf("unexpected parsed redis settings: %+v", sRedis)
 	}
+
+	// Destination-bound redisPassword succeeds for matching endpoint+TLS and rejects redirected addr or TLS downgrade.
+	boundPass, err := plugin.EncodeBoundRedisPassword("redis.internal:6379", true, "secret-redis-pw")
+	if err != nil {
+		t.Fatalf("EncodeBoundRedisPassword: %v", err)
+	}
+	if _, err := plugin.LoadSettings(backend.AppInstanceSettings{
+		JSONData:                []byte(`{"llmMode":"mock","allowMockInDev":true,"allowedDatasourceUids":["prom-1"],"jobStoreBackend":"redis","redisAddr":"REDIS.INTERNAL:6379","redisTls":true}`),
+		DecryptedSecureJSONData: map[string]string{"redisPassword": boundPass},
+	}); err != nil {
+		t.Fatalf("expected bound redisPassword to match canonical endpoint+TLS, got %v", err)
+	}
+	if _, err := plugin.LoadSettings(backend.AppInstanceSettings{
+		JSONData:                []byte(`{"llmMode":"mock","allowMockInDev":true,"allowedDatasourceUids":["prom-1"],"jobStoreBackend":"redis","redisAddr":"attacker.invalid:6379","redisTls":true}`),
+		DecryptedSecureJSONData: map[string]string{"redisPassword": boundPass},
+	}); err == nil {
+		t.Fatal("expected bound redisPassword to be rejected when redisAddr changed to another server")
+	}
+	if _, err := plugin.LoadSettings(backend.AppInstanceSettings{
+		JSONData:                []byte(`{"llmMode":"mock","allowMockInDev":true,"allowedDatasourceUids":["prom-1"],"jobStoreBackend":"redis","redisAddr":"redis.internal:6379","redisTls":false}`),
+		DecryptedSecureJSONData: map[string]string{"redisPassword": boundPass},
+	}); err == nil {
+		t.Fatal("expected bound redisPassword to be rejected when redisTls was downgraded")
+	}
+	// Switching back to memory ignores bound redisPassword without error.
+	if _, err := plugin.LoadSettings(backend.AppInstanceSettings{
+		JSONData:                []byte(`{"llmMode":"mock","allowMockInDev":true,"allowedDatasourceUids":["prom-1"],"jobStoreBackend":"memory"}`),
+		DecryptedSecureJSONData: map[string]string{"redisPassword": boundPass},
+	}); err != nil {
+		t.Fatalf("expected memory mode to ignore bound redisPassword, got %v", err)
+	}
+
+	// Operator-pinned Redis address rejects mismatched jsonData.redisAddr and fills empty redisAddr.
+	sPinned, err := plugin.LoadSettingsWithOptions(backend.AppInstanceSettings{
+		JSONData: []byte(`{"llmMode":"mock","allowMockInDev":true,"allowedDatasourceUids":["prom-1"],"jobStoreBackend":"redis"}`),
+	}, plugin.LoadOptions{PinnedRedisAddr: "redis.pinned:6379"})
+	if err != nil || sPinned.RedisAddr != "redis.pinned:6379" {
+		t.Fatalf("expected operator-pinned redisAddr fallback, got err=%v addr=%q", err, sPinned.RedisAddr)
+	}
+	if _, err := plugin.LoadSettingsWithOptions(backend.AppInstanceSettings{
+		JSONData: []byte(`{"llmMode":"mock","allowMockInDev":true,"allowedDatasourceUids":["prom-1"],"jobStoreBackend":"redis","redisAddr":"attacker.invalid:6379"}`),
+	}, plugin.LoadOptions{PinnedRedisAddr: "redis.pinned:6379"}); err == nil {
+		t.Fatal("expected mismatched redisAddr to be rejected against operator-pinned LLMSTUDIO_REDIS_ADDR")
+	}
 }
 
 func TestApp_MultiReplicaRedisJobStoreHTTPAndSecretIsolation(t *testing.T) {
@@ -319,5 +363,58 @@ func TestApp_AuthBeforeServiceUnavailableAndJobIDValidation(t *testing.T) {
 		JSONData: []byte(`{"llmMode":"mock","allowMockInDev":true,"allowedDatasourceUids":["prom-1"],"jobStoreBackend":"memory","redisUsername":"` + longUser + `"}`),
 	}); err != nil {
 		t.Fatalf("expected stale redisUsername to be ignored when jobStoreBackend=memory, got %v", err)
+	}
+}
+
+func TestApp_BoundRedisPasswordEndToEnd(t *testing.T) {
+	mr1 := miniredis.RunT(t)
+	mr1.RequireAuth("bound-live-secret")
+	mr2 := miniredis.RunT(t)
+
+	boundPass, err := plugin.EncodeBoundRedisPassword(mr1.Addr(), false, "bound-live-secret")
+	if err != nil {
+		t.Fatalf("EncodeBoundRedisPassword: %v", err)
+	}
+
+	// Matching redisAddr unwraps the password and authenticates cleanly to mr1.
+	inst, err := plugin.NewApp(context.Background(), backend.AppInstanceSettings{
+		JSONData: []byte(`{
+			"llmMode": "mock",
+			"allowMockInDev": true,
+			"allowedDatasourceUids": ["prom-1"],
+			"jobStoreBackend": "redis",
+			"redisAddr": "` + mr1.Addr() + `",
+			"redisTls": false
+		}`),
+		DecryptedSecureJSONData: map[string]string{
+			"redisPassword": boundPass,
+		},
+	})
+	if err != nil {
+		t.Fatalf("NewApp with matching bound redisPassword: %v", err)
+	}
+	app := inst.(*plugin.App)
+	defer app.Dispose()
+
+	health, err := app.CheckHealth(context.Background(), &backend.CheckHealthRequest{})
+	if err != nil || health.Status != backend.HealthStatusOk {
+		t.Fatalf("expected CheckHealth OK with bound redisPassword, got err=%v health=%+v", err, health)
+	}
+
+	// Redirecting redisAddr to mr2 while keeping mr1's bound redisPassword MUST fail in NewApp before dialing mr2.
+	if _, err := plugin.NewApp(context.Background(), backend.AppInstanceSettings{
+		JSONData: []byte(`{
+			"llmMode": "mock",
+			"allowMockInDev": true,
+			"allowedDatasourceUids": ["prom-1"],
+			"jobStoreBackend": "redis",
+			"redisAddr": "` + mr2.Addr() + `",
+			"redisTls": false
+		}`),
+		DecryptedSecureJSONData: map[string]string{
+			"redisPassword": boundPass,
+		},
+	}); err == nil {
+		t.Fatal("expected NewApp to reject redirected redisAddr with bound redisPassword from mr1")
 	}
 }

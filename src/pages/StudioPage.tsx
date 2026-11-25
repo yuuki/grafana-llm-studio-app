@@ -30,6 +30,7 @@ import {
   ExistingDashboardSummary,
   fetchExistingDashboardByUid,
   ImportConversionReport,
+  ImportPatchContext,
   listExistingDashboards,
 } from '../import/importDashboard';
 import {
@@ -75,6 +76,7 @@ interface PreservedImportMeta {
   folderUid?: string;
   preservedAnnotations?: Record<string, string>;
   preservedLabels?: Record<string, string>;
+  patchContext?: ImportPatchContext;
 }
 
 const VALIDATION_BADGE_COLOR: Record<ValidationCategory, 'green' | 'orange' | 'red' | 'blue'> = {
@@ -201,6 +203,7 @@ export const StudioPage: React.FC = () => {
   ]);
   const [selectedFolderUid, setSelectedFolderUid] = useState<string>('');
   const [optInUpdateExisting, setOptInUpdateExisting] = useState(false);
+  const [activeImportPatchKey, setActiveImportPatchKey] = useState<string | null>(null);
   const [savedResult, setSavedResult] = useState<SaveDashboardResult | null>(null);
 
   const abortRef = useRef<AbortController | null>(null);
@@ -256,6 +259,7 @@ export const StudioPage: React.FC = () => {
     setImportReport(null);
     setSelectedFolderUid('');
     setOptInUpdateExisting(false);
+    setActiveImportPatchKey(null);
     setValidationResults([]);
     setPreviewSpec(null);
     setPreviewScene(null);
@@ -596,16 +600,17 @@ export const StudioPage: React.FC = () => {
       if (controller.signal.aborted || seq !== contextSeqRef.current) {
         return;
       }
-      const { draft, report } = convertGrafanaDashboardToIR(fetched.rawDashboard, {
-        selectedDatasourceUid: selectedDatasource.uid,
-        selectedDatasourceName: selectedDatasource.name,
-        queryKind: activeDialect.kind,
-        maxPanels: publicCfg?.maxPanels ?? 6,
-      });
       const scope: ScopeFilter | undefined =
         isCatalogFresh && scopeLabelValue.trim()
           ? { labelName: scopeLabelName, labelValue: scopeLabelValue.trim() }
           : undefined;
+      const { draft, report, patchContext } = convertGrafanaDashboardToIR(fetched.rawDashboard, {
+        selectedDatasourceUid: selectedDatasource.uid,
+        selectedDatasourceName: selectedDatasource.name,
+        queryKind: activeDialect.kind,
+        maxPanels: publicCfg?.maxPanels ?? 6,
+        scope,
+      });
       const importedJob = await importDraft(
         {
           datasourceUid: selectedDatasource.uid,
@@ -630,15 +635,17 @@ export const StudioPage: React.FC = () => {
       setOptInUpdateExisting(false);
 
       if (importedJob.importSource?.uid) {
-        latestImportMetaRef.current.set(
-          `${importedJob.jobId}:${importedJob.importSource.uid}`,
-          {
-            resourceVersion: importedJob.importSource.resourceVersion,
-            folderUid: importedJob.importSource.folderUid ?? '',
-            preservedAnnotations: fetched.preservedAnnotations,
-            preservedLabels: fetched.preservedLabels,
-          }
-        );
+        const metaKey = `${importedJob.jobId}:${importedJob.importSource.uid}`;
+        latestImportMetaRef.current.set(metaKey, {
+          resourceVersion: importedJob.importSource.resourceVersion,
+          folderUid: importedJob.importSource.folderUid ?? '',
+          preservedAnnotations: fetched.preservedAnnotations,
+          preservedLabels: fetched.preservedLabels,
+          patchContext,
+        });
+        setActiveImportPatchKey(metaKey);
+      } else {
+        setActiveImportPatchKey(null);
       }
       applyJobSnapshot(importedJob);
       setImportReport(report);
@@ -766,7 +773,8 @@ export const StudioPage: React.FC = () => {
       const normalized = normalizeDashboardIR(
         job.currentIR,
         selectedDatasource,
-        publicCfg?.maxPanels ?? 6
+        publicCfg?.maxPanels ?? 6,
+        job.scope
       );
       const varsFingerprint = computeVariablesFingerprint(normalized);
 
@@ -944,8 +952,15 @@ export const StudioPage: React.FC = () => {
     }
   };
 
+  const activeImportKey = job?.importSource?.uid
+    ? `${job.jobId}:${job.importSource.uid}`
+    : '';
+
   const canOptInUpdate = Boolean(
-    job?.importSource?.uid && job?.importSource?.resourceVersion
+    job?.importSource?.uid &&
+      job?.importSource?.resourceVersion &&
+      activeImportPatchKey !== null &&
+      activeImportPatchKey === activeImportKey
   );
 
   const handleSaveDashboard = async () => {
@@ -972,24 +987,28 @@ export const StudioPage: React.FC = () => {
       const currentSpec = normalizeDashboardIR(
         job.currentIR,
         selectedDatasource,
-        publicCfg?.maxPanels ?? 6
+        publicCfg?.maxPanels ?? 6,
+        job.scope
       );
-      const useUpdate =
-        optInUpdateExisting &&
-        Boolean(job.importSource?.uid) &&
-        Boolean(job.importSource?.resourceVersion);
-
       const importMetaKey = job.importSource?.uid
         ? `${job.jobId}:${job.importSource.uid}`
         : '';
       const preservedMeta = importMetaKey
         ? latestImportMetaRef.current.get(importMetaKey)
         : undefined;
+      const useUpdate =
+        optInUpdateExisting &&
+        Boolean(job.importSource?.uid) &&
+        Boolean(job.importSource?.resourceVersion) &&
+        Boolean(preservedMeta?.patchContext);
+
       const updateFolderUid = job.importSource?.folderUid ?? preservedMeta?.folderUid ?? '';
 
       const res = useUpdate
         ? await saverRef.current.updateExistingDashboard({
             spec: currentSpec,
+            currentIR: job.currentIR,
+            patchContext: preservedMeta!.patchContext!,
             previewedRevision: previewMeta.revision,
             targetUid: job.importSource!.uid,
             expectedResourceVersion:
@@ -1045,7 +1064,8 @@ export const StudioPage: React.FC = () => {
       const spec = normalizeDashboardIR(
         job.currentIR,
         selectedDatasource,
-        publicCfg?.maxPanels ?? 6
+        publicCfg?.maxPanels ?? 6,
+        job.scope
       );
       const json = buildExportableDashboardJson(spec);
       const blob = new Blob([json], { type: 'application/json' });
@@ -1061,18 +1081,19 @@ export const StudioPage: React.FC = () => {
   };
 
   const currentIR = job?.currentIR;
+  const jobScope = job?.scope;
   const maxPanels = publicCfg?.maxPanels ?? 6;
   const foundationJsonPreview = useMemo(() => {
     if (!currentIR || !selectedDatasource) {
       return '';
     }
     try {
-      const spec = normalizeDashboardIR(currentIR, selectedDatasource, maxPanels);
+      const spec = normalizeDashboardIR(currentIR, selectedDatasource, maxPanels, jobScope);
       return buildExportableDashboardJson(spec);
     } catch {
       return '';
     }
-  }, [currentIR, selectedDatasource, maxPanels]);
+  }, [currentIR, jobScope, selectedDatasource, maxPanels]);
 
   const canSave =
     Boolean(previewSpec) &&

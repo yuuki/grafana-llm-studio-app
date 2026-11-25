@@ -170,30 +170,6 @@ func ValidateVariableMatcher(
 	return v, nil
 }
 
-// MatcherSatisfiesScopeWithVariable returns true if matcher m uses an anchored single-value variable
-// matching the mandatory scope label and value.
-func MatcherSatisfiesScopeWithVariable(m Matcher, v ir.VariableIR, scope *ir.ScopeFilter) bool {
-	if scope == nil || m.Name != scope.LabelName {
-		return false
-	}
-	if m.Type != MatchEqual {
-		return false
-	}
-	if v.IncludeAll || v.Multi {
-		return false
-	}
-	if v.DefaultValue != scope.LabelValue {
-		return false
-	}
-	if v.Type == "query" {
-		return v.LabelName == scope.LabelName
-	}
-	if v.Type == "custom" {
-		return len(v.Options) == 1 && v.Options[0] == scope.LabelValue
-	}
-	return false
-}
-
 // EscapeQueryString escapes a value for safe embedding inside a PromQL/MetricsQL quoted string literal.
 func EscapeQueryString(val string) string {
 	var b strings.Builder

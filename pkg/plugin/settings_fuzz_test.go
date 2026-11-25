@@ -45,11 +45,20 @@ func FuzzLoadSettings(f *testing.F) {
 		if u.User != nil {
 			t.Fatalf("accepted grafanaUrl %q embeds credentials", s.GrafanaURL)
 		}
+		if u.RawQuery != "" || u.Fragment != "" {
+			t.Fatalf("accepted grafanaUrl %q contains query or fragment", s.GrafanaURL)
+		}
 		host := strings.ToLower(u.Hostname())
 		ip := net.ParseIP(host)
-		loopback := host == "localhost" || (ip != nil && ip.IsLoopback())
-		if !loopback && !strings.EqualFold(u.Scheme+"://"+u.Host, trusted) {
-			t.Fatalf("accepted grafanaUrl %q is neither loopback nor %s", s.GrafanaURL, trusted)
+		if host == "localhost" || (ip != nil && ip.IsLoopback()) {
+			t.Fatalf("accepted loopback grafanaUrl %q despite trusted %s", s.GrafanaURL, trusted)
+		}
+		port := u.Port()
+		if port == "" {
+			port = "443"
+		}
+		if !strings.EqualFold(u.Scheme, "https") || host != "grafana.example.com" || port != "443" || strings.TrimRight(u.EscapedPath(), "/") != "" {
+			t.Fatalf("accepted grafanaUrl %q does not match trusted base URL %s", s.GrafanaURL, trusted)
 		}
 
 		if s.LLMMode == plugin.LLMModeMock && !s.AllowMockInDev {

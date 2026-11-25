@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
 	"strings"
 	"time"
 
@@ -52,15 +53,23 @@ func NewApp(ctx context.Context, appSettings backend.AppInstanceSettings) (insta
 			managedSecret = strings.TrimSpace(secret)
 		}
 	}
+	if envGrafanaURL := strings.TrimSpace(os.Getenv("LLMSTUDIO_GRAFANA_URL")); envGrafanaURL != "" {
+		trustedAppURL = envGrafanaURL
+	}
+	pinnedRedisAddr := strings.TrimSpace(os.Getenv("LLMSTUDIO_REDIS_ADDR"))
 
-	settings, err := LoadSettings(appSettings, trustedAppURL)
+	settings, err := LoadSettingsWithOptions(appSettings, LoadOptions{
+		TrustedGrafanaAppURL: trustedAppURL,
+		PinnedRedisAddr:      pinnedRedisAddr,
+	})
 	if err != nil {
 		return nil, err
 	}
 
-	// Prefer explicit secureJsonData token; allow Grafana-managed secret only after grafanaUrl origin validation passed.
+	// Prefer explicit secureJsonData token; allow Grafana-managed secret ONLY when grafanaUrl
+	// was strictly pinned against a trusted Grafana base URL.
 	token := settings.llmServiceAccountToken
-	if token == "" && managedSecret != "" {
+	if token == "" && managedSecret != "" && trustedAppURL != "" {
 		token = managedSecret
 	}
 

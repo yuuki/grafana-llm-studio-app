@@ -18,6 +18,7 @@ import {
   PanelType,
   QueryIR,
   QueryKind,
+  ScopeFilter,
   SELECTED_DATASOURCE_REF,
   ThresholdColor,
   ThresholdIR,
@@ -54,16 +55,40 @@ export interface ImportConversionReport {
   warnings: string[];
 }
 
+export interface ImportedPanelLocator {
+  /** Index in originalSpec.panels */
+  topIndex: number;
+  /** Child index inside originalSpec.panels[topIndex].panels when nested in a collapsed row */
+  rowChildIndex?: number;
+  /** Original numeric panel id if present */
+  originalNumericId?: number;
+  /** Original indices in rawPanel.targets imported into PanelIR (ordered by IR query index) */
+  importedTargetIndices: number[];
+}
+
+export interface ImportPatchContext {
+  /** Deep-cloned original dashboard spec captured at import time */
+  originalSpec: Record<string, unknown>;
+  /** Deep-cloned initial IR draft (rev 1) used as diff baseline during non-destructive updates */
+  initialDraft: DashboardIR;
+  /** Mapping from IR panel.id -> exact locator inside originalSpec */
+  panelBindings: Record<string, ImportedPanelLocator>;
+  /** Mapping from IR variable.name -> exact index inside originalSpec.templating.list */
+  variableBindings: Record<string, number>;
+}
+
 export interface ImportConversionOptions {
   selectedDatasourceUid: string;
   selectedDatasourceName?: string;
   queryKind?: QueryKind;
   maxPanels?: number;
+  scope?: ScopeFilter;
 }
 
 export interface ImportConversionResult {
   draft: DashboardIR;
   report: ImportConversionReport;
+  patchContext: ImportPatchContext;
 }
 
 interface RawDashboardV1Beta1 {
@@ -86,9 +111,12 @@ interface RawLegacyDashboardEnvelope {
 const VALID_VAR_NAME = /^[a-zA-Z_][a-zA-Z0-9_]{0,31}$/;
 const VALID_LABEL_NAME = /^[a-zA-Z_][a-zA-Z0-9_]{0,63}$/;
 const VALID_METRIC_NAME = /^[a-zA-Z_:][a-zA-Z0-9_:]{0,127}$/;
-// Explicitly reject filtered label_values(metric{...}, label) so import never silently widens variable scope.
+// Explicitly reject arbitrary filtered label_values(metric{...}, label) so import never silently widens variable scope.
+// Only an exact single equality matcher matching the active import scope is accepted when options.scope is set.
 const LABEL_VALUES_WITH_METRIC =
   /^label_values\(\s*([a-zA-Z_:][a-zA-Z0-9_:]*)\s*,\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*\)$/;
+const LABEL_VALUES_WITH_SCOPED_SELECTOR =
+  /^label_values\(\s*([a-zA-Z_:][a-zA-Z0-9_:]*)?\s*\{\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*=\s*"((?:[^"\\]|\\.)*)"\s*\}\s*,\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*\)$/;
 const LABEL_VALUES_ONLY = /^label_values\(\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*\)$/;
 const LEGEND_VAR_TOKEN_REGEX = /(?:\$(?:\{|[a-zA-Z_])|\[\[[a-zA-Z_])/;
 const EXPR_VAR_REF_REGEX =
@@ -332,6 +360,23 @@ export async function fetchExistingDashboardByUid(
  * - Caps panels (<= maxPanels), queries per panel (<= 3), thresholds (<= 4), and variables (<= 4).
  * - Packs gridPos cleanly onto the non-overlapping 2-column IR grid.
  */
+export function safeDeepClone<T>(value: T): T {
+  if (value === null || value === undefined || typeof value !== 'object') {
+    return value;
+  }
+  if (Array.isArray(value)) {
+    return value.map((item) => safeDeepClone(item)) as unknown as T;
+  }
+  const out: Record<string, unknown> = {};
+  for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
+    if (k === '__proto__' || k === 'constructor' || k === 'prototype') {
+      continue;
+    }
+    out[k] = safeDeepClone(v);
+  }
+  return out as T;
+}
+
 export function convertGrafanaDashboardToIR(
   rawInput: unknown,
   options: ImportConversionOptions
@@ -340,6 +385,7 @@ export function convertGrafanaDashboardToIR(
     throw new Error('Dashboard JSON must be an object');
   }
   const raw = rawInput as Record<string, unknown>;
+  const originalSpec = safeDeepClone(raw);
   const maxPanels = Math.max(1, Math.min(options.maxPanels ?? 6, 6));
   const warnings: string[] = [];
   const skippedPanels: SkippedImportItem[] = [];
@@ -362,11 +408,13 @@ export function convertGrafanaDashboardToIR(
 
   // 1. Safely import up to 4 scoped template variables.
   const variables: VariableIR[] = [];
+  const variableBindings: Record<string, number> = {};
   const rawTemplating = raw.templating as { list?: unknown[] } | undefined;
   const rawVarList = Array.isArray(rawTemplating?.list) ? rawTemplating.list : [];
   const seenVarNames = new Set<string>();
 
-  for (const item of rawVarList) {
+  for (let varIdx = 0; varIdx < rawVarList.length; varIdx++) {
+    const item = rawVarList[varIdx];
     if (!item || typeof item !== 'object' || Array.isArray(item)) {
       continue;
     }
@@ -418,7 +466,7 @@ export function convertGrafanaDashboardToIR(
         });
         continue;
       }
-      const parsed = parseLabelValuesQuery(v.query);
+      const parsed = parseLabelValuesQuery(v.query, options.scope);
       if (!parsed) {
         skippedVariables.push({
           title: rawName,
@@ -454,6 +502,7 @@ export function convertGrafanaDashboardToIR(
         ...(includeAll ? { includeAll: true } : {}),
       };
       seenVarNames.add(rawName);
+      variableBindings[rawName] = varIdx;
       variables.push(varIR);
     } else if (rawType === 'custom') {
       const opts = extractCustomVariableOptions(v);
@@ -484,6 +533,7 @@ export function convertGrafanaDashboardToIR(
         ...(includeAll ? { includeAll: true } : {}),
       };
       seenVarNames.add(rawName);
+      variableBindings[rawName] = varIdx;
       variables.push(varIR);
     } else {
       skippedVariables.push({
@@ -494,11 +544,11 @@ export function convertGrafanaDashboardToIR(
     }
   }
 
-  // 2. Flatten row-nested panels and convert up to maxPanels supported panels.
-  const rawPanels = flattenRawPanels(Array.isArray(raw.panels) ? raw.panels : []);
+  // 2. Flatten row-nested panels while recording exact original spec locators, and convert up to maxPanels supported panels.
+  const rawPanels = flattenRawPanelsWithLocators(Array.isArray(raw.panels) ? raw.panels : []);
   rawPanels.sort((a, b) => {
-    const ga = (a.gridPos as { y?: number; x?: number } | undefined) ?? {};
-    const gb = (b.gridPos as { y?: number; x?: number } | undefined) ?? {};
+    const ga = (a.panel.gridPos as { y?: number; x?: number } | undefined) ?? {};
+    const gb = (b.panel.gridPos as { y?: number; x?: number } | undefined) ?? {};
     const dy = (Number(ga.y) || 0) - (Number(gb.y) || 0);
     if (dy !== 0) {
       return dy;
@@ -507,11 +557,13 @@ export function convertGrafanaDashboardToIR(
   });
 
   const panels: PanelIR[] = [];
+  const panelBindings: Record<string, ImportedPanelLocator> = {};
   const usedPanelIds = new Set<string>();
   const widthHints: Array<'half' | 'full'> = [];
 
   for (let i = 0; i < rawPanels.length; i++) {
-    const rp = rawPanels[i];
+    const entry = rawPanels[i];
+    const rp = entry.panel;
     const pType = typeof rp.type === 'string' ? rp.type.trim() : 'unknown';
     const rawTitle = typeof rp.title === 'string' ? rp.title : `Panel ${i + 1}`;
     const safeTitle = sanitizePlainText(rawTitle, 80) || `Panel ${i + 1}`;
@@ -538,11 +590,13 @@ export function convertGrafanaDashboardToIR(
 
     const rawTargets = Array.isArray(rp.targets) ? rp.targets : [];
     const importedQueries: QueryIR[] = [];
+    const importedTargetIndices: number[] = [];
     let skippedTargetsCount = 0;
     let skippedUndeclaredVarCount = 0;
     let skippedWithTemplateCount = 0;
 
-    for (const rt of rawTargets) {
+    for (let targetIdx = 0; targetIdx < rawTargets.length; targetIdx++) {
+      const rt = rawTargets[targetIdx];
       if (!rt || typeof rt !== 'object' || Array.isArray(rt)) {
         continue;
       }
@@ -600,6 +654,7 @@ export function convertGrafanaDashboardToIR(
         expr: cleanExpr,
         ...(legend ? { legendFormat: legend } : {}),
       });
+      importedTargetIndices.push(targetIdx);
     }
 
     if (skippedTargetsCount > 0) {
@@ -666,6 +721,14 @@ export function convertGrafanaDashboardToIR(
       ...(thresholds.length > 0 ? { thresholds } : {}),
       layout: { row: 0, col: 0, width: widthHint },
     };
+    const originalNumericId =
+      typeof rp.id === 'number' && Number.isInteger(rp.id) && rp.id > 0 ? rp.id : undefined;
+    panelBindings[panelId] = {
+      topIndex: entry.topIndex,
+      ...(entry.rowChildIndex !== undefined ? { rowChildIndex: entry.rowChildIndex } : {}),
+      ...(originalNumericId !== undefined ? { originalNumericId } : {}),
+      importedTargetIndices,
+    };
     panels.push(panelIR);
   }
 
@@ -700,25 +763,43 @@ export function convertGrafanaDashboardToIR(
       skippedVariables,
       warnings,
     },
+    patchContext: {
+      originalSpec,
+      initialDraft: safeDeepClone(draft),
+      panelBindings,
+      variableBindings,
+    },
   };
 }
 
-function flattenRawPanels(rawPanels: unknown[]): Array<Record<string, unknown>> {
-  const out: Array<Record<string, unknown>> = [];
-  for (const item of rawPanels) {
+interface FlattenedPanelEntry {
+  panel: Record<string, unknown>;
+  topIndex: number;
+  rowChildIndex?: number;
+}
+
+function flattenRawPanelsWithLocators(rawPanels: unknown[]): FlattenedPanelEntry[] {
+  const out: FlattenedPanelEntry[] = [];
+  for (let topIndex = 0; topIndex < rawPanels.length; topIndex++) {
+    const item = rawPanels[topIndex];
     if (!item || typeof item !== 'object' || Array.isArray(item)) {
       continue;
     }
     const p = item as Record<string, unknown>;
     if (p.type === 'row' && Array.isArray(p.panels)) {
-      for (const child of p.panels) {
+      for (let rowChildIndex = 0; rowChildIndex < p.panels.length; rowChildIndex++) {
+        const child = p.panels[rowChildIndex];
         if (child && typeof child === 'object' && !Array.isArray(child)) {
-          out.push(child as Record<string, unknown>);
+          out.push({
+            panel: child as Record<string, unknown>,
+            topIndex,
+            rowChildIndex,
+          });
         }
       }
       continue;
     }
-    out.push(p);
+    out.push({ panel: p, topIndex });
   }
   return out;
 }
@@ -760,8 +841,24 @@ function isDatasourceCompatible(
   return false;
 }
 
+function unescapePromQLQuotedValue(raw: string): string {
+  return raw.replace(/\\(.)/g, (_m, ch: string) => {
+    switch (ch) {
+      case 'n':
+        return '\n';
+      case 'r':
+        return '\r';
+      case 't':
+        return '\t';
+      default:
+        return ch;
+    }
+  });
+}
+
 function parseLabelValuesQuery(
-  rawQuery: unknown
+  rawQuery: unknown,
+  activeScope?: ScopeFilter
 ): { labelName: string; metricName?: string } | null {
   let queryStr = '';
   if (typeof rawQuery === 'string') {
@@ -811,6 +908,27 @@ function parseLabelValuesQuery(
       return { metricName, labelName };
     }
     return null;
+  }
+  // Allow a single equality matcher inside label_values(...) ONLY when it matches the active import scope verbatim,
+  // enabling lossless round-trips of Studio-generated scoped variable queries without widening arbitrary filters.
+  if (activeScope?.labelName?.trim() && activeScope?.labelValue?.trim()) {
+    const scopedMatch = queryStr.match(LABEL_VALUES_WITH_SCOPED_SELECTOR);
+    if (scopedMatch) {
+      const metricName = scopedMatch[1] ?? '';
+      const filterLabel = scopedMatch[2];
+      const filterValue = unescapePromQLQuotedValue(scopedMatch[3]);
+      const labelName = scopedMatch[4];
+      if (
+        filterLabel === activeScope.labelName.trim() &&
+        filterValue === activeScope.labelValue.trim() &&
+        VALID_LABEL_NAME.test(labelName) &&
+        labelName !== '__name__' &&
+        (!metricName || VALID_METRIC_NAME.test(metricName))
+      ) {
+        return metricName ? { metricName, labelName } : { labelName };
+      }
+      return null;
+    }
   }
   const labelOnly = queryStr.match(LABEL_VALUES_ONLY);
   if (labelOnly) {
