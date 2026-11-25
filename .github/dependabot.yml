@@ -1,0 +1,115 @@
+# Version updates arrive weekly, grouped per ecosystem, and only after a
+# release has been public for a week (compromised releases are usually pulled
+# within days). Security updates are not delayed by this schedule.
+#
+# Pinned on purpose and bumped by hand, with docs/compatibility.md: the
+# Grafana versions under test (13.3.1 and 12.4.15), the @grafana/* build-time
+# lower bound (12.4.x, which keeps React 18 support), grafana-plugin-sdk-go,
+# and the Go and Node.js versions (go.mod, mise.toml, the workflows).
+version: 2
+updates:
+  - package-ecosystem: "gomod"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5
+    cooldown:
+      default-days: 7
+    ignore:
+      # Its gRPC protocol must stay compatible with Grafana 12.4 and 13.x.
+      - dependency-name: "github.com/grafana/grafana-plugin-sdk-go"
+        update-types: ["version-update:semver-minor"]
+    groups:
+      go-modules:
+        patterns: ["*"]
+    commit-message:
+      prefix: "build"
+      include: "scope"
+
+  - package-ecosystem: "npm"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5
+    cooldown:
+      default-days: 7
+      exclude:
+        - "@grafana/plugin-e2e"
+    ignore:
+      # The build-time API stays on Grafana 12.4 (React 18); see docs/compatibility.md.
+      - dependency-name: "@grafana/data"
+        update-types: ["version-update:semver-major", "version-update:semver-minor"]
+      - dependency-name: "@grafana/runtime"
+        update-types: ["version-update:semver-major", "version-update:semver-minor"]
+      - dependency-name: "@grafana/schema"
+        update-types: ["version-update:semver-major", "version-update:semver-minor"]
+      - dependency-name: "@grafana/ui"
+        update-types: ["version-update:semver-major", "version-update:semver-minor"]
+      - dependency-name: "@grafana/i18n"
+        update-types: ["version-update:semver-major", "version-update:semver-minor"]
+      - dependency-name: "@grafana/e2e-selectors"
+        update-types: ["version-update:semver-major", "version-update:semver-minor"]
+      - dependency-name: "react"
+        update-types: ["version-update:semver-major"]
+      - dependency-name: "react-dom"
+        update-types: ["version-update:semver-major"]
+      - dependency-name: "@types/react"
+        update-types: ["version-update:semver-major"]
+      - dependency-name: "@types/react-dom"
+        update-types: ["version-update:semver-major"]
+      # eslint-plugin-react does not support eslint 10 yet.
+      - dependency-name: "eslint"
+        update-types: ["version-update:semver-major"]
+    groups:
+      eslint:
+        patterns:
+          - "@grafana/eslint-config"
+          - "eslint*"
+          - "@typescript-eslint/*"
+          - "@stylistic/*"
+        update-types: ["minor", "patch"]
+      unit-test:
+        patterns:
+          - "@testing-library/*"
+          - "jest*"
+          - "ts-jest"
+          - "@types/jest"
+        update-types: ["minor", "patch"]
+      npm-minor-patch:
+        patterns: ["*"]
+        update-types: ["minor", "patch"]
+    commit-message:
+      prefix: "build"
+      include: "scope"
+
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5
+    cooldown:
+      default-days: 7
+    groups:
+      github-actions:
+        patterns: ["*"]
+    commit-message:
+      prefix: "ci"
+      include: "scope"
+
+  # Images of the local and CI stacks in deploy/. Grafana stays on the
+  # versions under test.
+  - package-ecosystem: "docker-compose"
+    directory: "/deploy"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5
+    cooldown:
+      default-days: 7
+    ignore:
+      - dependency-name: "grafana/grafana"
+    groups:
+      docker-compose:
+        patterns: ["*"]
+    commit-message:
+      prefix: "build"
+      include: "scope"

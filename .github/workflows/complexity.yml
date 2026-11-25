@@ -1,0 +1,130 @@
+name: Complexity
+
+# Measures Cognitive / Cyclomatic Complexity with cccc
+# (https://github.com/moznion/cccc) and tracks it over time as k1LoW/octocov
+# custom metrics (https://github.com/k1LoW/octocov#custom-metrics).
+#
+# The numbers are a trend to watch, not a score to chase: a steady rise points
+# at a component taking on too many responsibilities, and a sudden jump or drop
+# marks a large change worth a second look. octocov comments the before/after
+# values on pull requests and stores a report for every push to main (on the
+# `octocov` branch, see .octocov.complexity.yml), and the job summary lists the
+# hotspots.
+#
+# cccc.toml can hold max-cognitive / max-cyclomatic as a fixed backstop against
+# extreme outliers; the job fails when a function exceeds them.
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+env:
+  # Pinned so that scoring-rule changes in new cccc releases cannot move the
+  # tracked numbers or the cccc.toml thresholds. Bumping it can shift the trend,
+  # so the version is recorded in each report's metadata.
+  CCCC_VERSION: v1.8.6
+
+jobs:
+  cccc:
+    name: Cognitive / Cyclomatic complexity
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # octocov stores the report on the octocov branch (main only)
+      pull-requests: write # octocov comments on the pull request
+      actions: read
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Measure complexity (cccc)
+        uses: moznion/cccc-action@v1.1.2
+        with:
+          version: ${{ env.CCCC_VERSION }}
+          path: src pkg cmd
+          output-file: cccc.json
+
+      # The steps below run even when the gate above fails, so the offending
+      # functions and the metrics still show up.
+      #
+      # One custom metric set per component: the frontend (TypeScript) and the
+      # backend (Go, with the llm-bench CLI) are written in different
+      # languages, so a single median or p90 across them would mix unlike
+      # distributions.
+      - name: Build octocov custom metrics
+        if: ${{ !cancelled() && hashFiles('cccc.json') != '' }}
+        run: |
+          metric_set() { # <key> <name> <path>...
+            local key=$1 name=$2
+            shift 2
+            # cccc exits 1 when a function is over a cccc.toml limit, which the
+            # gate step above already reports; any other non-zero is an error.
+            cccc "$@" > "cccc-$key.json" || [ $? -eq 1 ]
+            jq --arg key "code_complexity_$key" --arg name "Code Complexity: $name ($*)" \
+               --arg path "$*" --arg version "$CCCC_VERSION" '{
+              key: $key,
+              name: $name,
+              metadata: [
+                { key: "paths", name: "Analyzed paths", value: $path },
+                { key: "cccc_version", name: "cccc version", value: $version }
+              ],
+              metrics: [
+                { key: "function_count",    name: "Function count",     value: .summary.function_count },
+                { key: "cognitive_sum",     name: "Cognitive: total",   value: .summary.cognitive.sum },
+                { key: "cognitive_max",     name: "Cognitive: max",     value: .summary.cognitive.max },
+                { key: "cognitive_median",  name: "Cognitive: median",  value: .summary.cognitive.median },
+                { key: "cognitive_p90",     name: "Cognitive: p90",     value: .summary.cognitive.p90 },
+                { key: "cyclomatic_sum",    name: "Cyclomatic: total",  value: .summary.cyclomatic.sum },
+                { key: "cyclomatic_max",    name: "Cyclomatic: max",    value: .summary.cyclomatic.max },
+                { key: "cyclomatic_median", name: "Cyclomatic: median", value: .summary.cyclomatic.median },
+                { key: "cyclomatic_p90",    name: "Cyclomatic: p90",    value: .summary.cyclomatic.p90 }
+              ]
+            }' "cccc-$key.json" > "custom_metrics_$key.json"
+          }
+          metric_set frontend "frontend" src
+          metric_set backend "backend" pkg cmd
+          jq -s . custom_metrics_frontend.json custom_metrics_backend.json > custom_metrics_complexity.json
+          echo "::group::custom_metrics_complexity.json"
+          cat custom_metrics_complexity.json
+          echo "::endgroup::"
+
+      - name: Write hotspot leaderboard to job summary
+        if: ${{ !cancelled() && hashFiles('cccc.json') != '' }}
+        run: |
+          top() {
+            jq -r --arg m "$1" --argjson n "$2" '
+              [ .files[] | .path as $p | .functions[] | recurse(.children[]?)
+                | { path: $p, name, line, cognitive, cyclomatic } ]
+              | sort_by(-.[$m]) | .[:$n][]
+              | "| \(.cognitive) | \(.cyclomatic) | `\(.name)` | \(.path):\(.line) |"
+            ' cccc.json
+          }
+          {
+            echo "## Complexity hotspots (cccc)"
+            echo
+            jq -r '.summary | "\(.file_count) files, \(.function_count) functions"' cccc.json
+            echo
+            echo "### Top 15 functions by Cognitive Complexity"
+            echo
+            echo "| Cognitive | Cyclomatic | Function | File:Line |"
+            echo "| ---: | ---: | --- | --- |"
+            top cognitive 15
+            echo
+            echo "### Top 15 functions by Cyclomatic Complexity"
+            echo
+            echo "| Cognitive | Cyclomatic | Function | File:Line |"
+            echo "| ---: | ---: | --- | --- |"
+            top cyclomatic 15
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Track complexity (octocov)
+        if: ${{ !cancelled() && hashFiles('custom_metrics_complexity.json') != '' }}
+        uses: k1LoW/octocov-action@v1.5.2
+        with:
+          version: v0.83.3
+          config: .octocov.complexity.yml
+        env:
+          OCTOCOV_CUSTOM_METRICS_COMPLEXITY: custom_metrics_complexity.json

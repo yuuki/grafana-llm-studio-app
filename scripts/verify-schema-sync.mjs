@@ -19,7 +19,9 @@ const tsTypes = fs.readFileSync(path.join(root, 'src/ir/types.ts'), 'utf8');
 const goValidate = fs.readFileSync(path.join(root, 'pkg/ir/validate.go'), 'utf8');
 
 function assertGoOpenAICompatible(node, trail = '$') {
-  if (!node || typeof node !== 'object') return;
+  if (!node || typeof node !== 'object') {
+    return;
+  }
   if ('oneOf' in node || 'anyOf' in node) {
     throw new Error(
       `Unsupported keyword oneOf/anyOf at ${trail} breaks grafana-llm-app (go-openai jsonschema.Definition)`

@@ -413,14 +413,15 @@ func TestApp_SSEIncrementalFlushHeartbeatAndStages(t *testing.T) {
 	var patchStages []jobs.JobStatus
 	var patchSnap *jobs.JobSnapshot
 	for _, f := range patchFrames {
-		if f.Event == "stage" {
+		switch f.Event {
+		case "stage":
 			var ev jobs.StageEvent
 			_ = json.Unmarshal([]byte(f.Data), &ev)
 			if ev.Operation != jobs.OperationPatch {
 				t.Fatalf("expected operation=patch, got %q", ev.Operation)
 			}
 			patchStages = append(patchStages, ev.Stage)
-		} else if f.Event == "result" {
+		case "result":
 			var s jobs.JobSnapshot
 			_ = json.Unmarshal([]byte(f.Data), &s)
 			patchSnap = &s

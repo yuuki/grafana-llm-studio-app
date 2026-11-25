@@ -369,7 +369,7 @@ func TestGrafanaLLMApp_To_VLLM_Contract(t *testing.T) {
 		}
 		sysMsg, _ := msgs[0].(map[string]any)
 		sysContent, _ := sysMsg["content"].(string)
-		if sysContent == "" || !json.Valid([]byte(rawIR)) {
+		if sysContent == "" || !json.Valid(rawIR) {
 			t.Fatal("expected valid JSON output and non-empty system prompt")
 		}
 		if !containsSubstring(sysContent, "JSON Schema") || !containsSubstring(sysContent, "selected_prometheus") {

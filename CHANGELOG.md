@@ -17,6 +17,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Expanded Dashboard IR v1.1 (7 panel types, multi-query panels, template variables, safe existing dashboard import).
 - English (default) and Japanese (`ja`) UI internationalization via Grafana's shared `i18next` runtime.
 
+### Changed
+- Development, CI and releases use Node.js 26 and Go 1.27.4 (`mise.toml`).
+- The PromQL validator uses the Prometheus parser `v0.311.3` through `parser.NewParser`, with every experimental parser option off as before.
+
+### Security
+- Update the Go modules with vulnerabilities reachable from the backend: `google.golang.org/grpc`, OpenTelemetry, `golang.org/x/net`, `golang.org/x/text`, `github.com/klauspost/compress`, `github.com/getkin/kin-openapi` and `github.com/prometheus/prometheus`.
+
 ## [0.1.0] - 2026-11-22
 
 ### Added

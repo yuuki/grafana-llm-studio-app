@@ -336,11 +336,12 @@ func ApplyPatch(current DashboardIR, patch DashboardPatch, opts ValidateOptions)
 				diffs = append(diffs, DiffEntry{Op: "update_variable", Field: "variables." + name + ".type", Before: target.Type, After: upd.Type})
 				target.Type = upd.Type
 				// Clear fields exclusive to the previous variable type so schema-compliant type switches validate cleanly.
-				if upd.Type == "custom" {
+				switch upd.Type {
+				case "custom":
 					target.DatasourceRef = ""
 					target.LabelName = ""
 					target.MetricName = ""
-				} else if upd.Type == "query" {
+				case "query":
 					target.Options = nil
 				}
 			}
@@ -443,11 +444,12 @@ func queriesEqual(a, b []QueryIR) bool {
 	if len(a) != len(b) {
 		return false
 	}
-	for i := range a {
-		if effectiveRefID(a[i].RefID, i) != effectiveRefID(b[i].RefID, i) ||
-			a[i].Kind != b[i].Kind ||
-			a[i].Expr != b[i].Expr ||
-			a[i].LegendFormat != b[i].LegendFormat {
+	for i, qb := range b {
+		qa := a[i]
+		if effectiveRefID(qa.RefID, i) != effectiveRefID(qb.RefID, i) ||
+			qa.Kind != qb.Kind ||
+			qa.Expr != qb.Expr ||
+			qa.LegendFormat != qb.LegendFormat {
 			return false
 		}
 	}

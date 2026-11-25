@@ -80,7 +80,9 @@ function parseArgs(argv) {
 }
 
 function getGitCommitSha() {
-  if (process.env.GITHUB_SHA) return process.env.GITHUB_SHA;
+  if (process.env.GITHUB_SHA) {
+    return process.env.GITHUB_SHA;
+  }
   try {
     return execFileSync('git', ['rev-parse', 'HEAD'], { cwd: root, encoding: 'utf8' }).trim();
   } catch {

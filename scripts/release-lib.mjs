@@ -77,7 +77,9 @@ export function parseTargets(rawTargets) {
 
   for (const token of rawTargets.split(',')) {
     const key = token.trim();
-    if (!key) continue;
+    if (!key) {
+      continue;
+    }
     if (!allowed.has(key)) {
       throw new Error(
         `Unsupported target ${JSON.stringify(key)}. Allowed targets: ${Array.from(allowed.keys()).join(', ')}`
@@ -121,7 +123,9 @@ export function parseChecksums(content) {
   const entries = [];
   for (const rawLine of content.split(/\r?\n/)) {
     const line = rawLine.trim();
-    if (!line) continue;
+    if (!line) {
+      continue;
+    }
     const match = line.match(/^([0-9a-fA-F]{40}|[0-9a-fA-F]{64})\s+\*?(.+)$/);
     if (!match) {
       throw new Error(`Invalid checksum line: ${JSON.stringify(rawLine)}`);
@@ -318,7 +322,9 @@ export function collectRelativeFiles(rootDir, currentDir = rootDir) {
 }
 
 export function parseRootUrls(raw) {
-  if (!raw || typeof raw !== 'string') return [];
+  if (!raw || typeof raw !== 'string') {
+    return [];
+  }
   const urls = raw
     .split(',')
     .map((u) => u.trim())

@@ -15,7 +15,7 @@ By default, Grafana refuses to load unsigned backend plugins unless the plugin I
 ## 2. Prerequisites & Tooling
 
 - **Pinned `@grafana/sign-plugin` (`3.3.3`):** Installed in `devDependencies` and exposed via `npm run sign`.
-  > **Node.js Compatibility Note:** `@grafana/sign-plugin@3.3.3` supports Node.js `>=20` (matching this repository's Node.js 22 toolchain). `@grafana/sign-plugin@4.0.0+` requires Node.js `>=24.15.0` — do not upgrade to v4 until the project's Node runtime is upgraded accordingly.
+  > **Node.js Compatibility Note:** `@grafana/sign-plugin@3.3.3` supports Node.js `>=20`. This repository's Node.js 26 toolchain also meets the `>=24.15.0` that `@grafana/sign-plugin@4.0.0+` requires; moving to v4 is a separate change.
 - **Grafana Cloud Account & Organization Slug:**
   - The first segment of `id` in `src/plugin.json` (`yuuki` in `yuuki-llmstudio-app`) must match the Grafana Cloud organization slug that generates the Access Policy token.
   - Organizations re-packaging the plugin internally for Private signing under their own Grafana Cloud account must align the plugin ID prefix with their own org slug.
