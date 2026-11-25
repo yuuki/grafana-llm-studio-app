@@ -47,6 +47,9 @@ jobs:
       - name: Run Jest unit & parity tests
         run: npm run test:ci
 
+      - name: Run release packaging helper tests
+        run: npm run test:release
+
       - name: Build frontend plugin bundle
         run: npm run build
 
