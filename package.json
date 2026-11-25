@@ -41,7 +41,7 @@
     "@grafana/e2e-selectors": "12.4.15",
     "@grafana/eslint-config": "10.0.0",
     "@grafana/plugin-e2e": "4.1.1",
-    "@grafana/sign-plugin": "3.3.3",
+    "@grafana/sign-plugin": "4.0.0",
     "@playwright/test": "1.65.1",
     "@stylistic/eslint-plugin": "5.10.0",
     "@testing-library/jest-dom": "6.6.3",
