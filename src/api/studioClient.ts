@@ -2,6 +2,7 @@ import { BackendSrvRequest, config, getBackendSrv } from '@grafana/runtime';
 import {
   DashboardIR,
   ImportSource,
+  JobOperation,
   JobSnapshot,
   JobStageEvent,
   MetricCatalogItem,
@@ -15,6 +16,8 @@ const PLUGIN_RESOURCE_BASE = '/api/plugins/yuuki-llmstudio-app/resources';
 const MAX_SSE_BUFFER_CHARS = 2 * 1024 * 1024;
 const STREAM_DROP_RECOVERY_MAX_ATTEMPTS = 5;
 const STREAM_DROP_RECOVERY_DELAY_MS = 1000;
+
+const VALID_JOB_OPERATIONS = new Set<JobOperation>(['generate', 'patch', 'repair']);
 
 const GENERIC_HTTP_ERROR_LABELS = new Set([
   'bad request',
@@ -67,7 +70,7 @@ export interface JobStreamOptions {
   /**
    * When true, requests optional decoupled SSE stage-progress streaming
    * (`Accept: text/event-stream, application/json`) and falls back gracefully
-   * to non-streaming JSON requests if SSE is unavailable or disabled on the server.
+   * to non-streaming JSON requests when SSE is unavailable or rejected before execution.
    */
   enableSse?: boolean;
   /** Invoked for application-level lifecycle stage updates (`generating`, `validating_ir`, etc.). */
@@ -82,33 +85,58 @@ export interface SseFrame {
 }
 
 /**
- * Incremental W3C Server-Sent Events frame parser resilient to arbitrary chunk boundaries,
- * CRLF line endings, and `: keepalive` comment heartbeats.
+ * Incremental WHATWG Server-Sent Events frame parser resilient to arbitrary chunk boundaries,
+ * LF/CRLF/CR line endings, `: keepalive` comment heartbeats, and total buffered-event memory caps.
  */
 export class SseEventParser {
   private buffer = '';
   private currentEvent = '';
   private currentData: string[] = [];
+  private currentDataChars = 0;
 
   push(chunk: string): SseFrame[] {
     if (!chunk) {
       return [];
     }
     this.buffer += chunk;
-    if (this.buffer.length > MAX_SSE_BUFFER_CHARS) {
+    if (this.buffer.length + this.currentDataChars > MAX_SSE_BUFFER_CHARS) {
       throw new Error('SSE stream buffer limit exceeded');
     }
 
     const frames: SseFrame[] = [];
-    let nlIdx = this.buffer.indexOf('\n');
-    while (nlIdx !== -1) {
-      let line = this.buffer.slice(0, nlIdx);
-      this.buffer = this.buffer.slice(nlIdx + 1);
-      if (line.endsWith('\r')) {
-        line = line.slice(0, -1);
+    let pos = 0;
+    const len = this.buffer.length;
+    while (pos < len) {
+      const crIdx = this.buffer.indexOf('\r', pos);
+      const lfIdx = this.buffer.indexOf('\n', pos);
+      let breakIdx = -1;
+      if (crIdx !== -1 && lfIdx !== -1) {
+        breakIdx = Math.min(crIdx, lfIdx);
+      } else if (crIdx !== -1) {
+        breakIdx = crIdx;
+      } else if (lfIdx !== -1) {
+        breakIdx = lfIdx;
+      }
+
+      if (breakIdx === -1) {
+        break;
+      }
+      // Hold a trailing CR at the end of a chunk in case LF arrives at the start of the next chunk.
+      if (this.buffer[breakIdx] === '\r' && breakIdx === len - 1) {
+        break;
+      }
+
+      const line = this.buffer.slice(pos, breakIdx);
+      if (this.buffer[breakIdx] === '\r' && this.buffer[breakIdx + 1] === '\n') {
+        pos = breakIdx + 2;
+      } else {
+        pos = breakIdx + 1;
       }
       this.consumeLine(line, frames);
-      nlIdx = this.buffer.indexOf('\n');
+    }
+
+    if (pos > 0) {
+      this.buffer = this.buffer.slice(pos);
     }
     return frames;
   }
@@ -116,9 +144,13 @@ export class SseEventParser {
   flush(): SseFrame[] {
     const frames: SseFrame[] = [];
     if (this.buffer.length > 0) {
-      const trailing = this.buffer.endsWith('\r') ? this.buffer.slice(0, -1) : this.buffer;
+      const hadTrailingCr = this.buffer.endsWith('\r');
+      const trailing = hadTrailingCr ? this.buffer.slice(0, -1) : this.buffer;
       this.buffer = '';
       this.consumeLine(trailing, frames);
+      if (hadTrailingCr) {
+        this.consumeLine('', frames);
+      }
     }
     this.dispatchCurrent(frames);
     return frames;
@@ -141,12 +173,18 @@ export class SseEventParser {
     if (field === 'event') {
       this.currentEvent = value;
     } else if (field === 'data') {
+      this.currentDataChars += value.length + 1;
+      if (this.buffer.length + this.currentDataChars > MAX_SSE_BUFFER_CHARS) {
+        throw new Error('SSE stream buffer limit exceeded');
+      }
       this.currentData.push(value);
     }
   }
 
   private dispatchCurrent(out: SseFrame[]): void {
-    if (this.currentData.length === 0 && this.currentEvent === '') {
+    if (this.currentData.length === 0) {
+      this.currentEvent = '';
+      this.currentDataChars = 0;
       return;
     }
     out.push({
@@ -155,6 +193,7 @@ export class SseEventParser {
     });
     this.currentEvent = '';
     this.currentData = [];
+    this.currentDataChars = 0;
   }
 }
 
@@ -191,6 +230,38 @@ export function extractApiError(err: unknown): string {
     }
   }
   return String(err);
+}
+
+function isPlainObject(v: unknown): v is Record<string, unknown> {
+  return typeof v === 'object' && v !== null && !Array.isArray(v);
+}
+
+function isValidJobSnapshot(v: unknown): v is JobSnapshot {
+  return isPlainObject(v) && typeof v.status === 'string';
+}
+
+function parseValidatedStageEvent(raw: string): JobStageEvent | null {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return null;
+  }
+  if (!isPlainObject(parsed) || typeof parsed.stage !== 'string' || parsed.stage.trim() === '') {
+    return null;
+  }
+  const jobId = typeof parsed.jobId === 'string' ? parsed.jobId : undefined;
+  const op: JobOperation =
+    typeof parsed.operation === 'string' && VALID_JOB_OPERATIONS.has(parsed.operation as JobOperation)
+      ? (parsed.operation as JobOperation)
+      : 'generate';
+  const timestamp = typeof parsed.timestamp === 'string' ? parsed.timestamp : '';
+  return {
+    ...(jobId ? { jobId } : {}),
+    operation: op,
+    stage: parsed.stage as JobStageEvent['stage'],
+    timestamp,
+  };
 }
 
 function buildResourceUrl(path: string): string {
@@ -287,7 +358,8 @@ function isActiveJobStatus(status: JobSnapshot['status']): boolean {
 
 async function recoverJobAfterStreamDrop(
   jobId: string,
-  signal?: AbortSignal
+  signal?: AbortSignal,
+  expectedMinRevision?: number
 ): Promise<JobSnapshot> {
   let latest: JobSnapshot | null = null;
   for (let attempt = 0; attempt < STREAM_DROP_RECOVERY_MAX_ATTEMPTS; attempt++) {
@@ -316,6 +388,25 @@ async function recoverJobAfterStreamDrop(
           message: latest.errorMessage || 'SSE stream disconnected before completion',
         };
       }
+      // For patch/repair, RevertOnCancel returns status='awaiting_preview' at the UNCHANGED revision.
+      // Never treat a reverted old revision as a successful edit/repair (H-1).
+      if (
+        expectedMinRevision !== undefined &&
+        (latest.currentIR?.revision ?? 0) < expectedMinRevision
+      ) {
+        const msg =
+          latest.errorMessage ||
+          latest.summary ||
+          'SSE stream disconnected before edit completed; draft was reverted to the previous revision';
+        throw {
+          status: 409,
+          data: {
+            error: msg,
+            job: latest,
+          },
+          message: msg,
+        };
+      }
       return latest;
     }
     if (attempt + 1 < STREAM_DROP_RECOVERY_MAX_ATTEMPTS) {
@@ -332,17 +423,23 @@ async function recoverJobAfterStreamDrop(
   };
 }
 
-interface SseErrorEventPayload {
+interface SseErrorObject {
   status?: number;
-  error?: string;
-  job?: JobSnapshot;
+  data?: { error?: string; job?: JobSnapshot };
+  message?: string;
+}
+
+interface JobOpContext {
+  jobId?: string;
+  expectedMinRevision?: number;
 }
 
 async function postJobWithOptionalSse<TReq>(
   path: string,
   data: TReq,
   signal?: AbortSignal,
-  options?: JobStreamOptions
+  options?: JobStreamOptions,
+  opContext?: JobOpContext
 ): Promise<JobSnapshot> {
   const nonStreaming = (fallbackReason?: string): Promise<JobSnapshot> => {
     if (fallbackReason) {
@@ -373,6 +470,8 @@ async function postJobWithOptionalSse<TReq>(
     return nonStreaming('streams_unavailable');
   }
 
+  let observedJobId: string | undefined = opContext?.jobId;
+
   const headers: Record<string, string> = {
     'Content-Type': 'application/json',
     Accept: 'text/event-stream, application/json',
@@ -395,8 +494,14 @@ async function postJobWithOptionalSse<TReq>(
     if (isAbortError(err, signal)) {
       throw new DOMException('Request aborted', 'AbortError');
     }
-    // Network/transport failure before any response was received: fall back gracefully to BackendSrv non-streaming.
-    return nonStreaming('sse_transport_error');
+    // Never blindly re-POST on a post-send transport reset (prevents duplicate LLM calls / double repair budget burn, H-2).
+    if (observedJobId) {
+      return recoverJobAfterStreamDrop(observedJobId, signal, opContext?.expectedMinRevision);
+    }
+    throw {
+      status: 502,
+      message: err instanceof Error ? err.message : 'SSE request failed before receiving a response',
+    };
   }
 
   const contentType = (res.headers?.get('content-type') || '').toLowerCase();
@@ -406,7 +511,10 @@ async function postJobWithOptionalSse<TReq>(
     let parsed: unknown;
     try {
       parsed = await res.json();
-    } catch {
+    } catch (err: unknown) {
+      if (isAbortError(err, signal)) {
+        throw new DOMException('Request aborted', 'AbortError');
+      }
       parsed = undefined;
     }
     if (!res.ok) {
@@ -416,10 +524,13 @@ async function postJobWithOptionalSse<TReq>(
         data: parsed,
       };
     }
-    return parsed as JobSnapshot;
+    if (!isValidJobSnapshot(parsed)) {
+      throw new Error('Invalid JSON response from plugin backend');
+    }
+    return parsed;
   }
 
-  // Proxy or server explicitly rejected text/event-stream negotiation -> fall back to JSON request.
+  // Proxy or server explicitly rejected text/event-stream negotiation BEFORE executing the job -> safe non-streaming fallback.
   if (res.status === 406 || res.status === 501) {
     return nonStreaming('sse_not_acceptable');
   }
@@ -428,8 +539,10 @@ async function postJobWithOptionalSse<TReq>(
     let errText = '';
     try {
       errText = (await res.text()).trim();
-    } catch {
-      // Ignore body read error.
+    } catch (err: unknown) {
+      if (isAbortError(err, signal)) {
+        throw new DOMException('Request aborted', 'AbortError');
+      }
     }
     throw {
       status: res.status,
@@ -438,50 +551,45 @@ async function postJobWithOptionalSse<TReq>(
     };
   }
 
-  if (!contentType.includes('text/event-stream')) {
-    // Check if an intermediary stripped Content-Type on a valid JSON JobSnapshot before falling back.
-    try {
-      const text = await res.text();
-      const maybeSnap = JSON.parse(text) as Partial<JobSnapshot>;
-      if (maybeSnap && typeof maybeSnap.status === 'string') {
-        return maybeSnap as JobSnapshot;
-      }
-    } catch {
-      // Not valid JSON; fall back cleanly.
-    }
-    return nonStreaming('unexpected_content_type');
-  }
-
   const parser = new SseEventParser();
-  let observedJobId: string | undefined;
-  let receivedAnyFrame = false;
   let finalResult: JobSnapshot | null = null;
-  let finalError: { status?: number; data?: { error?: string; job?: JobSnapshot }; message?: string } | null =
-    null;
+  let finalError: SseErrorObject | null = null;
 
   const handleFrames = (frames: SseFrame[]) => {
     for (const frame of frames) {
-      receivedAnyFrame = true;
       if (frame.event === 'stage') {
+        const ev = parseValidatedStageEvent(frame.data);
+        if (!ev) {
+          continue;
+        }
+        if (ev.jobId) {
+          observedJobId = ev.jobId;
+        }
         try {
-          const ev = JSON.parse(frame.data) as JobStageEvent;
-          if (ev.jobId) {
-            observedJobId = ev.jobId;
-          }
           options.onStage?.(ev);
         } catch {
-          // Ignore malformed non-terminal stage frame; never pass partial JSON to UI state.
+          // Ignore UI callback errors so stream consumption continues cleanly.
         }
       } else if (frame.event === 'result') {
-        finalResult = JSON.parse(frame.data) as JobSnapshot;
+        const parsed = JSON.parse(frame.data) as unknown;
+        if (!isValidJobSnapshot(parsed)) {
+          throw new Error('Invalid SSE result payload from plugin backend');
+        }
+        finalResult = parsed;
       } else if (frame.event === 'error') {
-        const payload = JSON.parse(frame.data) as SseErrorEventPayload;
-        const errMsg = payload.error || 'Job operation failed';
+        const parsed = JSON.parse(frame.data) as unknown;
+        const payload = isPlainObject(parsed) ? parsed : {};
+        const errMsg =
+          typeof payload.error === 'string' && payload.error.trim().length > 0
+            ? payload.error
+            : 'Job operation failed';
+        const status = typeof payload.status === 'number' ? payload.status : undefined;
+        const jobSnap = isValidJobSnapshot(payload.job) ? payload.job : undefined;
         finalError = {
-          status: payload.status,
+          status,
           data: {
             error: errMsg,
-            ...(payload.job ? { job: payload.job } : {}),
+            ...(jobSnap ? { job: jobSnap } : {}),
           },
           message: errMsg,
         };
@@ -489,14 +597,58 @@ async function postJobWithOptionalSse<TReq>(
     }
   };
 
+  if (!contentType.includes('text/event-stream')) {
+    // HTTP 200 with unexpected Content-Type (e.g., proxy rewrote text/event-stream to text/plain):
+    // Attempt to parse JSON or buffered SSE frames directly without blindly re-POSTing (H-2).
+    let text = '';
+    try {
+      text = await res.text();
+    } catch (err: unknown) {
+      if (isAbortError(err, signal)) {
+        throw new DOMException('Request aborted', 'AbortError');
+      }
+      if (observedJobId) {
+        return recoverJobAfterStreamDrop(observedJobId, signal, opContext?.expectedMinRevision);
+      }
+      throw err;
+    }
+    try {
+      const maybeSnap = JSON.parse(text) as unknown;
+      if (isValidJobSnapshot(maybeSnap)) {
+        return maybeSnap;
+      }
+    } catch {
+      // Not JSON; check if proxy rewrote Content-Type on a buffered SSE payload.
+    }
+    if (text.includes('data:') || text.includes('event:')) {
+      handleFrames(parser.push(text));
+      handleFrames(parser.flush());
+      if (finalResult) {
+        return finalResult;
+      }
+      if (finalError) {
+        throw finalError;
+      }
+    }
+    if (observedJobId) {
+      return recoverJobAfterStreamDrop(observedJobId, signal, opContext?.expectedMinRevision);
+    }
+    throw {
+      status: 502,
+      message: 'Unexpected response format from plugin backend during SSE request',
+    };
+  }
+
   try {
     if (res.body && typeof res.body.getReader === 'function') {
       const reader = res.body.getReader();
       const decoder = new TextDecoder();
+      let streamDone = false;
       try {
         while (true) {
           const { done, value } = await reader.read();
           if (done) {
+            streamDone = true;
             const tail = decoder.decode();
             if (tail) {
               handleFrames(parser.push(tail));
@@ -509,10 +661,13 @@ async function postJobWithOptionalSse<TReq>(
           }
         }
       } finally {
+        if (!streamDone) {
+          void reader.cancel().catch(() => {});
+        }
         reader.releaseLock();
       }
     } else {
-      // Buffered fallback if ReadableStream is unavailable (still extracts complete SSE frames without re-POSTing).
+      // Buffered fallback if ReadableStream is unavailable (extracts complete SSE frames without re-POSTing).
       const fullText = await res.text();
       handleFrames(parser.push(fullText));
       handleFrames(parser.flush());
@@ -527,11 +682,9 @@ async function postJobWithOptionalSse<TReq>(
     if (finalError) {
       throw finalError;
     }
+    // Once 200 text/event-stream was sent, the backend already started the job; NEVER re-POST (H-2).
     if (observedJobId) {
-      return recoverJobAfterStreamDrop(observedJobId, signal);
-    }
-    if (!receivedAnyFrame) {
-      return nonStreaming('sse_stream_error');
+      return recoverJobAfterStreamDrop(observedJobId, signal, opContext?.expectedMinRevision);
     }
     throw err;
   }
@@ -546,9 +699,12 @@ async function postJobWithOptionalSse<TReq>(
     throw new DOMException('Request aborted', 'AbortError');
   }
   if (observedJobId) {
-    return recoverJobAfterStreamDrop(observedJobId, signal);
+    return recoverJobAfterStreamDrop(observedJobId, signal, opContext?.expectedMinRevision);
   }
-  return nonStreaming('sse_empty_stream');
+  throw {
+    status: 502,
+    message: 'SSE stream closed before receiving a result from plugin backend',
+  };
 }
 
 export async function fetchPublicConfig(signal?: AbortSignal): Promise<PublicConfig> {
@@ -606,7 +762,8 @@ export async function patchDraft(
     `/jobs/${encodeURIComponent(jobId)}/patch`,
     req,
     signal,
-    options
+    options,
+    { jobId, expectedMinRevision: req.baseRevision + 1 }
   );
 }
 
@@ -620,7 +777,8 @@ export async function repairDraft(
     `/jobs/${encodeURIComponent(jobId)}/repair`,
     req,
     signal,
-    options
+    options,
+    { jobId, expectedMinRevision: req.baseRevision + 1 }
   );
 }
 
@@ -635,10 +793,16 @@ export async function undoDraft(jobId: string, signal?: AbortSignal): Promise<Jo
   );
 }
 
-export async function cancelDraftJob(jobId: string): Promise<JobSnapshot> {
-  return fetchWithAbort<JobSnapshot>({
-    url: `${PLUGIN_RESOURCE_BASE}/jobs/${encodeURIComponent(jobId)}/cancel`,
-    method: 'POST',
-    showErrorAlert: false,
-  });
+export async function cancelDraftJob(
+  jobId: string,
+  signal?: AbortSignal
+): Promise<JobSnapshot> {
+  return fetchWithAbort<JobSnapshot>(
+    {
+      url: `${PLUGIN_RESOURCE_BASE}/jobs/${encodeURIComponent(jobId)}/cancel`,
+      method: 'POST',
+      showErrorAlert: false,
+    },
+    signal
+  );
 }

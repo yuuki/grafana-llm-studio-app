@@ -363,6 +363,7 @@ test.describe('LLM Dashboard Studio live E2E', () => {
       errors.assertClean(`Studio SSE E2E on Grafana ${grafanaVersion}`);
     } finally {
       dsQueries.dispose();
+      const restoredSse = Boolean(origSettings.jsonData?.enableSseProgress);
       await request
         .post(`/api/plugins/${PLUGIN_ID}/settings`, {
           data: {
@@ -370,11 +371,22 @@ test.describe('LLM Dashboard Studio live E2E', () => {
             pinned: origSettings.pinned ?? true,
             jsonData: {
               ...(origSettings.jsonData ?? {}),
-              enableSseProgress: Boolean(origSettings.jsonData?.enableSseProgress),
+              enableSseProgress: restoredSse,
               mockDelayMs: 0,
             },
           },
         })
+        .catch(() => {});
+      await expect
+        .poll(async () => {
+          const cfgRes = await request.get(`/api/plugins/${PLUGIN_ID}/resources/config/public`);
+          if (!cfgRes.ok()) {
+            return false;
+          }
+          const cfg = await cfgRes.json();
+          return Boolean(cfg.enableSseProgress) === restoredSse;
+        })
+        .toBe(true)
         .catch(() => {});
     }
   });

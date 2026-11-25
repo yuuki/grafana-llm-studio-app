@@ -301,4 +301,221 @@ describe('studioClient optional SSE streaming and graceful fallback', () => {
     expect(onFallback).not.toHaveBeenCalled();
     expect(mockBackendFetch).not.toHaveBeenCalled();
   });
+
+  test('H-1: rejects with 409 + job snapshot when repair SSE drops and backend RevertOnCancel keeps old revision', async () => {
+    const revertedSnap = makeSnapshot({
+      jobId: 'job-repair-1',
+      status: 'awaiting_preview',
+      repairAttemptsUsed: 1,
+      currentIR: {
+        schemaVersion: '1.1',
+        revision: 1,
+        title: 'Old Rev',
+        timeRange: { from: 'now-15m', to: 'now' },
+        panels: [],
+      },
+    });
+    const droppingStream = makeMockReadableStream(
+      [
+        'event: stage\ndata: {"jobId":"job-repair-1","operation":"repair","stage":"repairing","timestamp":"2026-11-24T00:00:00Z"}\n\n',
+      ],
+      new Error('proxy reset')
+    );
+    globalThis.fetch = jest.fn().mockResolvedValueOnce({
+      ok: true,
+      status: 200,
+      statusText: 'OK',
+      headers: new Headers({ 'Content-Type': 'text/event-stream' }),
+      body: droppingStream,
+    }) as unknown as typeof fetch;
+    mockBackendFetch.mockReturnValueOnce(of({ data: revertedSnap }));
+
+    let caught: unknown;
+    try {
+      await repairDraft(
+        'job-repair-1',
+        { baseRevision: 1, results: [], catalog: [{ name: 'http_requests_total' }] },
+        undefined,
+        { enableSse: true }
+      );
+    } catch (err) {
+      caught = err;
+    }
+
+    expect(caught).toBeDefined();
+    expect((caught as { status?: number }).status).toBe(409);
+    expect((caught as { data?: { job?: JobSnapshot } }).data?.job).toEqual(revertedSnap);
+  });
+
+  test('H-2: never re-POSTs when 200 text/event-stream drops before first frame on repair (uses seeded jobId recovery)', async () => {
+    const repairedSnap = makeSnapshot({
+      jobId: 'job-repair-2',
+      status: 'awaiting_preview',
+      repairAttemptsUsed: 1,
+      currentIR: {
+        schemaVersion: '1.1',
+        revision: 2,
+        title: 'Repaired Rev',
+        timeRange: { from: 'now-15m', to: 'now' },
+        panels: [],
+      },
+    });
+    const emptyDropStream = makeMockReadableStream([], new Error('reset before first frame'));
+    const nativeFetch = jest.fn().mockResolvedValueOnce({
+      ok: true,
+      status: 200,
+      statusText: 'OK',
+      headers: new Headers({ 'Content-Type': 'text/event-stream' }),
+      body: emptyDropStream,
+    });
+    globalThis.fetch = nativeFetch as unknown as typeof fetch;
+    mockBackendFetch.mockReturnValueOnce(of({ data: repairedSnap }));
+
+    const result = await repairDraft(
+      'job-repair-2',
+      { baseRevision: 1, results: [], catalog: [{ name: 'http_requests_total' }] },
+      undefined,
+      { enableSse: true }
+    );
+
+    expect(result).toEqual(repairedSnap);
+    expect(nativeFetch).toHaveBeenCalledTimes(1);
+    expect(mockBackendFetch).toHaveBeenCalledTimes(1);
+    expect(mockBackendFetch.mock.calls[0][0]).toMatchObject({
+      url: '/api/plugins/yuuki-llmstudio-app/resources/jobs/job-repair-2',
+      method: 'GET',
+    });
+  });
+
+  test('H-2: never blindly re-POSTs generate on post-send fetch transport reset', async () => {
+    const nativeFetch = jest.fn().mockRejectedValueOnce(new TypeError('network reset'));
+    globalThis.fetch = nativeFetch as unknown as typeof fetch;
+
+    await expect(
+      generateDraft(
+        {
+          datasourceUid: 'prom-main',
+          userIntent: 'RED metrics',
+          catalog: [{ name: 'http_requests_total' }],
+        },
+        undefined,
+        { enableSse: true }
+      )
+    ).rejects.toMatchObject({ status: 502 });
+
+    expect(nativeFetch).toHaveBeenCalledTimes(1);
+    expect(mockBackendFetch).not.toHaveBeenCalled();
+  });
+
+  test('M-1 & L-2: SseEventParser handles standalone CR, split CRLF, enforces total data memory cap, and reader.cancel() runs on error', async () => {
+    const parser = new SseEventParser();
+    expect(parser.push('event: stage\rdata: {"stage":"generating"}\r\r: keepalive\r')).toEqual([
+      { event: 'stage', data: '{"stage":"generating"}' },
+    ]);
+    // Split CRLF across chunk boundary must NOT be treated as a blank line prematurely.
+    const splitParser = new SseEventParser();
+    expect(splitParser.push('event: stage\r')).toEqual([]);
+    expect(splitParser.push('\ndata: {"stage":"validating_ir"}\r')).toEqual([]);
+    expect(splitParser.push('\n\r\n')).toEqual([
+      { event: 'stage', data: '{"stage":"validating_ir"}' },
+    ]);
+    // Event with empty data buffer must be discarded per WHATWG SSE spec.
+    expect(parser.push('event: stage\n\n')).toEqual([]);
+
+    // Repeated data lines without blank-line terminator MUST trip MAX_SSE_BUFFER_CHARS cap.
+    const capParser = new SseEventParser();
+    const bigLine = `data: ${'x'.repeat(256 * 1024)}\n`;
+    expect(() => {
+      for (let i = 0; i < 12; i++) {
+        capParser.push(bigLine);
+      }
+    }).toThrow('SSE stream buffer limit exceeded');
+
+    // Reader cancel must be invoked when frame parsing throws mid-stream.
+    const cancelSpy = jest.fn(async () => {});
+    const releaseSpy = jest.fn();
+    const encoder = new TextEncoder();
+    let reads = 0;
+    const badStream = {
+      getReader() {
+        return {
+          async read() {
+            reads += 1;
+            if (reads === 1) {
+              return { done: false, value: encoder.encode('event: result\ndata: {broken json\n\n') };
+            }
+            return { done: true, value: undefined };
+          },
+          cancel: cancelSpy,
+          releaseLock: releaseSpy,
+        };
+      },
+    } as unknown as ReadableStream<Uint8Array>;
+
+    globalThis.fetch = jest.fn().mockResolvedValueOnce({
+      ok: true,
+      status: 200,
+      statusText: 'OK',
+      headers: new Headers({ 'Content-Type': 'text/event-stream' }),
+      body: badStream,
+    }) as unknown as typeof fetch;
+
+    await expect(
+      generateDraft(
+        { datasourceUid: 'prom-main', userIntent: 'test', catalog: [{ name: 'up' }] },
+        undefined,
+        { enableSse: true }
+      )
+    ).rejects.toThrow();
+
+    expect(cancelSpy).toHaveBeenCalledTimes(1);
+    expect(releaseSpy).toHaveBeenCalledTimes(1);
+  });
+
+  test('M-2: truncated or aborted 200 application/json response throws instead of returning undefined', async () => {
+    globalThis.fetch = jest.fn().mockResolvedValueOnce({
+      ok: true,
+      status: 200,
+      statusText: 'OK',
+      headers: new Headers({ 'Content-Type': 'application/json' }),
+      json: async () => {
+        throw new SyntaxError('Unexpected end of JSON input');
+      },
+    }) as unknown as typeof fetch;
+
+    await expect(
+      generateDraft(
+        { datasourceUid: 'prom-main', userIntent: 'test', catalog: [{ name: 'up' }] },
+        undefined,
+        { enableSse: true }
+      )
+    ).rejects.toThrow('Invalid JSON response from plugin backend');
+  });
+
+  test('M-3: ignores malformed stage frames with non-string stage while resolving valid result', async () => {
+    const snap = makeSnapshot({ jobId: 'job-m3' });
+    const stages: JobStageEvent[] = [];
+    const stream = makeMockReadableStream([
+      'event: stage\ndata: {"stage":{"nested":true}}\n\n',
+      'event: stage\ndata: null\n\n',
+      'event: stage\ndata: {"jobId":"job-m3","operation":"generate","stage":"generating","timestamp":"2026-11-24T00:00:00Z"}\n\n',
+      `event: result\ndata: ${JSON.stringify(snap)}\n\n`,
+    ]);
+    globalThis.fetch = jest.fn().mockResolvedValueOnce({
+      ok: true,
+      status: 200,
+      statusText: 'OK',
+      headers: new Headers({ 'Content-Type': 'text/event-stream' }),
+      body: stream,
+    }) as unknown as typeof fetch;
+
+    const res = await generateDraft(
+      { datasourceUid: 'prom-main', userIntent: 'test', catalog: [{ name: 'up' }] },
+      undefined,
+      { enableSse: true, onStage: (ev) => stages.push(ev) }
+    );
+    expect(res).toEqual(snap);
+    expect(stages).toHaveLength(1);
+    expect(stages[0].stage).toBe('generating');
+  });
 });

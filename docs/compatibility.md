@@ -1,6 +1,6 @@
 # Version Compatibility Matrix & Model Verification Report
 
-Last verified: **2026-11-23**
+Last verified: **2026-11-25**
 
 ## 1. Pinned Stack Compatibility Matrix
 

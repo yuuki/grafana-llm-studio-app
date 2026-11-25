@@ -43,11 +43,22 @@ async function getPluginSettings() {
   return res.json();
 }
 
+let lastPluginSettingsPostMs = 0;
+
 async function updatePluginSettings(baseSettings, jsonDataPatch) {
+  // Grafana stores plugin_setting.updated at 1-second resolution in SQLite, and
+  // grafana-plugin-sdk-go/backend/instancemgmt keys App instance invalidation on
+  // AppInstanceSettings.Updated. Ensure consecutive POSTs land in distinct seconds.
+  const elapsedSinceLastPost = Date.now() - lastPluginSettingsPostMs;
+  if (lastPluginSettingsPostMs > 0 && elapsedSinceLastPost < 1100) {
+    await sleep(1100 - elapsedSinceLastPost);
+  }
+
   const nextJsonData = {
     ...(baseSettings.jsonData || {}),
     ...jsonDataPatch,
   };
+  lastPluginSettingsPostMs = Date.now();
   const res = await fetch(`${grafanaUrl}/api/plugins/${pluginId}/settings`, {
     method: 'POST',
     headers: {
@@ -64,15 +75,26 @@ async function updatePluginSettings(baseSettings, jsonDataPatch) {
     throw new Error(`POST plugin settings failed: HTTP ${res.status} ${await res.text()}`);
   }
 
-  // Wait briefly for Grafana to reload the plugin instance with the updated jsonData.
+  // Wait until Grafana persists the updated jsonData and serves the reloaded plugin instance.
   const deadline = Date.now() + 15_000;
+  let lastPersistedDelay;
+  let lastPublicEnableSse;
   while (Date.now() < deadline) {
     try {
+      if (jsonDataPatch.mockDelayMs !== undefined) {
+        const persisted = await getPluginSettings();
+        lastPersistedDelay = persisted?.jsonData?.mockDelayMs;
+        if (lastPersistedDelay !== jsonDataPatch.mockDelayMs) {
+          await sleep(200);
+          continue;
+        }
+      }
       const cfgRes = await fetch(`${resourceBase}/config/public`, {
         headers: { Authorization: authHeader },
       });
       if (cfgRes.ok) {
         const cfg = await cfgRes.json();
+        lastPublicEnableSse = cfg.enableSseProgress;
         if (
           jsonDataPatch.enableSseProgress === undefined ||
           cfg.enableSseProgress === jsonDataPatch.enableSseProgress
@@ -86,7 +108,11 @@ async function updatePluginSettings(baseSettings, jsonDataPatch) {
     }
     await sleep(200);
   }
-  throw new Error('Timed out waiting for updated plugin settings to take effect');
+  throw new Error(
+    `Timed out waiting for updated plugin settings to take effect ` +
+      `(expected=${JSON.stringify(jsonDataPatch)}, lastPersistedMockDelayMs=${JSON.stringify(lastPersistedDelay)}, ` +
+      `lastPublicEnableSse=${JSON.stringify(lastPublicEnableSse)})`
+  );
 }
 
 function createSseParser() {
@@ -397,7 +423,59 @@ async function main() {
       `[sse-verify] PASS client-disconnect cancellation: jobId=${disconnectedJobId}, status=cancelled in ${cancelPropagatedMs}ms (mockDelay=6000ms)`
     );
 
-    // 4. Verify concurrency slot released + Accept: application/json returns plain JSON + enableSseProgress=false gate
+    // 3b. M-4: Verify per-user concurrency slot (limit=1) was genuinely released on the SAME plugin instance
+    //     BEFORE calling updatePluginSettings (which would recycle the App and create a fresh MemoryStore).
+    const slotProbeAbort = new AbortController();
+    let slotProbeJobId = '';
+    try {
+      await readSseRequest(
+        `${resourceBase}/jobs/generate`,
+        {
+          datasourceUid: 'prom-main',
+          scope: { labelName: 'service', labelValue: 'checkout-api' },
+          userIntent: 'Show request rate',
+          catalog: SAMPLE_CATALOG,
+        },
+        {
+          signal: slotProbeAbort.signal,
+          onFrame(frame) {
+            if (frame.event === 'stage' && !slotProbeJobId) {
+              const ev = JSON.parse(frame.data);
+              if (ev.jobId && ev.stage === 'generating') {
+                slotProbeJobId = ev.jobId;
+                slotProbeAbort.abort();
+              }
+            }
+          },
+        }
+      );
+    } catch (err) {
+      if (!(err && (err.name === 'AbortError' || String(err).includes('abort')))) {
+        throw err;
+      }
+    }
+    assert(
+      Boolean(slotProbeJobId) && slotProbeJobId !== disconnectedJobId,
+      'Follow-up Generate on the same plugin instance failed to acquire slot immediately after client disconnect'
+    );
+    const probeDeadline = Date.now() + 3500;
+    let probeCancelled = false;
+    while (Date.now() < probeDeadline) {
+      const getRes = await fetch(`${resourceBase}/jobs/${encodeURIComponent(slotProbeJobId)}`, {
+        headers: { Authorization: authHeader },
+      });
+      if (getRes.ok && (await getRes.json()).status === 'cancelled') {
+        probeCancelled = true;
+        break;
+      }
+      await sleep(100);
+    }
+    assert(probeCancelled, `Slot probe job ${slotProbeJobId} did not unwind to cancelled`);
+    console.log(
+      `[sse-verify] PASS same-instance slot release: follow-up jobId=${slotProbeJobId} acquired slot immediately`
+    );
+
+    // 4. Verify Accept: application/json returns plain JSON + enableSseProgress=false gate
     await updatePluginSettings(originalSettings, {
       enableSseProgress: true,
       mockDelayMs: 0,

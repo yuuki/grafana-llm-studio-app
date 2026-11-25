@@ -386,13 +386,14 @@ describe('AppConfig reactive locale switching', () => {
     expect(screen.getByText('設定を保存')).toBeTruthy();
   });
 
-  test('defaults enableSseProgress to false and persists true when explicitly enabled', async () => {
+  test('defaults enableSseProgress to false, persists true when enabled, and strips hidden mockDelayMs (L-1)', async () => {
     mockFetch.mockReset();
     mockFetch.mockReturnValue(of({ data: {} }));
 
     const plugin = makePlugin({
       allowedDatasourceUids: ['prom-main'],
       llmMode: 'grafana-llm-app',
+      mockDelayMs: 5000,
     });
 
     render(<AppConfig plugin={plugin as never} query={{}} />);
@@ -407,5 +408,6 @@ describe('AppConfig reactive locale switching', () => {
 
     const payload = mockFetch.mock.calls[0][0].data;
     expect(payload.jsonData.enableSseProgress).toBe(true);
+    expect('mockDelayMs' in payload.jsonData).toBe(false);
   });
 });

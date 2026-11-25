@@ -176,7 +176,7 @@ export const StudioPage: React.FC = () => {
   const [editPanelId, setEditPanelId] = useState<string>('');
   const [job, setJob] = useState<JobSnapshot | null>(null);
   const [busyState, setBusyState] = useState<
-    'idle' | 'generating' | 'importing' | 'patching' | 'validating' | 'repairing' | 'undoing' | 'saving'
+    'idle' | 'generating' | 'importing' | 'patching' | 'validating' | 'repairing' | 'undoing' | 'saving' | 'cancelling'
   >('idle');
   const [liveStage, setLiveStage] = useState<JobStageEvent | null>(null);
   const [sseFallbackNotice, setSseFallbackNotice] = useState(false);
@@ -654,7 +654,7 @@ export const StudioPage: React.FC = () => {
 
   const handleCancel = async () => {
     const activeState = busyState;
-    if (activeState === 'idle' || activeState === 'saving') {
+    if (activeState === 'idle' || activeState === 'saving' || activeState === 'cancelling') {
       return;
     }
     const cancelTargetJobId =
@@ -667,21 +667,36 @@ export const StudioPage: React.FC = () => {
     abortRef.current?.abort();
     inFlightJobIdRef.current = null;
     setLiveStage(null);
-    setBusyState('idle');
 
     // Notify Backend cancel when an LLM backend job ID is known (patching, repairing, or SSE-started generating).
+    // Keep busyState='cancelling' until cancel settles so a new Patch/Repair cannot be killed by a delayed Cancel (H-3).
     if (cancelTargetJobId) {
       const seq = contextSeqRef.current;
       const opSeq = ++jobOpSeqRef.current;
+      const cancelController = new AbortController();
+      abortRef.current = cancelController;
+      const timer = setTimeout(() => cancelController.abort(), 5000);
+      setBusyState('cancelling');
       try {
-        const updated = await cancelDraftJob(cancelTargetJobId);
+        const updated = await cancelDraftJob(cancelTargetJobId, cancelController.signal);
         if (seq === contextSeqRef.current && opSeq === jobOpSeqRef.current) {
           applyJobSnapshot(updated);
         }
       } catch {
         // Ignore cancel race errors if job already completed.
+      } finally {
+        clearTimeout(timer);
+        if (
+          abortRef.current === cancelController &&
+          seq === contextSeqRef.current &&
+          opSeq === jobOpSeqRef.current
+        ) {
+          setBusyState('idle');
+        }
       }
+      return;
     }
+    setBusyState('idle');
   };
 
   const handleUndo = async () => {
@@ -735,6 +750,7 @@ export const StudioPage: React.FC = () => {
     const controller = new AbortController();
     abortRef.current = controller;
     const seq = contextSeqRef.current;
+    jobOpSeqRef.current += 1;
     const targetJobId = job.jobId;
     const targetRevision = job.currentIR.revision;
 
@@ -942,6 +958,7 @@ export const StudioPage: React.FC = () => {
     }
 
     const seq = contextSeqRef.current;
+    jobOpSeqRef.current += 1;
     setBusyState('saving');
     setUiError(null);
     setSavedResult(null);
@@ -1344,7 +1361,9 @@ export const StudioPage: React.FC = () => {
               <span>{t('studio.progress.label')}</span>
               <Badge text={liveStage.stage} color="blue" />
               <span style={{ color: '#9fa7b3' }}>
-                {STAGE_LABEL_KEYS[liveStage.stage] ? t(STAGE_LABEL_KEYS[liveStage.stage]) : liveStage.stage}
+                {Object.prototype.hasOwnProperty.call(STAGE_LABEL_KEYS, liveStage.stage)
+                  ? t(STAGE_LABEL_KEYS[liveStage.stage])
+                  : liveStage.stage}
               </span>
             </div>
           )}

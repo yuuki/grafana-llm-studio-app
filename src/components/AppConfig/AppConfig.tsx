@@ -250,11 +250,14 @@ export const AppConfig: React.FC<PluginConfigPageProps<AppPluginMeta<StudioJsonD
         }
       }
 
-      // Preserve any existing jsonData fields (H-11) and normalize allowMockInDev=false outside mock mode (M-13).
+      // Preserve any existing jsonData fields (H-11), strip dev-only mockDelayMs (L-1), and normalize allowMockInDev=false outside mock mode (M-13).
       // Only write Redis-specific jsonData/secureJsonData fields when jobStoreBackend === 'redis' so switching
       // back to memory never overwrites saved settings with unvalidated hidden fields or resets redisPassword.
+      const { mockDelayMs: _stripMockDelayMs, ...preservedJsonData } = (jsonData ?? {}) as StudioJsonData & {
+        mockDelayMs?: unknown;
+      };
       const nextJsonData: StudioJsonData = {
-        ...(jsonData ?? {}),
+        ...preservedJsonData,
         allowedDatasourceUids,
         datasourceDialects: cleanedDialects,
         llmMode,

@@ -136,8 +136,8 @@ Browser-side dry-run caps (`now-5m`, `maxDataPoints=10`, concurrency `<= 2`, `10
 
 - **Non-Streaming Baseline (`enableSseProgress: false`, default):** An LLM request waits up to `llmTimeoutSeconds` (default `45s`) and `jobDeadlineSeconds` (default `90s`). Configure reverse-proxy read timeouts to at least `jobDeadlineSeconds` (e.g., `120s`).
 - **Optional SSE Stage-Progress Streaming (`enableSseProgress: true`):**
-  - The backend emits decoupled application-level lifecycle stage events (`generating` -> `validating_ir` -> `awaiting_preview`, or `repairing` -> `validating_ir` -> `awaiting_preview`) plus `: keepalive` comment heartbeats every `15s` over Grafana `CallResource` (`Content-Type: text/event-stream; charset=utf-8`, `Cache-Control: no-cache, no-transform`, `X-Accel-Buffering: no`). Raw LLM tokens and unvalidated JSON fragments are **never** streamed or rendered.
-  - Reverse proxies fronting Grafana **must** disable response buffering on the plugin resource endpoint, use HTTP/1.1 (or HTTP/2 end-to-end without buffering), and align idle timeouts above `jobDeadlineSeconds`:
+  - The backend emits decoupled application-level lifecycle stage events (`generating` -> `validating_ir` -> `awaiting_preview`, or `repairing` -> `validating_ir` -> `awaiting_preview`) plus `: keepalive` comment heartbeats every `15s` over Grafana `CallResource` (`Content-Type: text/event-stream; charset=utf-8`, `X-Accel-Buffering: no`). Note that Grafana's HTTP middleware normalizes `Cache-Control` to `no-store` (dropping `no-transform`), so reverse proxies **must** explicitly set `proxy_buffering off` and `gzip off`. Raw LLM tokens and unvalidated JSON fragments are **never** streamed or rendered.
+  - Reverse proxies fronting Grafana **must** disable response buffering on the plugin resource endpoint, use HTTP/1.1 (or HTTP/2 end-to-end without buffering), and align idle/response timeouts **above** `jobDeadlineSeconds` (e.g., `jobDeadlineSeconds + 30s`, so `210s` for the `180s` maximum). If Grafana runs with `serve_from_sub_path = true`, prefix the location/route path accordingly (e.g., `/grafana/api/plugins/yuuki-llmstudio-app/resources/`).
 
 #### Example Nginx Configuration (Scoped to Studio Resource Endpoints)
 
@@ -153,9 +153,9 @@ location /api/plugins/yuuki-llmstudio-app/resources/ {
     proxy_cache off;
     gzip off;
 
-    # Align idle/read timeouts above jobDeadlineSeconds (default 90s; max 180s):
-    proxy_read_timeout 180s;
-    proxy_send_timeout 180s;
+    # Align idle/read timeouts strictly above jobDeadlineSeconds (default 90s; max 180s -> 210s):
+    proxy_read_timeout 210s;
+    proxy_send_timeout 210s;
 }
 ```
 
@@ -167,8 +167,8 @@ routes:
       prefix: "/api/plugins/yuuki-llmstudio-app/resources/"
     route:
       cluster: grafana_upstream
-      timeout: 180s
-      idle_timeout: 180s
+      timeout: 210s
+      idle_timeout: 210s
 ```
 
-- **Graceful Fallback:** If an admin keeps `enableSseProgress: false`, the backend returns standard `application/json` even if a client sends `Accept: text/event-stream`. If `enableSseProgress: true` is enabled behind a proxy or browser that rejects SSE (`406`/`501`) or lacks streaming support, the Studio frontend automatically falls back to non-streaming JSON requests; if a proxy drops an SSE connection mid-flight after a `jobId` has been emitted, the frontend recovers the validated state via `GET /jobs/{id}` rather than issuing a duplicate LLM request.
+- **Graceful Fallback:** If an admin keeps `enableSseProgress: false`, the backend returns standard `application/json` even if a client sends `Accept: text/event-stream`. If `enableSseProgress: true` is enabled behind a proxy or browser that rejects SSE (`406`/`501`) or lacks streaming support before execution, the Studio frontend automatically falls back to non-streaming JSON requests; if a proxy drops an SSE connection mid-flight after a job has started, the frontend recovers the validated state via `GET /jobs/{id}` (verifying revision advancement on edits/repairs) rather than issuing a duplicate LLM request.

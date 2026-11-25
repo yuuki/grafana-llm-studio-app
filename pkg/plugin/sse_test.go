@@ -94,8 +94,10 @@ func parseSSEFrames(raw string) []parsedSSEFrame {
 type gatedLLMClient struct {
 	delegate     llm.Client
 	entered      chan struct{}
+	enteredOnce  sync.Once
 	release      chan struct{}
 	canceled     chan struct{}
+	canceledOnce sync.Once
 	failErr      error
 	patchFailErr error
 }
@@ -106,12 +108,12 @@ func (g *gatedLLMClient) Enabled(ctx context.Context) (bool, error) {
 
 func (g *gatedLLMClient) GenerateIR(ctx context.Context, req llm.GenerateRequest) ([]byte, llm.CompletionMeta, error) {
 	if g.entered != nil {
-		close(g.entered)
+		g.enteredOnce.Do(func() { close(g.entered) })
 	}
 	select {
 	case <-ctx.Done():
 		if g.canceled != nil {
-			close(g.canceled)
+			g.canceledOnce.Do(func() { close(g.canceled) })
 		}
 		return nil, llm.CompletionMeta{ProviderMode: "mock"}, ctx.Err()
 	case <-g.release:
@@ -166,6 +168,13 @@ func TestWantsEventStream_AcceptParsing(t *testing.T) {
 		{"TEXT/EVENT-STREAM; charset=utf-8", true},
 		{"text/event-stream;q=0, application/json", false},
 		{"text/event-stream;q=0.0", false},
+		{"text/event-stream;q=NaN", false},
+		{"text/event-stream;q=Inf", false},
+		{"text/event-stream;q=-0.5", false},
+		{"text/event-stream;q=1.5", false},
+		{"text/event-stream;q=invalid", false},
+		{`application/json;ext="foo,text/event-stream"`, false},
+		{`application/json;ext="foo,bar", text/event-stream;q=0.8`, true},
 	}
 	for _, tc := range cases {
 		req, _ := http.NewRequest(http.MethodPost, "/jobs/generate", nil)
@@ -510,6 +519,20 @@ func TestApp_SSEClientDisconnectCancelsLLMAndReleasesSlot(t *testing.T) {
 	}
 	if snap.Status != jobs.StatusCancelled {
 		t.Fatalf("expected status=cancelled after client disconnect, got %q", snap.Status)
+	}
+
+	// M-4: Verify per-user concurrency slot (limit=1) was genuinely released on the same App/Store instance.
+	close(gate.release)
+	followUpSender := &streamCaptureSender{}
+	_ = app.CallResource(context.Background(), &backend.CallResourceRequest{
+		PluginContext: testAuthCtx(),
+		Path:          "jobs/generate",
+		Method:        http.MethodPost,
+		Body:          sampleGenerateBody(),
+	}, followUpSender)
+	followUpChunks := followUpSender.snapshot()
+	if len(followUpChunks) != 1 || followUpChunks[0].Status != http.StatusOK {
+		t.Fatalf("expected follow-up Generate after disconnect to succeed (slot released), got %+v", followUpChunks)
 	}
 }
 

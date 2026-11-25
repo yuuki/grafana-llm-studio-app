@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"math"
+	"mime"
 	"net/http"
 	"strconv"
 	"strings"
@@ -19,39 +21,59 @@ const (
 	sseContentType              = "text/event-stream; charset=utf-8"
 )
 
+// splitHeaderOutsideQuotes splits a comma-separated HTTP header value without
+// splitting on commas inside double-quoted parameter strings (RFC 9110).
+func splitHeaderOutsideQuotes(s string) []string {
+	var parts []string
+	start := 0
+	inQuotes := false
+	escaped := false
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if escaped {
+			escaped = false
+			continue
+		}
+		if c == '\\' && inQuotes {
+			escaped = true
+			continue
+		}
+		if c == '"' {
+			inQuotes = !inQuotes
+			continue
+		}
+		if c == ',' && !inQuotes {
+			parts = append(parts, s[start:i])
+			start = i + 1
+		}
+	}
+	parts = append(parts, s[start:])
+	return parts
+}
+
 // wantsEventStream checks whether the HTTP Accept header explicitly accepts text/event-stream
-// with a non-zero quality weight (RFC 9110).
+// with a valid non-zero quality weight (0 < q <= 1) per RFC 9110.
 func wantsEventStream(r *http.Request) bool {
 	if r == nil {
 		return false
 	}
 	for _, headerVal := range r.Header.Values("Accept") {
-		for _, part := range strings.Split(headerVal, ",") {
-			part = strings.TrimSpace(part)
-			if part == "" {
+		for _, rawRange := range splitHeaderOutsideQuotes(headerVal) {
+			rawRange = strings.TrimSpace(rawRange)
+			if rawRange == "" {
 				continue
 			}
-			segments := strings.Split(part, ";")
-			mediaType := strings.ToLower(strings.TrimSpace(segments[0]))
-			if mediaType != "text/event-stream" {
+			mediaType, params, err := mime.ParseMediaType(rawRange)
+			if err != nil || mediaType != "text/event-stream" {
 				continue
 			}
-			accepted := true
-			for _, param := range segments[1:] {
-				k, v, ok := strings.Cut(param, "=")
-				if !ok {
+			if qStr, hasQ := params["q"]; hasQ {
+				q, err := strconv.ParseFloat(strings.TrimSpace(qStr), 64)
+				if err != nil || math.IsNaN(q) || math.IsInf(q, 0) || q <= 0 || q > 1 {
 					continue
 				}
-				if strings.EqualFold(strings.TrimSpace(k), "q") {
-					q, err := strconv.ParseFloat(strings.TrimSpace(v), 64)
-					if err == nil && q <= 0 {
-						accepted = false
-					}
-				}
 			}
-			if accepted {
-				return true
-			}
+			return true
 		}
 	}
 	return false
@@ -86,6 +108,12 @@ func newSSEStreamWriter(ctx context.Context, w http.ResponseWriter, flusher http
 	}
 }
 
+func (s *sseStreamWriter) signalStop() {
+	s.stopOnce.Do(func() {
+		close(s.stopCh)
+	})
+}
+
 func (s *sseStreamWriter) startLocked() {
 	if s.started {
 		return
@@ -117,10 +145,17 @@ func (s *sseStreamWriter) runHeartbeat() {
 			return
 		case <-ticker.C:
 			s.mu.Lock()
-			if !s.closed && s.started && s.ctx.Err() == nil {
-				_, _ = s.w.Write([]byte(": keepalive\n\n"))
-				s.flusher.Flush()
+			if s.closed || !s.started || s.ctx.Err() != nil {
+				s.mu.Unlock()
+				return
 			}
+			if _, err := s.w.Write([]byte(": keepalive\n\n")); err != nil {
+				s.closed = true
+				s.signalStop()
+				s.mu.Unlock()
+				return
+			}
+			s.flusher.Flush()
 			s.mu.Unlock()
 		}
 	}
@@ -129,9 +164,7 @@ func (s *sseStreamWriter) runHeartbeat() {
 // StopHeartbeat terminates the background keepalive goroutine and waits for it to exit
 // before the HTTP handler returns.
 func (s *sseStreamWriter) StopHeartbeat() {
-	s.stopOnce.Do(func() {
-		close(s.stopCh)
-	})
+	s.signalStop()
 	s.wg.Wait()
 }
 
@@ -211,6 +244,10 @@ func (s *sseStreamWriter) FinishError(err error, snap jobs.JobSnapshot) {
 }
 
 func (s *sseStreamWriter) writeEventLocked(eventName string, jsonPayload []byte) {
-	_, _ = fmt.Fprintf(s.w, "event: %s\ndata: %s\n\n", eventName, jsonPayload)
+	if _, err := fmt.Fprintf(s.w, "event: %s\ndata: %s\n\n", eventName, jsonPayload); err != nil {
+		s.closed = true
+		s.signalStop()
+		return
+	}
 	s.flusher.Flush()
 }
