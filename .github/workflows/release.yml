@@ -1,0 +1,121 @@
+# Builds the plugin for a version tag and publishes it as a GitHub release
+# with the archive yuuki-llmstudio-app-<version>.zip (frontend and linux
+# amd64/arm64 backends) and its .zip.sha1. The plugin is unsigned: Grafana
+# loads it only when allow_loading_unsigned_plugins names its ID (README).
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions: {}
+
+# Release jobs restore no caches: a poisoned cache entry would end up in the
+# published plugin archive.
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@v7.1.0
+        with:
+          node-version: '26.13.0'
+          package-manager-cache: false
+
+      - uses: actions/setup-go@v7.0.0
+        with:
+          go-version: '1.27.4'
+          cache: false
+
+      - name: Check the tag against package.json and src/plugin.json
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          for file in package.json src/plugin.json; do
+            version=$(node -p "const j = require('./$file'); j.version ?? j.info.version")
+            if [ "$TAG" != "v$version" ]; then
+              echo "::error::tag $TAG does not match version $version in $file"
+              exit 1
+            fi
+          done
+
+      - name: Install npm dependencies
+        run: npm ci
+
+      - name: Schema sync
+        run: npm run verify:schemas
+
+      - name: Type check
+        run: npm run typecheck
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Test frontend
+        run: npm run test:ci
+
+      - name: Vet backend
+        run: go vet ./pkg/... ./cmd/...
+
+      - name: Test backend
+        run: go test -race ./pkg/... ./cmd/...
+
+  release:
+    needs: test
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: write # gh release create publishes the release and uploads the plugin archive
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false # the release is created with gh and GH_TOKEN, not git push
+
+      - uses: actions/setup-node@v7.1.0
+        with:
+          node-version: '26.13.0'
+          package-manager-cache: false
+
+      - uses: actions/setup-go@v7.0.0
+        with:
+          go-version: '1.27.4'
+          cache: false
+
+      - name: Install npm dependencies
+        run: npm ci
+
+      - name: Build frontend
+        run: |
+          npm run build
+          npm run verify:bundle
+
+      - name: Build backend (linux/amd64, linux/arm64)
+        run: |
+          for arch in amd64 arm64; do
+            CGO_ENABLED=0 GOOS=linux GOARCH="$arch" go build -trimpath -o "dist/gpx_yuuki_llmstudio_app_linux_$arch" ./pkg
+          done
+
+      - name: Package plugin
+        run: |
+          plugin_id=$(node -p 'require("./dist/plugin.json").id')
+          version=$(node -p 'require("./package.json").version')
+          archive="${plugin_id}-${version}.zip"
+          mv dist "$plugin_id"
+          zip -qr "$archive" "$plugin_id"
+          sha1sum "$archive" | cut -d' ' -f1 > "$archive.sha1"
+          echo "ARCHIVE=$archive" >> "$GITHUB_ENV"
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          gh release create "$TAG" --verify-tag --title "$TAG" --generate-notes \
+            "$ARCHIVE" "$ARCHIVE.sha1"
