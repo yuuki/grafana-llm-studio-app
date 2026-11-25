@@ -10,7 +10,7 @@ service account token or the Redis password (for example by pointing
 the IR and query validators through a prompt, metric metadata or LLM output;
 overwrite a dashboard without asking; or disrupt the plugin backend with
 crafted requests are treated as vulnerabilities. So are weaknesses in how the
-release archive is built.
+release archives are built, signed or checksummed.
 
 Out of scope: the Docker Compose development stack and its default
 credentials, the development mock LLM mode, the cost or the quality of what a

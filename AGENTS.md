@@ -25,12 +25,13 @@
 - Settings `jsonData`/`secureJsonData` keys, defaults and bounds: `pkg/plugin/settings.go` ↔ `src/components/AppConfig/`, the README table; `PublicConfig` never carries a secret.
 - Redis job records and keys under `{redisKeyPrefix}` (`pkg/jobs/redis_store.go`): replicas of two versions share them during a rolling upgrade.
 - Saved and exported dashboard JSON (`src/spec/toFoundation.ts`, `src/save/saveDashboard.ts`); `llm-bench` flags and report (`cmd/llm-bench`, `pkg/bench`).
-- Release archive `yuuki-llmstudio-app-<version>.zip` (`release.yml`); the tag matches `version` in `package.json` and `src/plugin.json`.
+- Release assets `yuuki-llmstudio-app-<version>.zip`, `.tar.gz`, `.zip.sha1`, `-airgap.tar.gz` and `SHA256SUMS`, with five backend targets (`scripts/package-release.mjs`, `scripts/build-backend.mjs`, `release.yml`); the tag matches `version` in `package.json` and `src/plugin.json`.
 
 ## Before opening a pull request
 - `npm ci`, then `make check`; also `make test-integration` with `GRAFANA_VERSION=13.3.1` and `12.4.15` (Docker) for pages, routes, SSE, `deploy/` or `tests/`.
 - Decoders, validators, schemas or settings parsing: also `make test-fuzz`; dependencies: also `make vuln vuln-deps`.
 - `pkg/llm`, prompts or structured-output settings: also `make verify-llm-protocol` (real `grafana-llm-app` containers).
+- Release scripts or `release.yml`: also `make package-airgap`; user-visible changes: an entry under `[Unreleased]` in `CHANGELOG.md`.
 - `src/plugin.json`: restart Grafana (it reads the file only at start) and say so in the PR.
 
 ## Git conventions

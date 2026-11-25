@@ -46,6 +46,10 @@ jobs:
       - name: Test
         run: npm run test:ci
 
+      # node --test for the release packaging helpers (scripts/release-lib.mjs).
+      - name: Release packaging helper tests
+        run: npm run test:release
+
   backend:
     runs-on: ubuntu-latest
     timeout-minutes: 15

@@ -29,6 +29,7 @@ explains when each one is needed and lists the compatibility contracts (IR
 schemas, resource routes, settings keys, plugin ID) that must not change
 silently.
 
+Note user-visible changes under `[Unreleased]` in [CHANGELOG.md](CHANGELOG.md).
 A material design decision gets an ADR in [`docs/adr/`](docs/adr/).
 
 ## Commit messages

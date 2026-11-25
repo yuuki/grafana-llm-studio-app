@@ -5,6 +5,8 @@
   "private": true,
   "scripts": {
     "build": "webpack --mode production",
+    "build:backend": "node scripts/build-backend.mjs",
+    "build:backend:all": "node scripts/build-backend.mjs --all",
     "dev": "webpack --mode development --watch",
     "typecheck": "tsc --noEmit && tsc --noEmit -p tsconfig.e2e.json",
     "lint": "eslint --cache .",
@@ -12,8 +14,13 @@
     "test": "jest --runInBand",
     "test:ci": "jest --ci --runInBand",
     "test:e2e": "playwright test",
+    "test:release": "node --test scripts/release-lib.test.mjs",
+    "sign": "sign-plugin",
+    "package": "node scripts/package-release.mjs",
+    "package:airgap": "node scripts/package-release.mjs --airgap",
     "verify:schemas": "node scripts/verify-schema-sync.mjs",
-    "verify:bundle": "node scripts/verify-bundle.mjs"
+    "verify:bundle": "node scripts/verify-bundle.mjs",
+    "verify:release": "node scripts/verify-release.mjs"
   },
   "dependencies": {
     "@emotion/css": "11.13.5",
@@ -34,6 +41,7 @@
     "@grafana/e2e-selectors": "12.4.15",
     "@grafana/eslint-config": "10.0.0",
     "@grafana/plugin-e2e": "4.1.1",
+    "@grafana/sign-plugin": "3.3.3",
     "@playwright/test": "1.65.1",
     "@stylistic/eslint-plugin": "5.10.0",
     "@testing-library/jest-dom": "6.6.3",

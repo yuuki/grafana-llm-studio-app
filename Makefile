@@ -35,7 +35,6 @@ GH_ACTIONS_LOCK ?= $(GO_RUN) github.com/github/gh-actions-lock/cmd/gh-actions-lo
 OSV_SCANNER ?= $(GO_RUN) github.com/google/osv-scanner/v2/cmd/osv-scanner@$(OSV_SCANNER_VERSION)
 
 COMPOSE := docker compose -f deploy/docker-compose.yml
-BACKEND_BINARY := dist/gpx_yuuki_llmstudio_app_linux_amd64
 
 # `npm ci` writes this file, so dependencies are reinstalled only when the lockfile changes.
 NODE_MODULES := node_modules/.package-lock.json
@@ -45,18 +44,19 @@ SHELL := bash
 .SHELLFLAGS := -eu -o pipefail -c
 
 .DEFAULT_GOAL := help
-.PHONY: help check verify build build-frontend build-backend build-bench clean \
+.PHONY: help check verify build build-frontend build-backend build-backend-all build-bench clean \
+	sign package package-airgap verify-package \
 	lint lint-go lint-frontend vet typecheck fmt lint-actions lock-actions \
 	verify-schemas verify-bundle verify-sse verify-llm-protocol \
-	test test-go test-race test-ts test-frontend test-e2e test-integration test-fuzz bench \
+	test test-go test-race test-ts test-frontend test-release test-e2e test-integration test-fuzz bench \
 	vuln vuln-deps vuln-deps-sarif complexity
 
 help: ## List the targets
 	@awk 'BEGIN {FS = ":.*## "} /^[a-zA-Z0-9_-]+:.*## / {printf "  %-20s %s\n", $$1, $$2}' $(MAKEFILE_LIST)
 
-check: lint lint-actions verify-schemas test-race test-frontend build ## Local pre-PR gate: the required PR CI minus the live E2E stack
+check: lint lint-actions verify-schemas test-race test-frontend test-release build ## Local pre-PR gate: the required PR CI minus the live E2E stack
 
-verify: verify-schemas vet typecheck test-race test-frontend build ## Schema sync, vet, type check, unit tests and the plugin build (`make check` adds the linters)
+verify: verify-schemas vet typecheck test-race test-frontend test-release build ## Schema sync, vet, type check, unit tests and the plugin build (`make check` adds the linters)
 
 build: build-frontend build-backend ## Build the plugin into dist/ (frontend bundle, bundle check, linux/amd64 backend)
 
@@ -65,15 +65,31 @@ build-frontend: $(NODE_MODULES) ## Production frontend bundle (webpack) and its 
 	npm run verify:bundle
 
 build-backend: ## Backend binary for linux/amd64 (dist/gpx_yuuki_llmstudio_app_linux_amd64)
-	mkdir -p dist
-	CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o $(BACKEND_BINARY) ./pkg
+	node scripts/build-backend.mjs --targets linux/amd64
+
+build-backend-all: ## Backend binaries for every release target (linux, darwin, windows)
+	node scripts/build-backend.mjs --all
+
+sign: $(NODE_MODULES) ## Sign dist/ with @grafana/sign-plugin (needs GRAFANA_ACCESS_POLICY_TOKEN)
+	npm run sign
+
+package: build-frontend build-backend-all ## Release archives, .zip.sha1 and SHA256SUMS in release/ (signed when a token is set), then verify them
+	node scripts/package-release.mjs --sign auto
+	node scripts/verify-release.mjs
+
+package-airgap: build-frontend build-backend-all ## `make package` plus the offline -airgap.tar.gz bundle
+	node scripts/package-release.mjs --sign auto --airgap
+	node scripts/verify-release.mjs --airgap
+
+verify-package: ## Verify the archives and checksums in release/
+	node scripts/verify-release.mjs
 
 build-bench: ## llm-bench CLI (bin/llm-bench)
 	mkdir -p bin
 	go build -o bin/llm-bench ./cmd/llm-bench
 
 clean: ## Remove build outputs
-	rm -rf dist bin
+	rm -rf dist bin release
 
 lint: lint-go lint-frontend ## All linters: Go and frontend
 
@@ -124,7 +140,7 @@ verify-llm-protocol: build-bench ## Wire checks through real grafana-llm-app con
 		$(COMPOSE) -f deploy/docker-compose.bench-verify.yml down -v; \
 		exit $$status
 
-test: test-go test-frontend ## All unit tests: Go and frontend
+test: test-go test-frontend test-release ## All unit tests: Go, frontend and the release scripts
 
 test-go: ## Go unit tests
 	go test $(GO_PACKAGES)
@@ -136,6 +152,9 @@ test-ts: test-frontend
 
 test-frontend: $(NODE_MODULES) ## Frontend unit and parity tests (Jest)
 	npm run test:ci
+
+test-release: ## Release packaging helper tests (node --test)
+	npm run test:release
 
 test-e2e: $(NODE_MODULES) ## Playwright tests against a running stack (GRAFANA_URL, default http://127.0.0.1:3000)
 	npm run test:e2e

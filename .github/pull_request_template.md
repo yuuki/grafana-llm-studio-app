@@ -10,7 +10,7 @@
 
 - [ ] `make check` passes
 - [ ] Tests cover the behaviour change
-- [ ] Docs (README, docs/, ADRs, AGENTS.md) updated where needed
+- [ ] Docs (README, docs/, ADRs, AGENTS.md) and CHANGELOG.md updated where needed
 - [ ] Public contracts (IR and patch schemas, resource routes and their JSON, settings keys, Redis job records, plugin ID) unchanged, or the change is called out above
 - [ ] `src/plugin.json` changes noted (Grafana needs a restart)
 - [ ] AI-assisted changes were reviewed by a human

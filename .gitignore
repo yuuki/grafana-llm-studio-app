@@ -18,3 +18,5 @@ bench-results/
 bench.txt
 osv-scanner.sarif
 .cccc.cache
+release/
+*.zip

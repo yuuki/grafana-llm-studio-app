@@ -1,121 +1,422 @@
-# Builds the plugin for a version tag and publishes it as a GitHub release
-# with the archive yuuki-llmstudio-app-<version>.zip (frontend and linux
-# amd64/arm64 backends) and its .zip.sha1. The plugin is unsigned: Grafana
-# loads it only when allow_loading_unsigned_plugins names its ID (README).
 name: Release
 
 on:
   push:
     tags:
-      - 'v*'
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      signing_mode:
+        description: "Grafana plugin signing mode"
+        type: choice
+        default: auto
+        options:
+          - auto
+          - off
+          - community
+          - private
+      include_airgap_bundle:
+        description: "Build optional offline air-gapped bundle (-airgap.tar.gz)"
+        type: boolean
+        default: true
+      run_plugin_validator:
+        description: "Run Grafana plugin-validator-cli report against packaged ZIP"
+        type: boolean
+        default: true
+      publish_release:
+        description: "Create a GitHub Release (tags always publish; dispatch defaults to dry-run)"
+        type: boolean
+        default: false
 
-permissions: {}
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
 
 # Release jobs restore no caches: a poisoned cache entry would end up in the
-# published plugin archive.
+# published plugin archives.
 jobs:
-  test:
+  verify:
+    name: Verify Release Readiness
     runs-on: ubuntu-latest
-    timeout-minutes: 20
-    permissions:
-      contents: read
+    timeout-minutes: 15
+    outputs:
+      version: ${{ steps.meta.outputs.version }}
+      prerelease: ${{ steps.meta.outputs.prerelease }}
+      source_date_epoch: ${{ steps.meta.outputs.source_date_epoch }}
+
     steps:
-      - uses: actions/checkout@v7.0.1
+      - name: Checkout repository
+        uses: actions/checkout@v7.0.1
         with:
           persist-credentials: false
 
-      - uses: actions/setup-node@v7.1.0
+      - name: Set up Node.js
+        uses: actions/setup-node@v7.1.0
         with:
-          node-version: '26.13.0'
+          node-version: "26.13.0"
           package-manager-cache: false
 
-      - uses: actions/setup-go@v7.0.0
+      - name: Set up Go
+        uses: actions/setup-go@v7.0.0
         with:
-          go-version: '1.27.4'
+          go-version-file: go.mod
           cache: false
 
-      - name: Check the tag against package.json and src/plugin.json
+      - name: Validate version and release tag metadata
+        id: meta
         env:
-          TAG: ${{ github.ref_name }}
+          EVENT_NAME: ${{ github.event_name }}
+          REF_NAME: ${{ github.ref_name }}
         run: |
-          for file in package.json src/plugin.json; do
-            version=$(node -p "const j = require('./$file'); j.version ?? j.info.version")
-            if [ "$TAG" != "v$version" ]; then
-              echo "::error::tag $TAG does not match version $version in $file"
-              exit 1
-            fi
-          done
+          node --input-type=module -e '
+            import fs from "node:fs";
+            import { execFileSync } from "node:child_process";
+            import { validateVersionConsistency } from "./scripts/release-lib.mjs";
 
-      - name: Install npm dependencies
+            const pkg = JSON.parse(fs.readFileSync("package.json", "utf8"));
+            const plugin = JSON.parse(fs.readFileSync("src/plugin.json", "utf8"));
+            const gitTag = process.env.EVENT_NAME === "push" ? process.env.REF_NAME : undefined;
+
+            const version = validateVersionConsistency({
+              packageVersion: pkg.version,
+              pluginJsonVersion: plugin.info?.version,
+              gitTag,
+            });
+            const prerelease = version.includes("-") ? "true" : "false";
+            const epoch = execFileSync("git", ["log", "-1", "--format=%ct"], { encoding: "utf8" }).trim();
+
+            fs.appendFileSync(process.env.GITHUB_OUTPUT, `version=${version}\n`);
+            fs.appendFileSync(process.env.GITHUB_OUTPUT, `prerelease=${prerelease}\n`);
+            fs.appendFileSync(process.env.GITHUB_OUTPUT, `source_date_epoch=${epoch}\n`);
+            console.log(`Validated release metadata: version=${version}, prerelease=${prerelease}, epoch=${epoch}`);
+          '
+
+      - name: Install Node.js dependencies
         run: npm ci
 
-      - name: Schema sync
+      - name: Verify schema sync
         run: npm run verify:schemas
 
-      - name: Type check
+      - name: TypeScript typecheck
         run: npm run typecheck
 
-      - name: Lint
+      - name: ESLint
         run: npm run lint
 
-      - name: Test frontend
+      - name: Run Jest unit & parity tests
         run: npm run test:ci
 
-      - name: Vet backend
-        run: go vet ./pkg/... ./cmd/...
+      - name: Run release packaging helper tests
+        run: npm run test:release
 
-      - name: Test backend
-        run: go test -race ./pkg/... ./cmd/...
-
-  release:
-    needs: test
-    runs-on: ubuntu-latest
-    timeout-minutes: 20
-    permissions:
-      contents: write # gh release create publishes the release and uploads the plugin archive
-    steps:
-      - uses: actions/checkout@v7.0.1
-        with:
-          persist-credentials: false # the release is created with gh and GH_TOKEN, not git push
-
-      - uses: actions/setup-node@v7.1.0
-        with:
-          node-version: '26.13.0'
-          package-manager-cache: false
-
-      - uses: actions/setup-go@v7.0.0
-        with:
-          go-version: '1.27.4'
-          cache: false
-
-      - name: Install npm dependencies
-        run: npm ci
-
-      - name: Build frontend
+      - name: Build & verify frontend bundle
         run: |
           npm run build
           npm run verify:bundle
 
-      - name: Build backend (linux/amd64, linux/arm64)
+      - name: Go vet & race tests
         run: |
-          for arch in amd64 arm64; do
-            CGO_ENABLED=0 GOOS=linux GOARCH="$arch" go build -trimpath -o "dist/gpx_yuuki_llmstudio_app_linux_$arch" ./pkg
-          done
+          go vet ./pkg/... ./cmd/...
+          go test -race -count=1 ./pkg/... ./cmd/...
 
-      - name: Package plugin
-        run: |
-          plugin_id=$(node -p 'require("./dist/plugin.json").id')
-          version=$(node -p 'require("./package.json").version')
-          archive="${plugin_id}-${version}.zip"
-          mv dist "$plugin_id"
-          zip -qr "$archive" "$plugin_id"
-          sha1sum "$archive" | cut -d' ' -f1 > "$archive.sha1"
-          echo "ARCHIVE=$archive" >> "$GITHUB_ENV"
+  build-backend:
+    name: Build Backend (${{ matrix.goos }}/${{ matrix.goarch }})
+    needs: verify
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - goos: linux
+            goarch: amd64
+          - goos: linux
+            goarch: arm64
+          - goos: darwin
+            goarch: amd64
+          - goos: darwin
+            goarch: arm64
+          - goos: windows
+            goarch: amd64
 
-      - name: Create GitHub release
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v7.1.0
+        with:
+          node-version: "26.13.0"
+          package-manager-cache: false
+
+      - name: Set up Go
+        uses: actions/setup-go@v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: false
+
+      - name: Cross-compile Go backend (${{ matrix.goos }}/${{ matrix.goarch }})
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TAG: ${{ github.ref_name }}
+          RELEASE_VERSION: ${{ needs.verify.outputs.version }}
+          SOURCE_DATE_EPOCH: ${{ needs.verify.outputs.source_date_epoch }}
+          TARGET_OS: ${{ matrix.goos }}
+          TARGET_ARCH: ${{ matrix.goarch }}
         run: |
-          gh release create "$TAG" --verify-tag --title "$TAG" --generate-notes \
-            "$ARCHIVE" "$ARCHIVE.sha1"
+          node scripts/build-backend.mjs \
+            --targets "${TARGET_OS}/${TARGET_ARCH}" \
+            --version "${RELEASE_VERSION}" \
+            --out-dir "build-bin/${TARGET_OS}_${TARGET_ARCH}"
+
+      - name: Upload backend binary artifact
+        uses: actions/upload-artifact@v7.0.2
+        with:
+          name: backend-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: build-bin/${{ matrix.goos }}_${{ matrix.goarch }}/
+          retention-days: 1
+
+  package:
+    name: Sign, Package & Verify Release Artifacts
+    needs: [verify, build-backend]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    outputs:
+      signed: ${{ steps.pkg.outputs.signed }}
+      signature_type: ${{ steps.pkg.outputs.signature_type }}
+      include_airgap: ${{ steps.pkg.outputs.include_airgap }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v7.1.0
+        with:
+          node-version: "26.13.0"
+          package-manager-cache: false
+
+      - name: Install Node.js dependencies
+        run: npm ci
+
+      - name: Build & verify frontend bundle
+        run: |
+          npm run build
+          npm run verify:bundle
+
+      - name: Download all cross-compiled Go backend binaries
+        uses: actions/download-artifact@v8.0.2
+        with:
+          pattern: backend-*
+          merge-multiple: true
+          path: dist/
+
+      - name: Sign & package multi-arch plugin archives, checksums, and optional air-gapped bundle
+        id: pkg
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REF_NAME: ${{ github.ref_name }}
+          RELEASE_VERSION: ${{ needs.verify.outputs.version }}
+          SOURCE_DATE_EPOCH: ${{ needs.verify.outputs.source_date_epoch }}
+          INPUT_SIGNING_MODE: ${{ inputs.signing_mode }}
+          VAR_SIGNING_MODE: ${{ vars.GRAFANA_PLUGIN_SIGNING_MODE }}
+          VAR_REQUIRE_SIGNED: ${{ vars.GRAFANA_REQUIRE_SIGNED_RELEASE }}
+          INPUT_AIRGAP: ${{ inputs.include_airgap_bundle }}
+          VAR_BUILD_AIRGAP: ${{ vars.BUILD_AIRGAP_BUNDLE }}
+          GRAFANA_ACCESS_POLICY_TOKEN: ${{ secrets.GRAFANA_ACCESS_POLICY_TOKEN }}
+          GRAFANA_PLUGIN_ROOT_URLS: ${{ vars.GRAFANA_PLUGIN_ROOT_URLS }}
+        run: |
+          SIGN_MODE="auto"
+          if [ "${EVENT_NAME}" = "workflow_dispatch" ] && [ -n "${INPUT_SIGNING_MODE}" ]; then
+            SIGN_MODE="${INPUT_SIGNING_MODE}"
+          elif [ -n "${VAR_SIGNING_MODE}" ]; then
+            SIGN_MODE="${VAR_SIGNING_MODE}"
+          fi
+
+          INCLUDE_AIRGAP="true"
+          if [ "${EVENT_NAME}" = "workflow_dispatch" ]; then
+            INCLUDE_AIRGAP="${INPUT_AIRGAP:-true}"
+          elif [ "${VAR_BUILD_AIRGAP}" = "false" ]; then
+            INCLUDE_AIRGAP="false"
+          fi
+
+          ARGS=(--version "${RELEASE_VERSION}" --sign "${SIGN_MODE}" --out-dir release)
+          if [ "${EVENT_NAME}" = "push" ]; then
+            ARGS+=(--tag "${REF_NAME}")
+          fi
+          ENFORCE_SIGNED="false"
+          if [ "${VAR_REQUIRE_SIGNED}" = "true" ] && { [ "${EVENT_NAME}" = "push" ] || [ "${SIGN_MODE}" != "off" ]; }; then
+            ENFORCE_SIGNED="true"
+            ARGS+=(--require-signed)
+          fi
+          if [ "${INCLUDE_AIRGAP}" = "true" ]; then
+            ARGS+=(--airgap)
+          fi
+
+          node scripts/package-release.mjs "${ARGS[@]}"
+
+          VERIFY_ARGS=(--out-dir release --version "${RELEASE_VERSION}")
+          if [ "${INCLUDE_AIRGAP}" = "true" ]; then
+            VERIFY_ARGS+=(--airgap)
+          fi
+          if [ -f "dist/MANIFEST.txt" ] || [ "${ENFORCE_SIGNED}" = "true" ]; then
+            VERIFY_ARGS+=(--require-signed)
+          fi
+          node scripts/verify-release.mjs "${VERIFY_ARGS[@]}"
+
+          # Verify SHA256SUMS using standard GNU sha256sum utility as well
+          (cd release && sha256sum -c SHA256SUMS)
+
+          if [ -f "dist/MANIFEST.txt" ]; then
+            SIG_TYPE=$(node --input-type=module -e '
+              import { verifySignedManifest } from "./scripts/release-lib.mjs";
+              const m = verifySignedManifest("dist");
+              process.stdout.write(m.signatureType || "signed");
+            ')
+            echo "signed=true" >> "${GITHUB_OUTPUT}"
+            echo "signature_type=${SIG_TYPE}" >> "${GITHUB_OUTPUT}"
+          else
+            echo "signed=false" >> "${GITHUB_OUTPUT}"
+            echo "signature_type=unsigned" >> "${GITHUB_OUTPUT}"
+          fi
+          echo "include_airgap=${INCLUDE_AIRGAP}" >> "${GITHUB_OUTPUT}"
+
+      - name: Run Grafana Plugin Validator (informational catalog readiness check)
+        if: github.event_name != 'workflow_dispatch' || inputs.run_plugin_validator != false
+        continue-on-error: true
+        env:
+          RELEASE_VERSION: ${{ needs.verify.outputs.version }}
+        run: |
+          ZIP_FILE="yuuki-llmstudio-app-${RELEASE_VERSION}.zip"
+          echo "### Grafana Plugin Validator Report (\`${ZIP_FILE}\`)" >> "${GITHUB_STEP_SUMMARY}"
+          echo '```text' >> "${GITHUB_STEP_SUMMARY}"
+          docker run --rm \
+            -v "${PWD}/release:/release:ro" \
+            -v "${PWD}:/src:ro" \
+            grafana/plugin-validator-cli \
+            -sourceCodeUri "file:///src" \
+            "/release/${ZIP_FILE}" 2>&1 | tee -a "${GITHUB_STEP_SUMMARY}"
+          echo '```' >> "${GITHUB_STEP_SUMMARY}"
+
+      - name: Write packaging summary
+        env:
+          RELEASE_VERSION: ${{ needs.verify.outputs.version }}
+          SIGNED: ${{ steps.pkg.outputs.signed }}
+          SIGNATURE_TYPE: ${{ steps.pkg.outputs.signature_type }}
+          INCLUDE_AIRGAP: ${{ steps.pkg.outputs.include_airgap }}
+        run: |
+          {
+            echo "## Release Packaging Summary (\`yuuki-llmstudio-app\` v${RELEASE_VERSION})"
+            echo "- **Signature status:** \`${SIGNATURE_TYPE}\` (signed=\`${SIGNED}\`)"
+            echo "- **Air-gapped bundle included:** \`${INCLUDE_AIRGAP}\`"
+            echo "- **Targets:** \`linux/amd64\`, \`linux/arm64\`, \`darwin/amd64\`, \`darwin/arm64\`, \`windows/amd64\`"
+            echo ""
+            echo "### SHA256SUMS"
+            echo '```text'
+            cat release/SHA256SUMS
+            echo '```'
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+      - name: Upload release artifacts
+        uses: actions/upload-artifact@v7.0.2
+        with:
+          name: release-yuuki-llmstudio-app-${{ needs.verify.outputs.version }}
+          path: release/
+          retention-days: 14
+
+  publish:
+    name: Publish GitHub Release
+    needs: [verify, package]
+    if: startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && inputs.publish_release == true)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download release artifacts
+        uses: actions/download-artifact@v8.0.2
+        with:
+          name: release-yuuki-llmstudio-app-${{ needs.verify.outputs.version }}
+          path: release/
+
+      - name: Re-verify SHA256SUMS before publishing
+        run: |
+          cd release
+          sha256sum -c SHA256SUMS
+
+      - name: Create or update GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          RELEASE_VERSION: ${{ needs.verify.outputs.version }}
+          PRERELEASE: ${{ needs.verify.outputs.prerelease }}
+          SIGNED: ${{ needs.package.outputs.signed }}
+          SIGNATURE_TYPE: ${{ needs.package.outputs.signature_type }}
+          INCLUDE_AIRGAP: ${{ needs.package.outputs.include_airgap }}
+          EVENT_NAME: ${{ github.event_name }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          TAG="v${RELEASE_VERSION}"
+          if [ "${EVENT_NAME}" = "push" ]; then
+            TAG="${REF_NAME}"
+          fi
+
+          if [ "${SIGNED}" = "true" ]; then
+            SIGN_NOTE="Signed Grafana plugin (\`signatureType: ${SIGNATURE_TYPE}\`) with verified \`MANIFEST.txt\`. \`allow_loading_unsigned_plugins\` is **not** required."
+          else
+            SIGN_NOTE="Unsigned plugin archive (pre-approval or \`GRAFANA_ACCESS_POLICY_TOKEN\` not configured). Configure \`allow_loading_unsigned_plugins = yuuki-llmstudio-app\` in \`grafana.ini\` or sign before production rollout — see \`docs/plugin-signing-and-publishing.md\`."
+          fi
+
+          {
+            echo "## LLM Dashboard Studio (\`yuuki-llmstudio-app\`) ${TAG}"
+            echo ""
+            echo "- **Supported Grafana OSS versions:** \`13.3.1\` (React 19) and \`12.4.15\` (React 18) (\`>=12.4.0 <14.0.0\`)"
+            echo "- **Bundled Go backend targets:** \`linux/amd64\`, \`linux/arm64\`, \`darwin/amd64\`, \`darwin/arm64\`, \`windows/amd64\`"
+            echo "- **Plugin signature:** ${SIGN_NOTE}"
+            echo ""
+            echo "### Verification & Installation"
+            echo ""
+            echo '```bash'
+            echo "sha256sum -c SHA256SUMS"
+            echo "unzip -q yuuki-llmstudio-app-${RELEASE_VERSION}.zip -d /var/lib/grafana/plugins"
+            echo "# or:"
+            echo "tar -xzf yuuki-llmstudio-app-${RELEASE_VERSION}.tar.gz -C /var/lib/grafana/plugins"
+            echo '```'
+            if [ "${INCLUDE_AIRGAP}" = "true" ]; then
+              echo ""
+              echo "### Offline / Air-Gapped Bundle"
+              echo ""
+              echo "\`yuuki-llmstudio-app-${RELEASE_VERSION}-airgap.tar.gz\` bundles the multi-architecture plugin archives, plugin \`SHA256SUMS\`, canonical IR/Patch JSON schemas, hardened offline \`grafana.ini\` template, \`BUNDLE-MANIFEST.json\`, and offline installation docs."
+            fi
+            echo ""
+            echo "### SHA256SUMS"
+            echo ""
+            echo '```text'
+            cat release/SHA256SUMS
+            echo '```'
+          } > release-notes.md
+
+          if gh release view "${TAG}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
+            gh release upload "${TAG}" release/* --repo "${GITHUB_REPOSITORY}" --clobber
+            gh release edit "${TAG}" --repo "${GITHUB_REPOSITORY}" --notes-file release-notes.md
+          else
+            CREATE_ARGS=(
+              release create "${TAG}" release/*
+              --repo "${GITHUB_REPOSITORY}"
+              --title "yuuki-llmstudio-app ${TAG}"
+              --notes-file release-notes.md
+            )
+            if [ "${EVENT_NAME}" != "push" ]; then
+              CREATE_ARGS+=(--target "${GITHUB_SHA}")
+            fi
+            if [ "${PRERELEASE}" = "true" ]; then
+              CREATE_ARGS+=(--prerelease)
+            fi
+            gh "${CREATE_ARGS[@]}"
+          fi
