@@ -136,7 +136,7 @@ Configured via **Administration → Plugins → LLM Dashboard Studio** (`jsonDat
 | `maxConcurrentJobs` | `jsonData` | `4` | `1..16` | Global concurrent LLM job cap per Grafana organization (per-user cap is `1`) |
 | `validationTimeoutSeconds` | `jsonData` | `10` | `2..30` | Per-panel dry-run query timeout |
 | `maxConcurrentQueries` | `jsonData` | `2` | `1..4` | Concurrent dry-run query cap in the browser |
-| `jobStoreBackend` | `jsonData` | `"memory"` | `"memory"`, `"redis"` | Job storage backend (`"memory"` zero-dependency default; `"redis"` for HA multi-replica persistence) |
+| `jobStoreBackend` | `jsonData` | `"memory"` | `"memory"`, `"redis"`, `"postgres"` | Job storage backend (`"memory"` zero-dependency default; `"redis"` or `"postgres"` for HA multi-replica persistence) |
 | `jobTtlMinutes` | `jsonData` | `30` | `1..1440` | Automatic expiration TTL (minutes) for idle draft jobs |
 | `redisAddr` | `jsonData` | *(unset)* | `host:port` or `[ipv6]:port` | Single-endpoint Redis/Valkey server or cluster proxy address (required when `jobStoreBackend="redis"`; no URL scheme, whitespace, or credentials) |
 | `redisDb` | `jsonData` | `0` | `0..15` | Redis logical database index (use `0` when connecting through a Redis Cluster proxy) |
@@ -144,6 +144,13 @@ Configured via **Administration → Plugins → LLM Dashboard Studio** (`jsonDat
 | `redisTls` | `jsonData` | `false` | `boolean` | Enable TLS (minimum TLS 1.2) using the container/host system CA trust store |
 | `redisUsername` | `jsonData` | *(unset)* | `<= 128` chars | Optional Redis 6+ ACL username |
 | `redisPassword` | `secureJsonData` | *(unset)* | Encrypted secret | Optional Redis password stored encrypted in `secureJsonData` (never exposed to browser) |
+| `postgresAddr` | `jsonData` | *(unset)* | `host:port` or `[ipv6]:port` | Single-endpoint PostgreSQL server address (required when `jobStoreBackend="postgres"`; can share Grafana's PostgreSQL server; no URL scheme, whitespace, or credentials) |
+| `postgresDatabase` | `jsonData` | *(unset)* | `1..63` chars (no whitespace) | Target PostgreSQL database name (required when `jobStoreBackend="postgres"`) |
+| `postgresSchema` | `jsonData` | `"public"` | `[a-zA-Z_][a-zA-Z0-9_]{0,62}` | PostgreSQL schema where plugin tables are auto-created (use a dedicated schema such as `llm_studio` when sharing Grafana's database) |
+| `postgresTablePrefix` | `jsonData` | `"llm_studio_"` | `[a-zA-Z_][a-zA-Z0-9_]{0,31}` | Prefix for plugin-owned PostgreSQL tables (`<prefix>jobs`, `<prefix>slots`) |
+| `postgresUsername` | `jsonData` | *(unset)* | `1..128` chars | PostgreSQL login username (required when `jobStoreBackend="postgres"`) |
+| `postgresPassword` | `secureJsonData` | *(unset)* | Encrypted secret | Optional PostgreSQL password stored encrypted in `secureJsonData` (never exposed to browser) |
+| `postgresSslMode` | `jsonData` | `"prefer"` | `"disable"`, `"prefer"`, `"require"`, `"verify-ca"`, `"verify-full"` | PostgreSQL TLS transport mode (minimum TLS 1.2; use `require`, `verify-ca`, or `verify-full` in production) |
 
 ## Security & Trust Boundaries
 
@@ -199,14 +206,14 @@ GitHub Actions (`.github/workflows/ci.yml`) runs all verification checks plus th
 ├── tests/e2e/              # Live Playwright / @grafana/plugin-e2e tests
 ├── schemas/                # Canonical Dashboard IR & Patch JSON Schemas and sample payloads
 ├── scripts/                # Schema sync verifier, bundle verifier, and E2E stack readiness helper
-├── deploy/                 # Local Docker Compose stack (+ optional OpenAI override), Prometheus config, sample exporter, provisioning templates
+├── deploy/                 # Local Docker Compose stack (+ optional OpenAI/Redis/Postgres overlays), Prometheus config, sample exporter, provisioning templates
 └── docs/                   # Architecture, compatibility matrix, air-gapped & OpenAI-compatible API guides, and ADRs
 ```
 
 ## Known Limitations (MVP Scope)
 
 - **Scope:** Single Grafana organization, Prometheus-compatible datasources only, `timeseries` and `stat` panels only, fixed grid layout, auto-refresh disabled, non-streaming LLM requests. (Loki, Tempo, ClickHouse, template variables, repeat panels, existing dashboard import, GitOps sync, and MCP/tool execution are out of scope for MVP.)
-- **Job State Persistence:** Defaults to process-local in-memory storage (`jobStoreBackend: "memory"`). For multi-replica HA Grafana deployments or restart persistence, enable `jobStoreBackend: "redis"` (see `deploy/docker-compose.redis.yml` for a local overlay).
+- **Job State Persistence:** Defaults to process-local in-memory storage (`jobStoreBackend: "memory"`). For multi-replica HA Grafana deployments or restart persistence, enable `jobStoreBackend: "redis"` (`deploy/docker-compose.redis.yml`) or `jobStoreBackend: "postgres"` (`deploy/docker-compose.postgres.yml`, which can share Grafana's own PostgreSQL server using a dedicated schema or table prefix).
 - **`grafana-llm-app` JSON Schema Proxy Behavior:** `grafana-llm-app` (`v1.0.8` / `v1.2.0`) unmarshals `response_format.json_schema.schema` into `go-openai/jsonschema.Definition`, which strips numeric/length/regex keywords and `extra_body`. Structure, `additionalProperties: false`, and string enums are enforced via structured outputs (or system-prompt schema in `json_object` mode), while bounds, regexes, PromQL AST rules, and catalog membership are deterministically re-enforced in the Go backend.
 - **Verification Coverage:** Automated unit tests, Scenes/Foundation parity tests, bundle externalization checks (`verify:bundle`), `grafana-llm-app` HTTP contract tests, and live Playwright / `@grafana/plugin-e2e` tests against running Grafana `13.3.1` (React 19) and `12.4.15` (React 18) containers (in mock mode with live Prometheus) run in GitHub Actions CI. Live LLM inference backends (vLLM or OpenAI-compatible APIs via `grafana-llm-app`) should still be validated in your target environment before production rollout.
 

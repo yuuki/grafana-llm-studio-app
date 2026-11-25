@@ -215,7 +215,8 @@ type RecordEditFailureParams struct {
 // TTL-based expiration across single-process or multi-replica HA deployments.
 //
 // Timestamps and TTLs have millisecond resolution normalized to UTC. When Now is zero,
-// implementations use their authoritative clock (time.Now for MemoryStore, Redis TIME for RedisStore).
+// implementations use their authoritative clock (time.Now for MemoryStore, Redis TIME for RedisStore,
+// and PostgreSQL clock_timestamp() for PostgresStore).
 //
 // Implementations MUST verify exact Owner (OrgID and UserLogin) equality on every
 // read and write operation, returning ErrForbidden if a job exists for another owner
@@ -241,7 +242,7 @@ type JobStore interface {
 }
 
 // CancelSubscription is an optional extension implemented by distributed JobStores
-// (such as RedisStore) to broadcast Cancel/Undo fencing events across replicas so
+// (such as RedisStore and PostgresStore) to broadcast Cancel/Undo fencing events across replicas so
 // in-flight LLM requests and concurrency slots unwind immediately on remote replicas.
 type CancelSubscription interface {
 	SubscribeCancels(ctx context.Context, onCancel func(jobID string, fencedToken uint64)) (stop func(), err error)

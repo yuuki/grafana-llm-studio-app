@@ -18,10 +18,11 @@ import (
 )
 
 const (
-	LLMModeGrafanaLLMApp  = "grafana-llm-app"
-	LLMModeMock           = "mock"
-	JobStoreBackendMemory = "memory"
-	JobStoreBackendRedis  = "redis"
+	LLMModeGrafanaLLMApp    = "grafana-llm-app"
+	LLMModeMock             = "mock"
+	JobStoreBackendMemory   = "memory"
+	JobStoreBackendRedis    = "redis"
+	JobStoreBackendPostgres = "postgres"
 )
 
 var allowedReasoningEfforts = map[string]bool{
@@ -67,6 +68,12 @@ type JSONSettings struct {
 	RedisKeyPrefix        string            `json:"redisKeyPrefix,omitempty"`
 	RedisTLS              bool              `json:"redisTls,omitempty"`
 	RedisUsername         string            `json:"redisUsername,omitempty"`
+	PostgresAddr          string            `json:"postgresAddr,omitempty"`
+	PostgresDatabase      string            `json:"postgresDatabase,omitempty"`
+	PostgresSchema        string            `json:"postgresSchema,omitempty"`
+	PostgresTablePrefix   string            `json:"postgresTablePrefix,omitempty"`
+	PostgresUsername      string            `json:"postgresUsername,omitempty"`
+	PostgresSSLMode       string            `json:"postgresSslMode,omitempty"`
 }
 
 // Settings combines validated jsonData and decrypted secureJsonData.
@@ -80,6 +87,9 @@ type Settings struct {
 	// redisPassword is the optional decrypted secret for jobStoreBackend=redis.
 	// It MUST NEVER be exposed in PublicConfig, health responses, or logs.
 	redisPassword string
+	// postgresPassword is the optional decrypted secret for jobStoreBackend=postgres.
+	// It MUST NEVER be exposed in PublicConfig, health responses, or logs.
+	postgresPassword string
 }
 
 // PublicConfig is the secret-free subset exposed to the Frontend via GET /config/public.
@@ -263,8 +273,8 @@ func LoadSettings(appSettings backend.AppInstanceSettings, trustedGrafanaAppURL 
 	if js.JobStoreBackend == "" {
 		js.JobStoreBackend = JobStoreBackendMemory
 	}
-	if js.JobStoreBackend != JobStoreBackendMemory && js.JobStoreBackend != JobStoreBackendRedis {
-		return Settings{}, fmt.Errorf("unsupported jobStoreBackend %q (must be %q or %q)", js.JobStoreBackend, JobStoreBackendMemory, JobStoreBackendRedis)
+	if js.JobStoreBackend != JobStoreBackendMemory && js.JobStoreBackend != JobStoreBackendRedis && js.JobStoreBackend != JobStoreBackendPostgres {
+		return Settings{}, fmt.Errorf("unsupported jobStoreBackend %q (must be %q, %q, or %q)", js.JobStoreBackend, JobStoreBackendMemory, JobStoreBackendRedis, JobStoreBackendPostgres)
 	}
 	if js.JobTTLMinutes <= 0 || js.JobTTLMinutes > 1440 {
 		js.JobTTLMinutes = 30
@@ -290,11 +300,49 @@ func LoadSettings(appSettings backend.AppInstanceSettings, trustedGrafanaAppURL 
 		}
 	}
 
+	js.PostgresAddr = strings.TrimSpace(js.PostgresAddr)
+	js.PostgresDatabase = strings.TrimSpace(js.PostgresDatabase)
+	js.PostgresSchema = strings.TrimSpace(js.PostgresSchema)
+	js.PostgresTablePrefix = strings.TrimSpace(js.PostgresTablePrefix)
+	js.PostgresUsername = strings.TrimSpace(js.PostgresUsername)
+	js.PostgresSSLMode = strings.TrimSpace(strings.ToLower(js.PostgresSSLMode))
+	if js.JobStoreBackend == JobStoreBackendPostgres {
+		if err := jobs.ValidatePostgresAddr(js.PostgresAddr); err != nil {
+			return Settings{}, err
+		}
+		if err := jobs.ValidatePostgresDatabase(js.PostgresDatabase); err != nil {
+			return Settings{}, err
+		}
+		if err := jobs.ValidatePostgresUsername(js.PostgresUsername); err != nil {
+			return Settings{}, err
+		}
+		if err := jobs.ValidatePostgresSchema(js.PostgresSchema); err != nil {
+			return Settings{}, err
+		}
+		if js.PostgresSchema == "" {
+			js.PostgresSchema = jobs.DefaultPostgresSchema
+		}
+		if err := jobs.ValidatePostgresTablePrefix(js.PostgresTablePrefix); err != nil {
+			return Settings{}, err
+		}
+		if js.PostgresTablePrefix == "" {
+			js.PostgresTablePrefix = jobs.DefaultPostgresTablePrefix
+		}
+		if err := jobs.ValidatePostgresSSLMode(js.PostgresSSLMode); err != nil {
+			return Settings{}, err
+		}
+		if js.PostgresSSLMode == "" {
+			js.PostgresSSLMode = jobs.DefaultPostgresSSLMode
+		}
+	}
+
 	var token string
 	var redisPass string
+	var postgresPass string
 	if appSettings.DecryptedSecureJSONData != nil {
 		token = strings.TrimSpace(appSettings.DecryptedSecureJSONData["llmServiceAccountToken"])
 		redisPass = appSettings.DecryptedSecureJSONData["redisPassword"]
+		postgresPass = appSettings.DecryptedSecureJSONData["postgresPassword"]
 	}
 
 	return Settings{
@@ -303,6 +351,7 @@ func LoadSettings(appSettings backend.AppInstanceSettings, trustedGrafanaAppURL 
 		EffectiveMaxRepairs:      effectiveRepairs,
 		llmServiceAccountToken:   token,
 		redisPassword:            redisPass,
+		postgresPassword:         postgresPass,
 	}, nil
 }
 

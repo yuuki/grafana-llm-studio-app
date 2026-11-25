@@ -76,11 +76,12 @@ type Config struct {
 	AllowedDSUIDs      []string
 	DatasourceDialects map[string]string
 	QueryRegistry      *query.Registry
-	// Store optionally supplies a persistent / multi-replica JobStore (e.g. RedisStore).
+	// Store optionally supplies a persistent / multi-replica JobStore (e.g. RedisStore or PostgresStore).
 	// When nil, NewManager creates a process-local MemoryStore.
 	Store JobStore
 	// NowFunc optionally overrides wall-clock time for deterministic tests.
-	// When nil, stores use their authoritative clock (time.Now for MemoryStore, Redis TIME for RedisStore).
+	// When nil, stores use their authoritative clock (time.Now for MemoryStore, Redis TIME for RedisStore,
+	// and PostgreSQL clock_timestamp() for PostgresStore).
 	NowFunc func() time.Time
 }
 

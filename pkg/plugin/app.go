@@ -104,6 +104,17 @@ func NewApp(ctx context.Context, appSettings backend.AppInstanceSettings) (insta
 			KeyPrefix: settings.RedisKeyPrefix,
 			TLS:       settings.RedisTLS,
 		})
+	case JobStoreBackendPostgres:
+		// Never silently fall back to single-process memory when PostgreSQL is explicitly configured for HA.
+		store, storeInitErr = jobs.NewPostgresStore(jobs.PostgresConfig{
+			Addr:        settings.PostgresAddr,
+			Database:    settings.PostgresDatabase,
+			Username:    settings.PostgresUsername,
+			Password:    settings.postgresPassword,
+			Schema:      settings.PostgresSchema,
+			TablePrefix: settings.PostgresTablePrefix,
+			SSLMode:     settings.PostgresSSLMode,
+		})
 	default:
 		storeInitErr = fmt.Errorf("unsupported jobStoreBackend: %s", settings.JobStoreBackend)
 	}

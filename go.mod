@@ -7,6 +7,7 @@ require (
 	github.com/alicebob/miniredis/v2 v2.34.0
 	github.com/grafana/grafana-llm-app/llmclient v0.20.0
 	github.com/grafana/grafana-plugin-sdk-go v0.278.0
+	github.com/jackc/pgx/v5 v5.7.6
 	github.com/prometheus/prometheus v0.305.0
 	github.com/redis/go-redis/v9 v9.7.3
 	github.com/sashabaranov/go-openai v1.41.1
@@ -49,6 +50,9 @@ require (
 	github.com/hashicorp/go-hclog v1.6.3 // indirect
 	github.com/hashicorp/go-plugin v1.6.3 // indirect
 	github.com/hashicorp/yamux v0.1.1 // indirect
+	github.com/jackc/pgpassfile v1.0.0 // indirect
+	github.com/jackc/pgservicefile v0.0.0-20240606120523-5a60cdf6a761 // indirect
+	github.com/jackc/puddle/v2 v2.2.2 // indirect
 	github.com/jaegertracing/jaeger-idl v0.5.0 // indirect
 	github.com/josharian/intern v1.0.0 // indirect
 	github.com/json-iterator/go v1.1.12 // indirect
@@ -97,6 +101,7 @@ require (
 	go.opentelemetry.io/otel/trace v1.36.0 // indirect
 	go.opentelemetry.io/proto/otlp v1.6.0 // indirect
 	go.uber.org/atomic v1.11.0 // indirect
+	golang.org/x/crypto v0.39.0 // indirect
 	golang.org/x/exp v0.0.0-20250106191152-7588d65b2ba8 // indirect
 	golang.org/x/mod v0.25.0 // indirect
 	golang.org/x/net v0.41.0 // indirect

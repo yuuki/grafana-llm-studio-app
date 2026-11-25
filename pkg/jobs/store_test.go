@@ -2,9 +2,12 @@ package jobs_test
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -12,6 +15,8 @@ import (
 	"time"
 
 	"github.com/alicebob/miniredis/v2"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/yuuki/grafana-llm-studio-app/pkg/ir"
 	"github.com/yuuki/grafana-llm-studio-app/pkg/jobs"
 	"github.com/yuuki/grafana-llm-studio-app/pkg/llm"
@@ -22,8 +27,53 @@ type storeFactory struct {
 	new  func(t *testing.T) (jobs.JobStore, func())
 }
 
+func testPostgresConfigFromEnv(t *testing.T) (jobs.PostgresConfig, bool) {
+	t.Helper()
+	addr := strings.TrimSpace(os.Getenv("LLM_STUDIO_TEST_POSTGRES_ADDR"))
+	if addr == "" {
+		return jobs.PostgresConfig{}, false
+	}
+	db := strings.TrimSpace(os.Getenv("LLM_STUDIO_TEST_POSTGRES_DB"))
+	if db == "" {
+		db = "grafana"
+	}
+	user := strings.TrimSpace(os.Getenv("LLM_STUDIO_TEST_POSTGRES_USER"))
+	if user == "" {
+		user = "grafana"
+	}
+	pass := os.Getenv("LLM_STUDIO_TEST_POSTGRES_PASSWORD")
+	sslMode := strings.TrimSpace(os.Getenv("LLM_STUDIO_TEST_POSTGRES_SSLMODE"))
+	if sslMode == "" {
+		sslMode = jobs.PostgresSSLModeDisable
+	}
+	var rnd [6]byte
+	_, _ = rand.Read(rnd[:])
+	schema := "llmstudio_test_" + hex.EncodeToString(rnd[:])
+	return jobs.PostgresConfig{
+		Addr:        addr,
+		Database:    db,
+		Username:    user,
+		Password:    pass,
+		Schema:      schema,
+		TablePrefix: "llm_studio_",
+		SSLMode:     sslMode,
+	}, true
+}
+
+func dropTestPostgresSchema(cfg jobs.PostgresConfig) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	dsn := fmt.Sprintf("postgres://%s:%s@%s/%s?sslmode=%s", cfg.Username, cfg.Password, cfg.Addr, cfg.Database, cfg.SSLMode)
+	pool, err := pgxpool.New(ctx, dsn)
+	if err != nil {
+		return
+	}
+	defer pool.Close()
+	_, _ = pool.Exec(ctx, "DROP SCHEMA IF EXISTS "+pgx.Identifier{cfg.Schema}.Sanitize()+" CASCADE")
+}
+
 func allStoreFactories() []storeFactory {
-	return []storeFactory{
+	factories := []storeFactory{
 		{
 			name: "memory",
 			new: func(_ *testing.T) (jobs.JobStore, func()) {
@@ -50,6 +100,27 @@ func allStoreFactories() []storeFactory {
 			},
 		},
 	}
+	if strings.TrimSpace(os.Getenv("LLM_STUDIO_TEST_POSTGRES_ADDR")) != "" {
+		factories = append(factories, storeFactory{
+			name: "postgres",
+			new: func(t *testing.T) (jobs.JobStore, func()) {
+				t.Helper()
+				cfg, ok := testPostgresConfigFromEnv(t)
+				if !ok {
+					t.Skip("LLM_STUDIO_TEST_POSTGRES_ADDR not set")
+				}
+				s, err := jobs.NewPostgresStore(cfg)
+				if err != nil {
+					t.Fatalf("NewPostgresStore: %v", err)
+				}
+				return s, func() {
+					_ = s.Close()
+					dropTestPostgresSchema(cfg)
+				}
+			},
+		})
+	}
+	return factories
 }
 
 type testClock struct {

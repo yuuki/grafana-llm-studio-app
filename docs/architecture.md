@@ -23,7 +23,7 @@ flowchart LR
 
   subgraph Backend["Custom App Go Backend (yuuki-llmstudio-app)"]
     Auth["PluginContext Verification\n(OrgID + User.Login)"]
-    Jobs["Job Manager + Pluggable JobStore\n(Memory Default / Optional Redis HA)"]
+    Jobs["Job Manager + Pluggable JobStore\n(Memory Default / Optional Redis or PostgreSQL HA)"]
     Prompt["Prompt Builder\n(Sanitization & Size Caps)"]
     IRVal["IR & PromQL AST Validator\n(Catalog & Scope Enforcement)"]
     LLMCli["llmclient v0.20.0 Adapter\n(Structured Output)"]
@@ -100,7 +100,7 @@ sequenceDiagram
 - Two panel types only (**`timeseries`** and **`stat`**), fixed grid layout, and **auto-refresh disabled**.
 - Create-only dashboard saving, in-draft partial panel edits, and clean JSON export.
 - Scoped metadata fetched per session in browser memory and single-request scope only (no shared persistent metadata index).
-- Pluggable `JobStore` in `pkg/jobs`: defaults to a zero-dependency process-local in-memory store (`jobStoreBackend: "memory"`), with an optional persistent Redis/Valkey backend (`jobStoreBackend: "redis"`) for HA multi-replica Grafana deployments enforcing atomic `(OrgID, UserLogin)` owner isolation, lease-based per-user/global concurrency limits, atomic repair-budget accounting, fencing tokens for `Undo`/`Cancel`, and native TTL expiration.
+- Pluggable `JobStore` in `pkg/jobs`: defaults to a zero-dependency process-local in-memory store (`jobStoreBackend: "memory"`), with optional persistent Redis/Valkey (`jobStoreBackend: "redis"`) and PostgreSQL (`jobStoreBackend: "postgres"`) backends for HA multi-replica Grafana deployments enforcing atomic `(OrgID, UserLogin)` owner isolation, lease-based per-user/org concurrency limits, atomic repair-budget accounting, fencing tokens + cross-replica cancel notifications (Redis Pub/Sub or PostgreSQL `LISTEN`/`NOTIFY`) for `Undo`/`Cancel`, and TTL-based automatic expiration.
 
 ### 4.2 Serving Users with Different Data-Access Scopes (Out of Scope for MVP)
 - Within a single Grafana OSS organization (`12.4.15` / `13.3.1`), datasource-level RBAC and LBAC are Enterprise/Cloud features. Folder permissions and UI hiding do **not** restrict Prometheus metric access.
