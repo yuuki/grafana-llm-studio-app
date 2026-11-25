@@ -203,6 +203,7 @@ export const StudioPage: React.FC = () => {
   ]);
   const [selectedFolderUid, setSelectedFolderUid] = useState<string>('');
   const [optInUpdateExisting, setOptInUpdateExisting] = useState(false);
+  const [activeImportPatchKey, setActiveImportPatchKey] = useState<string | null>(null);
   const [savedResult, setSavedResult] = useState<SaveDashboardResult | null>(null);
 
   const abortRef = useRef<AbortController | null>(null);
@@ -258,6 +259,7 @@ export const StudioPage: React.FC = () => {
     setImportReport(null);
     setSelectedFolderUid('');
     setOptInUpdateExisting(false);
+    setActiveImportPatchKey(null);
     setValidationResults([]);
     setPreviewSpec(null);
     setPreviewScene(null);
@@ -328,6 +330,9 @@ export const StudioPage: React.FC = () => {
       active = false;
       initController.abort();
     };
+    // `t` is left out on purpose: with an i18n instance override (tests) it is a new
+    // function on every render, which would refetch the folders on every render.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [currentOrgId]);
 
   const selectedDatasource = useMemo(
@@ -352,6 +357,8 @@ export const StudioPage: React.FC = () => {
       });
     }
     return opts;
+    // `t` keeps its identity when the language changes; `locale` recomputes the labels.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [folders, selectedFolderUid, t, locale]);
 
   const currentScopeKey = makeScopeKey(selectedDsUid, scopeLabelName, scopeLabelValue);
@@ -628,16 +635,17 @@ export const StudioPage: React.FC = () => {
       setOptInUpdateExisting(false);
 
       if (importedJob.importSource?.uid) {
-        latestImportMetaRef.current.set(
-          `${importedJob.jobId}:${importedJob.importSource.uid}`,
-          {
-            resourceVersion: importedJob.importSource.resourceVersion,
-            folderUid: importedJob.importSource.folderUid ?? '',
-            preservedAnnotations: fetched.preservedAnnotations,
-            preservedLabels: fetched.preservedLabels,
-            patchContext,
-          }
-        );
+        const metaKey = `${importedJob.jobId}:${importedJob.importSource.uid}`;
+        latestImportMetaRef.current.set(metaKey, {
+          resourceVersion: importedJob.importSource.resourceVersion,
+          folderUid: importedJob.importSource.folderUid ?? '',
+          preservedAnnotations: fetched.preservedAnnotations,
+          preservedLabels: fetched.preservedLabels,
+          patchContext,
+        });
+        setActiveImportPatchKey(metaKey);
+      } else {
+        setActiveImportPatchKey(null);
       }
       applyJobSnapshot(importedJob);
       setImportReport(report);
@@ -944,15 +952,15 @@ export const StudioPage: React.FC = () => {
     }
   };
 
-  const activeImportMeta =
-    job?.importSource?.uid
-      ? latestImportMetaRef.current.get(`${job.jobId}:${job.importSource.uid}`)
-      : undefined;
+  const activeImportKey = job?.importSource?.uid
+    ? `${job.jobId}:${job.importSource.uid}`
+    : '';
 
   const canOptInUpdate = Boolean(
     job?.importSource?.uid &&
       job?.importSource?.resourceVersion &&
-      activeImportMeta?.patchContext
+      activeImportPatchKey !== null &&
+      activeImportPatchKey === activeImportKey
   );
 
   const handleSaveDashboard = async () => {
@@ -1072,22 +1080,20 @@ export const StudioPage: React.FC = () => {
     }
   };
 
+  const currentIR = job?.currentIR;
+  const jobScope = job?.scope;
+  const maxPanels = publicCfg?.maxPanels ?? 6;
   const foundationJsonPreview = useMemo(() => {
-    if (!job?.currentIR || !selectedDatasource) {
+    if (!currentIR || !selectedDatasource) {
       return '';
     }
     try {
-      const spec = normalizeDashboardIR(
-        job.currentIR,
-        selectedDatasource,
-        publicCfg?.maxPanels ?? 6,
-        job.scope
-      );
+      const spec = normalizeDashboardIR(currentIR, selectedDatasource, maxPanels, jobScope);
       return buildExportableDashboardJson(spec);
     } catch {
       return '';
     }
-  }, [job?.currentIR, job?.scope, selectedDatasource, publicCfg?.maxPanels]);
+  }, [currentIR, jobScope, selectedDatasource, maxPanels]);
 
   const canSave =
     Boolean(previewSpec) &&

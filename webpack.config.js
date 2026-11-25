@@ -67,6 +67,7 @@ module.exports = (env, argv) => {
           { from: 'src/plugin.json', to: '.' },
           { from: 'src/img', to: 'img' },
           { from: 'README.md', to: '.', noErrorOnMissing: true },
+          { from: 'CHANGELOG.md', to: '.', noErrorOnMissing: true },
           { from: 'LICENSE', to: '.', noErrorOnMissing: true },
         ],
       }),

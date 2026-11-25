@@ -58,7 +58,7 @@ This plugin intentionally pins and verifies concrete target versions rather than
 | **`@grafana/grafana-foundation-sdk`** | `0.0.22` | Generates Classic Dashboard JSON (`schemaVersion: 42`) |
 | **`grafana-plugin-sdk-go`** | `v0.278.0` | `ProtocolVersion = 2` (wire-compatible with Grafana 12.4.x and 13.x) |
 | **LLM Backends (via `grafana-llm-app`)** | OpenAI / OpenAI-compatible APIs or local `vLLM >= v0.12.0` | Supports `json_schema` / `json_object` and `max_completion_tokens` / `max_tokens`; model-agnostic via `base`/`large` |
-| **Build Toolchain** | Node.js `>=22.0.0`, Go `1.24.3` | Reproducible builds (`npm ci` + `go mod vendor` supported for offline packaging) |
+| **Build Toolchain** | Node.js `26`, Go `1.27.4` (`mise.toml`) | Reproducible builds (`npm ci` + `go mod vendor` supported for offline packaging) |
 
 See [`docs/compatibility.md`](docs/compatibility.md) for the full source-verified matrix and [`docs/openai-compatible-apis.md`](docs/openai-compatible-apis.md) for provider-by-provider setup.
 
@@ -68,8 +68,8 @@ The included Docker Compose stack launches Grafana OSS, Prometheus (with query g
 
 ### Prerequisites
 
-- Node.js `>= 22.0.0` and npm
-- Go `1.24.x`
+- Node.js `26` and npm
+- Go `1.27.4` (the version in `go.mod`; `mise install` installs both)
 - Docker & Docker Compose
 
 ### 1. Install dependencies & build the plugin
@@ -100,18 +100,24 @@ To connect directly to an **OpenAI or OpenAI-compatible API** via `grafana-llm-a
 
 ## Production Deployment
 
-1. **Allowlist only this unsigned plugin ID** in `grafana.ini` (or via environment variable):
+1. **Install the multi-architecture release archive** (`yuuki-llmstudio-app-<version>.zip` or `.tar.gz`, bundling Go backend binaries for `linux/amd64`, `linux/arm64`, `darwin/amd64`, `darwin/arm64`, and `windows/amd64`) after verifying `SHA256SUMS`:
+   ```bash
+   sha256sum -c SHA256SUMS
+   unzip -q yuuki-llmstudio-app-<version>.zip -d /var/lib/grafana/plugins
+   ```
+2. **Use a signed plugin release (recommended)** so production Grafana instances do **not** require `allow_loading_unsigned_plugins` — see [`docs/plugin-signing-and-publishing.md`](docs/plugin-signing-and-publishing.md) for Private signing (`@grafana/sign-plugin --rootUrls ...`) and Community catalog signing. Only if deploying an unsigned archive, allowlist **only** this plugin ID in `grafana.ini`:
    ```ini
    [plugins]
    allow_loading_unsigned_plugins = yuuki-llmstudio-app
    ```
-2. **Install and configure `grafana-llm-app`** (`v1.2.0` for Grafana 13.x or `v1.0.8` for Grafana 12.4.x) pointing either to an OpenAI / OpenAI-compatible HTTPS API (`provider: "openai"`, `"azure"`, or `"custom"`) or your self-hosted vLLM server (`provider: "custom"`, TLS, API key), with `base` / `large` model mappings.
-3. **Create a dedicated Grafana Service Account** with the minimum OSS basic role **`Viewer`** (never `Editor` or `Admin`) and store its token in **Plugin Configuration → `llmServiceAccountToken` (`secureJsonData`)**.
-4. **Switch `llmMode` to `grafana-llm-app`** and remove development provisioning files (`deploy/grafana/provisioning/plugins/llm-studio-dev.yml`). Production mode never silently falls back to mock mode.
-5. **Enforce upstream query limits** on Prometheus (`--query.timeout`, `--query.max-concurrency`, `--query.max-samples`) or VictoriaMetrics (`-search.maxQueryDuration`, `-search.maxConcurrentRequests`, `-search.maxSeries`). Browser-side dry-run caps are UX guardrails, not a DoS boundary.
+3. **Install and configure `grafana-llm-app`** (`v1.2.0` for Grafana 13.x or `v1.0.8` for Grafana 12.4.x) pointing either to an OpenAI / OpenAI-compatible HTTPS API (`provider: "openai"`, `"azure"`, or `"custom"`) or your self-hosted vLLM server (`provider: "custom"`, TLS, API key), with `base` / `large` model mappings.
+4. **Create a dedicated Grafana Service Account** with the minimum OSS basic role **`Viewer`** (never `Editor` or `Admin`) and store its token in **Plugin Configuration → `llmServiceAccountToken` (`secureJsonData`)**.
+5. **Switch `llmMode` to `grafana-llm-app`** and remove development provisioning files (`deploy/grafana/provisioning/plugins/llm-studio-dev.yaml`). Production mode never silently falls back to mock mode.
+6. **Enforce upstream query limits** on Prometheus (`--query.timeout`, `--query.max-concurrency`, `--query.max-samples`) or VictoriaMetrics (`-search.maxQueryDuration`, `-search.maxConcurrentRequests`, `-search.maxSeries`). Browser-side dry-run caps are UX guardrails, not a DoS boundary.
 
 - **Internet-connected OpenAI / OpenAI-compatible APIs** (OpenAI, Azure OpenAI, OpenRouter, Groq, DeepSeek, Together, Fireworks, Gemini): see [`docs/openai-compatible-apis.md`](docs/openai-compatible-apis.md).
-- **Strictly offline / air-gapped environments** (offline Grafana flags, digest-pinned image/plugin/model bundling, local vLLM): see [`docs/airgapped-deployment.md`](docs/airgapped-deployment.md).
+- **Strictly offline / air-gapped environments** (offline Grafana flags, `-airgap.tar.gz` bundle, digest-pinned image/plugin/model bundling, local vLLM): see [`docs/airgapped-deployment.md`](docs/airgapped-deployment.md).
+- **Multi-architecture releases, `@grafana/sign-plugin`, and Grafana Catalog submission:** see [`docs/plugin-signing-and-publishing.md`](docs/plugin-signing-and-publishing.md).
 
 ## Configuration Reference
 
@@ -157,51 +163,52 @@ Configured via **Administration → Plugins → LLM Dashboard Studio** (`jsonDat
 ## Development & Verification
 
 ```bash
-# Run all checks: schema sync, typecheck, Jest tests, Go vet & race tests, builds, and bundle verification
-make verify
+npm ci
+make check   # the required PR CI minus the live E2E stack
+make help    # every target, with a one-line description
 ```
 
-Individual commands:
+`make check` runs golangci-lint, the TypeScript type check, ESLint, the GitHub Actions audit (actionlint, zizmor, `actions.lock`), the JSON Schema sync check, Go tests with the race detector, Jest and the plugin build with its bundle check. `make verify`, the earlier gate, still runs the same checks without the linters. Individual targets:
 
 ```bash
-npm run verify:schemas   # Bidirectional enum & string-only schema sync (JSON Schema <-> TS <-> Go)
-npm run typecheck        # TypeScript strict type checking (src + Playwright E2E)
-npm run test:ci          # Jest unit, Scenes/Foundation parity, saver, and UI lifecycle tests
-npm run build            # Production Webpack bundle (dist/module.js)
-npm run verify:bundle    # Verify dist/module.js externalizes react/jsx-runtime and contains zero SECRET_INTERNALS
-go vet ./pkg/...         # Go static analysis
-go test -race -count=1 ./pkg/...  # Go unit, PromQL AST, job isolation, and grafana-llm-app contract tests
-make build-backend       # Linux amd64 Go plugin binary (dist/gpx_yuuki_llmstudio_app_linux_amd64)
-docker compose -f deploy/docker-compose.yml config --quiet
+make verify-schemas    # Bidirectional enum & string-only schema sync (JSON Schema <-> TS <-> Go)
+make lint              # golangci-lint, go.mod tidiness, TypeScript type check and ESLint
+make test-race         # Go unit, PromQL/MetricsQL AST, job isolation, and grafana-llm-app contract tests
+make test-frontend     # Jest unit, Scenes/Foundation parity, saver, and UI lifecycle tests
+make test-release      # Unit tests for multi-arch build, checksum, and MANIFEST.txt verification helpers
+make build             # dist/module.js (externals checked) and dist/gpx_yuuki_llmstudio_app_linux_amd64
+make build-backend-all # All 5 Go backend targets (linux/amd64, linux/arm64, darwin/amd64, darwin/arm64, windows/amd64)
+make package-airgap    # Package .zip, .tar.gz, .zip.sha1, -airgap.tar.gz, and SHA256SUMS + verify all archives
+make test-fuzz         # Go fuzz targets: IR decoding and patching, PromQL/MetricsQL validators, settings
+make vuln vuln-deps    # govulncheck for the Go code, osv-scanner for package-lock.json
 ```
+
+[CONTRIBUTING.md](CONTRIBUTING.md) describes how to propose a change, and [AGENTS.md](AGENTS.md) lists the design rules, the compatibility contracts and the checks each kind of change needs. Report vulnerabilities as [SECURITY.md](SECURITY.md) describes.
 
 ### Live E2E Tests (Playwright + `@grafana/plugin-e2e`)
 
-Run end-to-end browser tests against live Grafana `13.3.1` (React 19) or `12.4.15` (React 18) containers:
+Run end-to-end browser tests against live Grafana `13.3.1` (React 19) or `12.4.15` (React 18) containers. `make test-integration` builds the plugin, starts the Docker Compose stack, waits for it, runs the `CallResource` SSE checks and Playwright, and stops the stack:
 
 ```bash
-make build
 npx playwright install chromium
-GRAFANA_VERSION=13.3.1 docker compose -f deploy/docker-compose.yml up -d
-node scripts/wait-for-stack.mjs
-npm run test:e2e
-docker compose -f deploy/docker-compose.yml down -v
+make test-integration GRAFANA_VERSION=13.3.1
+make test-integration GRAFANA_VERSION=12.4.15
 ```
 
-GitHub Actions (`.github/workflows/ci.yml`) runs all verification checks plus the live E2E matrix on both **Grafana `13.3.1` (React 19)** and **Grafana `12.4.15` (React 18)**.
+GitHub Actions runs the same checks: `.github/workflows/ci.yml` (lint, unit tests, build, fuzzing, and the live E2E matrix on **Grafana `13.3.1` (React 19)** and **Grafana `12.4.15` (React 18)**), `security.yml` (CodeQL, govulncheck, osv-scanner) and `complexity.yml` (cccc complexity trend). Version tags (`v*`) trigger `.github/workflows/release.yml` for multi-architecture Go cross-compilation, optional `@grafana/sign-plugin` signing, archive & air-gapped bundling, `SHA256SUMS` verification, and GitHub Release publication.
 
 ### Repository Structure
 
 ```text
 .
-├── .github/workflows/      # GitHub Actions CI (verify + live Grafana 13.3.1 & 12.4.15 E2E matrix)
+├── .github/workflows/      # GitHub Actions: CI (+ Grafana 13.3.1/12.4.15 E2E), security, complexity & tag-triggered multi-arch Release workflow
 ├── pkg/                    # Go backend plugin (IR, PromQL AST validator, prompt builder, llmclient, job manager, plugin handlers)
 ├── src/                    # TypeScript/React frontend (Studio UI, AppConfig, metadata/BM25, dry-run validator, Scenes & Foundation adapters, saver)
 ├── tests/e2e/              # Live Playwright / @grafana/plugin-e2e tests
 ├── schemas/                # Canonical Dashboard IR & Patch JSON Schemas and sample payloads
-├── scripts/                # Schema sync verifier, bundle verifier, and E2E stack readiness helper
-├── deploy/                 # Local Docker Compose stack (+ optional OpenAI override), Prometheus config, sample exporter, provisioning templates
-└── docs/                   # Architecture, compatibility matrix, air-gapped & OpenAI-compatible API guides, and ADRs
+├── scripts/                # Schema sync verifier, bundle verifier, multi-arch release packager/verifier, and E2E helpers
+├── deploy/                 # Local Docker Compose stack (+ optional OpenAI/Redis/VictoriaMetrics overrides), Prometheus config, provisioning templates
+└── docs/                   # Architecture, compatibility matrix, signing & publishing, air-gapped & OpenAI-compatible API guides, and ADRs
 ```
 
 ## Known Limitations (MVP Scope)
@@ -215,6 +222,7 @@ GitHub Actions (`.github/workflows/ci.yml`) runs all verification checks plus th
 
 - [Architecture, Auth Boundaries & MVP Scope](docs/architecture.md)
 - [Version Compatibility Matrix & Model Verification](docs/compatibility.md)
+- [Multi-Architecture Releases, Plugin Signing & Catalog Submission Guide](docs/plugin-signing-and-publishing.md)
 - [Internet OpenAI & OpenAI-Compatible APIs Guide](docs/openai-compatible-apis.md)
 - [Air-Gapped Deployment, Reverse-Proxy SSE & Upstream Guardrails Guide](docs/airgapped-deployment.md)
 - Architecture Decision Records:

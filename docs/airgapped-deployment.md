@@ -26,18 +26,26 @@ sha256sum airgap-images.tar > airgap-images.tar.sha256
 
 ### 1.2 Bundle Plugins and Offline Dependencies
 1. **Custom App Plugin (`yuuki-llmstudio-app`):**
-   ```bash
-   # Optional: create offline caches if rebuilding inside the air-gapped network
-   go mod vendor
-   npm ci --prefer-offline
+   - **Option A — Use Prebuilt Multi-Arch Release Artifacts (Recommended):**
+     Download the tagged release assets from GitHub Releases on the staging host and verify checksums before transferring offline:
+     - `yuuki-llmstudio-app-<version>-airgap.tar.gz` (self-contained offline bundle containing the multi-architecture `.tar.gz`/`.zip` plugin archives, `SHA256SUMS`, canonical IR/Patch schemas, hardened offline `grafana.ini` template, `BUNDLE-MANIFEST.json`, and `INSTALL-OFFLINE.md`), **or**
+     - `yuuki-llmstudio-app-<version>.tar.gz` / `yuuki-llmstudio-app-<version>.zip` + `SHA256SUMS` (bundles all 5 Go backend binaries: `linux/amd64`, `linux/arm64`, `darwin/amd64`, `darwin/arm64`, `windows/amd64`).
+     ```bash
+     sha256sum -c SHA256SUMS
+     # Inside the air-gapped host (creates /var/lib/grafana/plugins/yuuki-llmstudio-app/):
+     tar -xzf yuuki-llmstudio-app-<version>.tar.gz -C /var/lib/grafana/plugins
+     ```
+   - **Option B — Build & Package from Source:**
+     ```bash
+     # Optional: create offline caches if rebuilding inside the air-gapped network
+     go mod vendor
+     npm ci --prefer-offline
 
-   # Build distributable plugin bundle (dist/)
-   npm run verify:schemas
-   npm run build
-   CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -mod=vendor -o dist/gpx_yuuki_llmstudio_app_linux_amd64 ./pkg
-   tar -czf yuuki-llmstudio-app-0.1.0.tar.gz -C dist .
-   sha256sum yuuki-llmstudio-app-0.1.0.tar.gz > yuuki-llmstudio-app-0.1.0.tar.gz.sha256
-   ```
+     # Build frontend + all 5 Go backend architectures, package, and verify SHA256SUMS:
+     # (Export GRAFANA_ACCESS_POLICY_TOKEN and GRAFANA_PLUGIN_ROOT_URLS first for Private signing)
+     make package-airgap
+     ```
+     Outputs land in `release/` (`yuuki-llmstudio-app-<version>.zip`, `.tar.gz`, `-airgap.tar.gz`, and `SHA256SUMS`).
 2. **Official `grafana-llm-app` (Grafana 13.x: `v1.2.0` / Grafana 12.4.x: `v1.0.8`):**
    - Download the signed release archive for **`v1.2.0`** (`grafanaDependency: ">=13.0.0-0"`) on Grafana 13.3.1, or **`v1.0.8`** (`grafanaDependency: ">=9.5.2"`) on Grafana 12.4.15, verify its SHA-256 checksum, and transfer it offline.
    - **Never rely on runtime `GF_INSTALL_PLUGINS` downloads in air-gapped environments.**
@@ -50,11 +58,13 @@ sha256sum airgap-images.tar > airgap-images.tar.sha256
 
 ## 2. Air-Gapped Deployment Configuration
 
-### 2.1 Explicit Unsigned Plugin Allowlist & Offline Grafana Hardening
-Allow **only** `yuuki-llmstudio-app` in `grafana.ini` or environment variables (never use wildcards):
+### 2.1 Plugin Signature Verification & Offline Grafana Hardening
+- **Signed Releases (Recommended for Production):** Sign the plugin on your internet-connected staging host using `@grafana/sign-plugin` (Private signature with `--rootUrls` matching your internal Grafana `root_url`, or Community signature once approved — see [`docs/plugin-signing-and-publishing.md`](plugin-signing-and-publishing.md)). Grafana verifies `MANIFEST.txt` offline against its built-in Grafana Labs public key even with `public_key_retrieval_disabled = true`, so **`allow_loading_unsigned_plugins` is not needed**.
+- **Unsigned Builds (Fallback Only):** If deploying an unsigned archive, allow **only** `yuuki-llmstudio-app` in `grafana.ini` or environment variables (never use wildcards):
 
 ```ini
 [plugins]
+# Required ONLY when deploying an unsigned build (omit for signed releases):
 allow_loading_unsigned_plugins = yuuki-llmstudio-app
 public_key_retrieval_disabled = true
 plugin_admin_enabled = false
@@ -76,6 +86,7 @@ external_enabled = false
 
 Equivalent environment variables:
 ```bash
+# Required ONLY when deploying an unsigned build (omit for signed releases):
 GF_PLUGINS_ALLOW_LOADING_UNSIGNED_PLUGINS=yuuki-llmstudio-app
 GF_PLUGINS_PUBLIC_KEY_RETRIEVAL_DISABLED=true
 GF_PLUGINS_PLUGIN_ADMIN_ENABLED=false

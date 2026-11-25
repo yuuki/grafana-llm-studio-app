@@ -5,13 +5,22 @@
   "private": true,
   "scripts": {
     "build": "webpack --mode production",
+    "build:backend": "node scripts/build-backend.mjs",
+    "build:backend:all": "node scripts/build-backend.mjs --all",
     "dev": "webpack --mode development --watch",
     "typecheck": "tsc --noEmit && tsc --noEmit -p tsconfig.e2e.json",
+    "lint": "eslint --cache .",
+    "lint:fix": "eslint --cache --fix .",
     "test": "jest --runInBand",
     "test:ci": "jest --ci --runInBand",
     "test:e2e": "playwright test",
+    "test:release": "node --test scripts/release-lib.test.mjs",
+    "sign": "sign-plugin",
+    "package": "node scripts/package-release.mjs",
+    "package:airgap": "node scripts/package-release.mjs --airgap",
     "verify:schemas": "node scripts/verify-schema-sync.mjs",
-    "verify:bundle": "node scripts/verify-bundle.mjs"
+    "verify:bundle": "node scripts/verify-bundle.mjs",
+    "verify:release": "node scripts/verify-release.mjs"
   },
   "dependencies": {
     "@emotion/css": "11.13.5",
@@ -30,15 +39,25 @@
   },
   "devDependencies": {
     "@grafana/e2e-selectors": "12.4.15",
+    "@grafana/eslint-config": "10.0.0",
     "@grafana/plugin-e2e": "4.1.1",
+    "@grafana/sign-plugin": "3.3.3",
     "@playwright/test": "1.65.1",
+    "@stylistic/eslint-plugin": "5.10.0",
     "@testing-library/jest-dom": "6.6.3",
     "@testing-library/react": "16.1.0",
     "@types/jest": "29.5.14",
     "@types/node": "22.10.2",
     "@types/react": "18.3.18",
     "@types/react-dom": "18.3.5",
+    "@typescript-eslint/eslint-plugin": "8.72.1",
+    "@typescript-eslint/parser": "8.72.1",
     "copy-webpack-plugin": "12.0.2",
+    "eslint": "9.39.5",
+    "eslint-config-prettier": "10.1.8",
+    "eslint-plugin-jsdoc": "62.9.0",
+    "eslint-plugin-react": "7.37.5",
+    "eslint-plugin-react-hooks": "7.1.1",
     "jest": "29.7.0",
     "jest-environment-jsdom": "29.7.0",
     "ts-jest": "29.2.5",
@@ -47,7 +66,8 @@
     "webpack": "5.97.1",
     "webpack-cli": "5.1.4"
   },
+  "packageManager": "npm@11.20.0",
   "engines": {
-    "node": ">=22.0.0"
+    "node": ">=26 <27"
   }
 }

@@ -10,14 +10,25 @@
     "keywords": ["app", "llm", "dashboard", "studio", "scenes", "prometheus"],
     "description": "OSS LLM Dashboard Studio for self-hosted Grafana powered by grafana-llm-app, Scenes, and Foundation SDK",
     "author": {
-      "name": "yuuki"
+      "name": "yuuki",
+      "url": "https://github.com/yuuki"
     },
     "logos": {
       "small": "img/logo.svg",
       "large": "img/logo.svg"
     },
+    "links": [
+      {
+        "name": "Project site",
+        "url": "https://github.com/yuuki/grafana-llm-studio-app"
+      },
+      {
+        "name": "License",
+        "url": "https://github.com/yuuki/grafana-llm-studio-app/blob/main/LICENSE"
+      }
+    ],
     "version": "0.1.0",
-    "updated": "2026-11-22"
+    "updated": "2026-11-25"
   },
   "includes": [
     {
