@@ -448,6 +448,147 @@ describe.each(SUPPORTED_LOCALES)(
       expect(payload.secureJsonData).toBeUndefined();
     });
 
+    test('normalizes uppercase/whitespace provisioned jobStoreBackend and postgresSslMode without silent downgrade', async () => {
+      const plugin = makePlugin({
+        allowedDatasourceUids: ['prom-main'],
+        llmMode: 'grafana-llm-app',
+        jobStoreBackend: ' POSTGRES ' as unknown as 'postgres',
+        postgresAddr: 'postgres.ha:5432',
+        postgresDatabase: 'grafana',
+        postgresUsername: 'grafana',
+        postgresSslMode: ' VERIFY-FULL ' as unknown as 'verify-full',
+      });
+
+      render(<AppConfig plugin={plugin as never} query={{}} />);
+
+      // Save an unrelated setting without touching Job Storage -> MUST NOT downgrade to memory or prefer.
+      fireEvent.click(screen.getByText(t('appConfig.actions.save')));
+      await waitFor(() => expect(mockFetch).toHaveBeenCalledTimes(1));
+      const payload = mockFetch.mock.calls[0][0].data;
+      expect(payload.jsonData.jobStoreBackend).toBe('postgres');
+      expect(payload.jsonData.postgresSslMode).toBe('verify-full');
+    });
+
+    test('multi-save without reload preserves newly saved Postgres fields and switching away disarms secret reset', async () => {
+      const plugin = makePlugin(
+        {
+          allowedDatasourceUids: ['prom-main'],
+          llmMode: 'grafana-llm-app',
+          jobStoreBackend: 'memory',
+        },
+        { postgresPassword: true }
+      );
+
+      render(<AppConfig plugin={plugin as never} query={{}} />);
+      const storeSelect = screen.getByLabelText(t('appConfig.jobStorage.backendLabel'));
+
+      // Save #1: configure postgres with a new password (preserving leading/trailing space).
+      fireEvent.change(storeSelect, { target: { value: 'postgres' } });
+      fireEvent.change(screen.getByPlaceholderText('postgres:5432'), {
+        target: { value: '[::ffff:127.0.0.1]:5432' },
+      });
+      fireEvent.change(screen.getByLabelText(t('appConfig.jobStorage.postgresDatabaseLabel')), {
+        target: { value: 'grafana' },
+      });
+      fireEvent.change(screen.getByLabelText(t('appConfig.jobStorage.postgresUsernameLabel')), {
+        target: { value: 'grafana@flex' },
+      });
+      fireEvent.change(screen.getByLabelText(t('appConfig.jobStorage.postgresSchemaLabel')), {
+        target: { value: '' },
+      });
+      fireEvent.change(screen.getByLabelText(t('appConfig.jobStorage.postgresTablePrefixLabel')), {
+        target: { value: '' },
+      });
+      fireEvent.change(screen.getByLabelText(t('appConfig.jobStorage.postgresSslModeLabel')), {
+        target: { value: 'require' },
+      });
+      fireEvent.click(screen.getByText('Reset Secret'));
+      fireEvent.change(screen.getByPlaceholderText('postgres-password'), {
+        target: { value: ' pg-pass-1 ' },
+      });
+
+      fireEvent.click(screen.getByText(t('appConfig.actions.save')));
+      await waitFor(() => expect(mockFetch).toHaveBeenCalledTimes(1));
+      expect(mockFetch.mock.calls[0][0].data.jsonData.postgresAddr).toBe('[::ffff:127.0.0.1]:5432');
+      expect(mockFetch.mock.calls[0][0].data.jsonData.postgresSchema).toBe('public');
+      expect(mockFetch.mock.calls[0][0].data.jsonData.postgresTablePrefix).toBe('llm_studio_');
+      expect(mockFetch.mock.calls[0][0].data.secureJsonData).toEqual({ postgresPassword: ' pg-pass-1 ' });
+
+      // Click Reset Secret on postgres password, then switch to memory and Save #2 (without reload).
+      fireEvent.click(screen.getByText('Reset Secret'));
+      fireEvent.change(storeSelect, { target: { value: 'memory' } });
+      fireEvent.click(screen.getByText(t('appConfig.actions.save')));
+      await waitFor(() => expect(mockFetch).toHaveBeenCalledTimes(2));
+      const save2 = mockFetch.mock.calls[1][0].data;
+      expect(save2.jsonData.jobStoreBackend).toBe('memory');
+      // Newly saved Postgres fields from Save #1 MUST still be preserved (not wiped by stale mount jsonData).
+      expect(save2.jsonData.postgresAddr).toBe('[::ffff:127.0.0.1]:5432');
+      expect(save2.jsonData.postgresSslMode).toBe('require');
+      expect(save2.secureJsonData).toBeUndefined();
+
+      // Switch back to postgres and Save #3 -> armed reset from before switching MUST have been disarmed!
+      fireEvent.change(storeSelect, { target: { value: 'postgres' } });
+      fireEvent.click(screen.getByText(t('appConfig.actions.save')));
+      await waitFor(() => expect(mockFetch).toHaveBeenCalledTimes(3));
+      expect(mockFetch.mock.calls[2][0].data.secureJsonData).toBeUndefined();
+    });
+
+    test('enforces UTF-8 byte limits, strict RFC 4291 IPv6, and reserved/uppercase PostgreSQL schemas', async () => {
+      const plugin = makePlugin({
+        allowedDatasourceUids: ['prom-main'],
+        llmMode: 'grafana-llm-app',
+        jobStoreBackend: 'postgres',
+      });
+
+      render(<AppConfig plugin={plugin as never} query={{}} />);
+
+      // Malformed IPv6 and bracketed non-IPv6 MUST be rejected client-side.
+      for (const badAddr of ['[:::]:5432', '[1::2::3]:5432', '[:]:5432', '[127.0.0.1]:5432', '[postgres]:5432']) {
+        fireEvent.change(screen.getByPlaceholderText('postgres:5432'), { target: { value: badAddr } });
+        fireEvent.click(screen.getByText(t('appConfig.actions.save')));
+        await waitFor(() =>
+          expect(screen.getByText(t('appConfig.validation.postgresAddrRequired'))).toBeTruthy()
+        );
+      }
+
+      // Valid IPv6, but multi-byte Japanese DB name exceeding 63 UTF-8 bytes (22 chars = 66 bytes) MUST fail.
+      fireEvent.change(screen.getByPlaceholderText('postgres:5432'), { target: { value: '[::1]:5432' } });
+      fireEvent.change(screen.getByLabelText(t('appConfig.jobStorage.postgresDatabaseLabel')), {
+        target: { value: 'あ'.repeat(22) },
+      });
+      fireEvent.click(screen.getByText(t('appConfig.actions.save')));
+      await waitFor(() =>
+        expect(screen.getByText(t('appConfig.validation.postgresDatabaseRequired'))).toBeTruthy()
+      );
+
+      // Valid DB, multi-byte username exceeding 128 UTF-8 bytes (43 chars = 129 bytes) MUST fail.
+      fireEvent.change(screen.getByLabelText(t('appConfig.jobStorage.postgresDatabaseLabel')), {
+        target: { value: 'grafana' },
+      });
+      fireEvent.change(screen.getByLabelText(t('appConfig.jobStorage.postgresUsernameLabel')), {
+        target: { value: 'あ'.repeat(43) },
+      });
+      fireEvent.click(screen.getByText(t('appConfig.actions.save')));
+      await waitFor(() =>
+        expect(screen.getByText(t('appConfig.validation.postgresUsernameRequired'))).toBeTruthy()
+      );
+
+      // Reserved system schemas and uppercase schema MUST fail.
+      fireEvent.change(screen.getByLabelText(t('appConfig.jobStorage.postgresUsernameLabel')), {
+        target: { value: 'grafana' },
+      });
+      for (const badSchema of ['PUBLIC', 'pg_temp', 'pg_catalog', 'information_schema']) {
+        fireEvent.change(screen.getByLabelText(t('appConfig.jobStorage.postgresSchemaLabel')), {
+          target: { value: badSchema },
+        });
+        fireEvent.click(screen.getByText(t('appConfig.actions.save')));
+        await waitFor(() =>
+          expect(screen.getByText(t('appConfig.validation.postgresSchemaInvalid'))).toBeTruthy()
+        );
+      }
+      expect(mockFetch).not.toHaveBeenCalled();
+    });
+
     test('clearing a numeric input fails validation instead of silently coercing to 0', async () => {
       const plugin = makePlugin({
         allowedDatasourceUids: ['prom-main'],

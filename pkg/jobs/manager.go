@@ -209,19 +209,74 @@ func NewManager(client llm.Client, cfg Config) *Manager {
 		stopCh:       make(chan struct{}),
 	}
 
-	// Subscribe to cross-replica Cancel/Undo fencing events when supported by the JobStore (e.g. RedisStore).
+	// Subscribe to cross-replica Cancel/Undo fencing events when supported by the JobStore
+	// (e.g. RedisStore or PostgresStore). Try synchronously first so healthy stores are armed
+	// immediately, and fall back to bounded background retry if the store is transiently unreachable.
 	if sub, ok := store.(CancelSubscription); ok {
-		subCtx, cancel := context.WithTimeout(context.Background(), cancelSubscribeTimeout)
-		stopFn, err := sub.SubscribeCancels(subCtx, func(jobID string, fencedToken uint64) {
+		onCancel := func(jobID string, fencedToken uint64) {
 			m.cancelLocalOp(jobID, fencedToken)
-		})
+		}
+		subCtx, cancel := context.WithTimeout(context.Background(), cancelSubscribeTimeout)
+		stopFn, err := sub.SubscribeCancels(subCtx, onCancel)
 		cancel()
 		if err == nil && stopFn != nil {
+			m.localMu.Lock()
 			m.stopCancelSub = stopFn
+			m.localMu.Unlock()
+		} else {
+			m.bgWG.Add(1)
+			go func() {
+				defer m.bgWG.Done()
+				retryCtx, retryCancel := context.WithCancel(context.Background())
+				retryDone := make(chan struct{})
+				go func() {
+					select {
+					case <-m.stopCh:
+						retryCancel()
+					case <-retryDone:
+					}
+				}()
+				defer func() {
+					close(retryDone)
+					retryCancel()
+				}()
+
+				backoff := 500 * time.Millisecond
+				const maxBackoff = 5 * time.Second
+				for {
+					timer := time.NewTimer(jitterDuration(backoff))
+					select {
+					case <-m.stopCh:
+						timer.Stop()
+						return
+					case <-timer.C:
+					}
+					backoff *= 2
+					if backoff > maxBackoff {
+						backoff = maxBackoff
+					}
+					attemptCtx, attemptCancel := context.WithTimeout(retryCtx, cancelSubscribeTimeout)
+					fn, subErr := sub.SubscribeCancels(attemptCtx, onCancel)
+					attemptCancel()
+					if subErr == nil && fn != nil {
+						m.localMu.Lock()
+						select {
+						case <-m.stopCh:
+							m.localMu.Unlock()
+							fn()
+							return
+						default:
+							m.stopCancelSub = fn
+							m.localMu.Unlock()
+							return
+						}
+					}
+				}
+			}()
 		}
 	}
 
-	// Start periodic background cleanup for idle MemoryStore/RedisStore expiration when using real wall clock.
+	// Start periodic background cleanup for idle MemoryStore/RedisStore/PostgresStore expiration when using real wall clock.
 	if m.customNow == nil && cfg.JobTTL > 0 {
 		interval := cfg.JobTTL / 2
 		if interval < 10*time.Second {
@@ -258,8 +313,8 @@ func (m *Manager) now() time.Time {
 	return time.Now()
 }
 
-// storeNow returns the explicit test clock if configured, or zero time.Time{} so RedisStore
-// uses authoritative Redis TIME in production across HA replicas.
+// storeNow returns the explicit test clock if configured, or zero time.Time{} so RedisStore/PostgresStore
+// use authoritative server time in production across HA replicas.
 func (m *Manager) storeNow() time.Time {
 	if m.customNow != nil {
 		return m.customNow()
@@ -285,10 +340,15 @@ func (m *Manager) CleanupExpired(ctx context.Context) error {
 func (m *Manager) Close() {
 	m.closeOnce.Do(func() {
 		close(m.stopCh)
-		if m.stopCancelSub != nil {
-			m.stopCancelSub()
-		}
 		m.bgWG.Wait()
+
+		m.localMu.Lock()
+		stopSub := m.stopCancelSub
+		m.stopCancelSub = nil
+		m.localMu.Unlock()
+		if stopSub != nil {
+			stopSub()
+		}
 
 		m.localMu.Lock()
 		cancels := make([]context.CancelFunc, 0, len(m.localCancels))

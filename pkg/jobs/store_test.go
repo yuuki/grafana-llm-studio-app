@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/url"
 	"os"
 	"strings"
 	"sync"
@@ -31,6 +32,9 @@ func testPostgresConfigFromEnv(t *testing.T) (jobs.PostgresConfig, bool) {
 	t.Helper()
 	addr := strings.TrimSpace(os.Getenv("LLM_STUDIO_TEST_POSTGRES_ADDR"))
 	if addr == "" {
+		if strings.TrimSpace(os.Getenv("LLM_STUDIO_REQUIRE_POSTGRES_TESTS")) == "1" {
+			t.Fatal("LLM_STUDIO_REQUIRE_POSTGRES_TESTS=1 is set but LLM_STUDIO_TEST_POSTGRES_ADDR is empty")
+		}
 		return jobs.PostgresConfig{}, false
 	}
 	db := strings.TrimSpace(os.Getenv("LLM_STUDIO_TEST_POSTGRES_DB"))
@@ -60,11 +64,28 @@ func testPostgresConfigFromEnv(t *testing.T) (jobs.PostgresConfig, bool) {
 	}, true
 }
 
+func buildTestPostgresDSN(cfg jobs.PostgresConfig) string {
+	u := &url.URL{
+		Scheme: "postgres",
+		User:   url.UserPassword(cfg.Username, cfg.Password),
+		Host:   cfg.Addr,
+		Path:   "/" + cfg.Database,
+	}
+	q := u.Query()
+	q.Set("sslmode", cfg.SSLMode)
+	q.Set("sslrootcert", "")
+	q.Set("sslcert", "")
+	q.Set("sslkey", "")
+	q.Set("connect_timeout", "5")
+	q.Set("target_session_attrs", "any")
+	u.RawQuery = q.Encode()
+	return u.String()
+}
+
 func dropTestPostgresSchema(cfg jobs.PostgresConfig) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	dsn := fmt.Sprintf("postgres://%s:%s@%s/%s?sslmode=%s", cfg.Username, cfg.Password, cfg.Addr, cfg.Database, cfg.SSLMode)
-	pool, err := pgxpool.New(ctx, dsn)
+	pool, err := pgxpool.New(ctx, buildTestPostgresDSN(cfg))
 	if err != nil {
 		return
 	}
@@ -100,7 +121,8 @@ func allStoreFactories() []storeFactory {
 			},
 		},
 	}
-	if strings.TrimSpace(os.Getenv("LLM_STUDIO_TEST_POSTGRES_ADDR")) != "" {
+	if strings.TrimSpace(os.Getenv("LLM_STUDIO_TEST_POSTGRES_ADDR")) != "" ||
+		strings.TrimSpace(os.Getenv("LLM_STUDIO_REQUIRE_POSTGRES_TESTS")) == "1" {
 		factories = append(factories, storeFactory{
 			name: "postgres",
 			new: func(t *testing.T) (jobs.JobStore, func()) {

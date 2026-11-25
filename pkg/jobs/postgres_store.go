@@ -2,6 +2,7 @@ package jobs
 
 import (
 	"context"
+	"crypto/rand"
 	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
@@ -10,11 +11,13 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"net"
 	"regexp"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -43,11 +46,19 @@ const (
 
 	postgresDefaultConnectTimeout = 5 * time.Second
 	postgresDefaultMaxConns       = int32(10)
+	postgresCleanupBatchSize      = 500
+	postgresRollbackTimeout       = time.Second
+	postgresCloseConnTimeout      = time.Second
+	postgresListenKeepalive       = 30 * time.Second
+	postgresListenPingTimeout     = 5 * time.Second
 )
 
 var (
-	validPostgresIdentRe       = regexp.MustCompile(`^[a-zA-Z_][a-zA-Z0-9_]{0,62}$`)
-	validPostgresTablePrefixRe = regexp.MustCompile(`^[a-zA-Z_][a-zA-Z0-9_]{0,31}$`)
+	// Restrict schema & tablePrefix to lowercase PostgreSQL identifiers matching unquoted
+	// folded identifier conventions so quoted pgx.Identifier references never create duplicate
+	// case-sensitive schemas (e.g. "PUBLIC" vs public).
+	validPostgresIdentRe       = regexp.MustCompile(`^[a-z_][a-z0-9_]{0,62}$`)
+	validPostgresTablePrefixRe = regexp.MustCompile(`^[a-z_][a-z0-9_]{0,31}$`)
 	allowedPostgresSSLModes    = map[string]bool{
 		PostgresSSLModeDisable:    true,
 		PostgresSSLModePrefer:     true,
@@ -77,7 +88,8 @@ type PostgresConfig struct {
 }
 
 // ValidatePostgresAddr validates that addr is a bare host:port (or [ipv6]:port) with port in 1..65535,
-// disallowing URL schemes, embedded credentials, whitespace, control characters, and malformed hosts.
+// disallowing URL schemes, embedded credentials, whitespace, control characters, bracketed non-IPv6 hosts,
+// and malformed hosts.
 func ValidatePostgresAddr(addr string) error {
 	trimmed := strings.TrimSpace(addr)
 	if trimmed == "" {
@@ -99,7 +111,12 @@ func ValidatePostgresAddr(addr string) error {
 	if host == "" {
 		return fmt.Errorf("invalid postgresAddr %q: host is empty", trimmed)
 	}
-	if net.ParseIP(host) == nil {
+	if strings.HasPrefix(trimmed, "[") {
+		ip := net.ParseIP(host)
+		if ip == nil || !strings.Contains(host, ":") {
+			return fmt.Errorf("invalid postgresAddr %q: bracketed host must be a valid IPv6 literal", trimmed)
+		}
+	} else if net.ParseIP(host) == nil {
 		if !validRedisHostnameRe.MatchString(host) || strings.Contains(host, "..") {
 			return fmt.Errorf("invalid postgresAddr %q: invalid hostname %q", trimmed, host)
 		}
@@ -114,50 +131,62 @@ func ValidatePostgresAddr(addr string) error {
 	return nil
 }
 
-// ValidatePostgresDatabase validates the PostgreSQL database name (required, 1..63 printable non-whitespace chars).
+func containsForbiddenTextRune(s string, disallowSpace bool) bool {
+	for _, r := range s {
+		if r < 0x20 || r == 0x7f || (r >= 0x80 && r <= 0x9f) || r == '\ufeff' {
+			return true
+		}
+		if disallowSpace && (r == ' ' || r == '\t' || r == '\n' || r == '\r') {
+			return true
+		}
+	}
+	return false
+}
+
+// ValidatePostgresDatabase validates the PostgreSQL database name (required, 1..63 UTF-8 bytes,
+// no whitespace, control characters, or BOM).
 func ValidatePostgresDatabase(db string) error {
 	trimmed := strings.TrimSpace(db)
 	if trimmed == "" {
 		return errors.New("postgresDatabase is required when jobStoreBackend=postgres")
 	}
 	if len(trimmed) > 63 {
-		return errors.New("postgresDatabase exceeds maximum length of 63 characters")
+		return errors.New("postgresDatabase exceeds maximum length of 63 UTF-8 bytes")
 	}
-	for i := 0; i < len(trimmed); i++ {
-		c := trimmed[i]
-		if c <= 0x20 || c == 0x7f {
-			return fmt.Errorf("invalid postgresDatabase %q: contains whitespace or control character", trimmed)
-		}
+	if containsForbiddenTextRune(trimmed, true) {
+		return fmt.Errorf("invalid postgresDatabase %q: contains whitespace, control character, or BOM", trimmed)
 	}
 	return nil
 }
 
-// ValidatePostgresUsername validates the PostgreSQL username (required, 1..128 chars, no control characters).
+// ValidatePostgresUsername validates the PostgreSQL username (required, 1..128 UTF-8 bytes,
+// no control characters or BOM).
 func ValidatePostgresUsername(user string) error {
 	trimmed := strings.TrimSpace(user)
 	if trimmed == "" {
 		return errors.New("postgresUsername is required when jobStoreBackend=postgres")
 	}
 	if len(trimmed) > 128 {
-		return errors.New("postgresUsername exceeds maximum length of 128 characters")
+		return errors.New("postgresUsername exceeds maximum length of 128 UTF-8 bytes")
 	}
-	for i := 0; i < len(trimmed); i++ {
-		c := trimmed[i]
-		if c < 0x20 || c == 0x7f {
-			return errors.New("invalid postgresUsername: contains control character")
-		}
+	if containsForbiddenTextRune(trimmed, false) {
+		return errors.New("invalid postgresUsername: contains control character or BOM")
 	}
 	return nil
 }
 
-// ValidatePostgresSchema validates the optional PostgreSQL schema identifier.
+// ValidatePostgresSchema validates the optional PostgreSQL schema identifier, disallowing
+// reserved PostgreSQL system schemas (pg_*, information_schema) and mixed-case identifiers.
 func ValidatePostgresSchema(schema string) error {
 	trimmed := strings.TrimSpace(schema)
 	if trimmed == "" {
 		return nil
 	}
 	if !validPostgresIdentRe.MatchString(trimmed) {
-		return fmt.Errorf("invalid postgresSchema %q (allowed: 1..63 chars matching [a-zA-Z_][a-zA-Z0-9_]*)", trimmed)
+		return fmt.Errorf("invalid postgresSchema %q (allowed: 1..63 lowercase chars matching [a-z_][a-z0-9_]*)", trimmed)
+	}
+	if strings.HasPrefix(trimmed, "pg_") || trimmed == "information_schema" {
+		return fmt.Errorf("invalid postgresSchema %q: reserved PostgreSQL system schema is not allowed", trimmed)
 	}
 	return nil
 }
@@ -169,7 +198,7 @@ func ValidatePostgresTablePrefix(prefix string) error {
 		return nil
 	}
 	if !validPostgresTablePrefixRe.MatchString(trimmed) {
-		return fmt.Errorf("invalid postgresTablePrefix %q (allowed: 1..32 chars matching [a-zA-Z_][a-zA-Z0-9_]*)", trimmed)
+		return fmt.Errorf("invalid postgresTablePrefix %q (allowed: 1..32 lowercase chars matching [a-z_][a-z0-9_]*)", trimmed)
 	}
 	return nil
 }
@@ -193,14 +222,15 @@ func ValidatePostgresSSLMode(mode string) error {
 type PostgresStore struct {
 	pool          *pgxpool.Pool
 	ownsPool      bool
+	listenConnCfg *pgx.ConnConfig
 	schema        string
 	tablePrefix   string
 	jobsTable     string
 	slotsTable    string
 	cancelChannel string
 
-	schemaMu    sync.Mutex
-	schemaReady bool
+	schemaReady atomic.Bool
+	schemaSem   chan struct{}
 
 	closeMu     sync.Mutex
 	closed      bool
@@ -244,6 +274,7 @@ func NewPostgresStore(cfg PostgresConfig) (*PostgresStore, error) {
 			jobsTable:     jobsTable,
 			slotsTable:    slotsTable,
 			cancelChannel: cancelChannel,
+			schemaSem:     make(chan struct{}, 1),
 			closeCtx:      closeCtx,
 			closeCancel:   closeCancel,
 		}, nil
@@ -254,6 +285,11 @@ func NewPostgresStore(cfg PostgresConfig) (*PostgresStore, error) {
 		closeCancel()
 		return nil, err
 	}
+	listenCfg := poolCfg.ConnConfig.Copy()
+	listenCfg.RuntimeParams = map[string]string{
+		"application_name": "yuuki-llmstudio-app-listen",
+	}
+
 	pool, err := pgxpool.NewWithConfig(context.Background(), poolCfg)
 	if err != nil {
 		closeCancel()
@@ -263,11 +299,13 @@ func NewPostgresStore(cfg PostgresConfig) (*PostgresStore, error) {
 	return &PostgresStore{
 		pool:          pool,
 		ownsPool:      true,
+		listenConnCfg: listenCfg,
 		schema:        schema,
 		tablePrefix:   tablePrefix,
 		jobsTable:     jobsTable,
 		slotsTable:    slotsTable,
 		cancelChannel: cancelChannel,
+		schemaSem:     make(chan struct{}, 1),
 		closeCtx:      closeCtx,
 		closeCancel:   closeCancel,
 	}, nil
@@ -302,9 +340,13 @@ func buildPostgresPoolConfig(cfg PostgresConfig) (*pgxpool.Config, error) {
 		sslMode = DefaultPostgresSSLMode
 	}
 
-	// Start from an empty pgxpool.Config and explicitly overwrite every connection field so
-	// ambient PGHOST/PGPASSWORD/PGSSLMODE environment variables cannot leak or override plugin config.
-	poolCfg, err := pgxpool.ParseConfig("")
+	// Pass explicit neutral values for every env-backed key parsed by pgconn.parseEnvSettings()
+	// so ambient PGHOST/PGPORT/PGSSLMODE/PGSSLROOTCERT/PGTARGETSESSIONATTRS/PGCONNECT_TIMEOUT/etc.
+	// can never fail startup or hijack plugin connections.
+	const neutralBaseDSN = "host=127.0.0.1 port=5432 user=x password=x dbname=x " +
+		"sslmode=disable sslcert='' sslkey='' sslrootcert='' sslpassword='' sslsni=1 " +
+		"sslnegotiation=postgres connect_timeout=5 target_session_attrs=any passfile=/dev/null"
+	poolCfg, err := pgxpool.ParseConfig(neutralBaseDSN)
 	if err != nil {
 		return nil, err
 	}
@@ -334,17 +376,32 @@ func buildPostgresPoolConfig(cfg PostgresConfig) (*pgxpool.Config, error) {
 	cc.User = strings.TrimSpace(cfg.Username)
 	cc.Password = cfg.Password
 	cc.ConnectTimeout = connectTimeout
+	cc.DialFunc = (&net.Dialer{Timeout: connectTimeout, KeepAlive: 5 * time.Minute}).DialContext
+	cc.ValidateConnect = nil
+	cc.SSLNegotiation = ""
+	cc.KerberosSrvName = ""
+	cc.KerberosSpn = ""
 	cc.RuntimeParams = map[string]string{
 		"application_name": "yuuki-llmstudio-app",
+		"lock_timeout":     "5000",
 	}
 	cc.TLSConfig = nil
 	cc.Fallbacks = nil
+
+	// Send TLS SNI when connecting by DNS hostname (required by managed Postgres / SNI proxies
+	// such as Neon, RDS Proxy, Azure Flexible Server, and HAProxy). Setting ServerName with
+	// InsecureSkipVerify=true emits SNI without enabling hostname verification.
+	sniHost := ""
+	if net.ParseIP(host) == nil {
+		sniHost = host
+	}
 
 	switch sslMode {
 	case PostgresSSLModeDisable:
 		cc.TLSConfig = nil
 	case PostgresSSLModePrefer:
 		cc.TLSConfig = &tls.Config{
+			ServerName:         sniHost,
 			InsecureSkipVerify: true, // matches libpq sslmode=prefer (encrypt if available without CA check)
 			MinVersion:         tls.VersionTLS12,
 		}
@@ -357,11 +414,13 @@ func buildPostgresPoolConfig(cfg PostgresConfig) (*pgxpool.Config, error) {
 		}
 	case PostgresSSLModeRequire:
 		cc.TLSConfig = &tls.Config{
+			ServerName:         sniHost,
 			InsecureSkipVerify: true, // matches libpq sslmode=require (require TLS 1.2+ transport encryption)
 			MinVersion:         tls.VersionTLS12,
 		}
 	case PostgresSSLModeVerifyCA:
 		cc.TLSConfig = &tls.Config{
+			ServerName:         sniHost,
 			InsecureSkipVerify: true, // hostname skipped intentionally; CA chain verified in VerifyPeerCertificate
 			MinVersion:         tls.VersionTLS12,
 			VerifyPeerCertificate: func(certificates [][]byte, _ [][]*x509.Certificate) error {
@@ -414,28 +473,75 @@ func (s *PostgresStore) schemaLockKey() int64 {
 	return s.advisoryLockKey("schema")
 }
 
+// rollbackTx rolls back tx using a short detached context so an already-cancelled caller ctx
+// still sends ROLLBACK cleanly instead of forcing pgx to tear down the TCP connection.
+func rollbackTx(ctx context.Context, tx pgx.Tx) {
+	rbCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), postgresRollbackTimeout)
+	defer cancel()
+	_ = tx.Rollback(rbCtx)
+}
+
+func closePgConnBounded(conn *pgx.Conn) {
+	if conn == nil {
+		return
+	}
+	closeCtx, cancel := context.WithTimeout(context.Background(), postgresCloseConnTimeout)
+	defer cancel()
+	_ = conn.Close(closeCtx)
+}
+
 // ensureSchema idempotently initializes the plugin tables and indexes inside a serialized
 // transaction so concurrent multi-replica startups never race on CREATE TABLE IF NOT EXISTS.
+// If both tables already exist (e.g. pre-created by a DBA for a least-privilege DML-only role),
+// ensureSchema marks itself ready without executing any DDL statements.
 func (s *PostgresStore) ensureSchema(ctx context.Context) error {
-	s.schemaMu.Lock()
-	if s.schemaReady {
-		s.schemaMu.Unlock()
+	if s.schemaReady.Load() {
 		return nil
 	}
-	defer s.schemaMu.Unlock()
+
+	select {
+	case s.schemaSem <- struct{}{}:
+		defer func() { <-s.schemaSem }()
+	case <-ctx.Done():
+		return wrapPostgresErr("ensureSchema", ctx.Err())
+	}
+
+	if s.schemaReady.Load() {
+		return nil
+	}
+
+	// Fast existence check: allows least-privilege DML-only DB roles to operate without
+	// CREATE privilege on the schema or table ownership once tables are pre-created.
+	var bothExist bool
+	if err := s.pool.QueryRow(ctx, `SELECT to_regclass($1) IS NOT NULL AND to_regclass($2) IS NOT NULL`,
+		s.jobsTable, s.slotsTable).Scan(&bothExist); err != nil {
+		return wrapPostgresErr("ensureSchema", err)
+	}
+	if bothExist {
+		s.schemaReady.Store(true)
+		return nil
+	}
 
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return wrapPostgresErr("ensureSchema", err)
 	}
-	defer func() { _ = tx.Rollback(ctx) }()
+	defer rollbackTx(ctx, tx)
 
 	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock($1)`, s.schemaLockKey()); err != nil {
 		return wrapPostgresErr("ensureSchema", err)
 	}
 
-	// Only run CREATE SCHEMA when the schema does not already exist so least-privilege DB roles
-	// with USAGE+CREATE on a pre-created schema do not require database-level CREATE privilege.
+	// Re-check inside lock in case another replica just created the tables.
+	if err := tx.QueryRow(ctx, `SELECT to_regclass($1) IS NOT NULL AND to_regclass($2) IS NOT NULL`,
+		s.jobsTable, s.slotsTable).Scan(&bothExist); err != nil {
+		return wrapPostgresErr("ensureSchema", err)
+	}
+	if bothExist {
+		s.schemaReady.Store(true)
+		return nil
+	}
+
 	if s.schema != DefaultPostgresSchema {
 		var exists bool
 		if err := tx.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM pg_namespace WHERE nspname = $1)`, s.schema).Scan(&exists); err != nil {
@@ -479,20 +585,17 @@ func (s *PostgresStore) ensureSchema(ctx context.Context) error {
 		)`, s.jobsTable),
 		fmt.Sprintf(`CREATE INDEX IF NOT EXISTS %s ON %s (org_id, updated_at_ms, job_id)`,
 			pgx.Identifier{s.tablePrefix + "jobs_org_updated_idx"}.Sanitize(), s.jobsTable),
-		fmt.Sprintf(`CREATE INDEX IF NOT EXISTS %s ON %s (org_id, owner_key, updated_at_ms, job_id)`,
-			pgx.Identifier{s.tablePrefix + "jobs_owner_updated_idx"}.Sanitize(), s.jobsTable),
 		fmt.Sprintf(`CREATE INDEX IF NOT EXISTS %s ON %s (expires_at_ms)`,
 			pgx.Identifier{s.tablePrefix + "jobs_expires_idx"}.Sanitize(), s.jobsTable),
 		fmt.Sprintf(`CREATE TABLE IF NOT EXISTS %s (
-			slot_id TEXT PRIMARY KEY,
 			org_id BIGINT NOT NULL,
+			slot_id TEXT NOT NULL,
 			owner_key TEXT NOT NULL,
-			expires_at_ms BIGINT NOT NULL
+			expires_at_ms BIGINT NOT NULL,
+			PRIMARY KEY (org_id, slot_id)
 		)`, s.slotsTable),
 		fmt.Sprintf(`CREATE INDEX IF NOT EXISTS %s ON %s (org_id, expires_at_ms)`,
 			pgx.Identifier{s.tablePrefix + "slots_org_exp_idx"}.Sanitize(), s.slotsTable),
-		fmt.Sprintf(`CREATE INDEX IF NOT EXISTS %s ON %s (org_id, owner_key, expires_at_ms)`,
-			pgx.Identifier{s.tablePrefix + "slots_owner_exp_idx"}.Sanitize(), s.slotsTable),
 		fmt.Sprintf(`CREATE INDEX IF NOT EXISTS %s ON %s (expires_at_ms)`,
 			pgx.Identifier{s.tablePrefix + "slots_exp_idx"}.Sanitize(), s.slotsTable),
 	}
@@ -506,7 +609,7 @@ func (s *PostgresStore) ensureSchema(ctx context.Context) error {
 	if err := tx.Commit(ctx); err != nil {
 		return wrapPostgresErr("ensureSchema", err)
 	}
-	s.schemaReady = true
+	s.schemaReady.Store(true)
 	return nil
 }
 
@@ -525,24 +628,97 @@ func resolvePostgresNowMs(ctx context.Context, q pgQueryRower, now time.Time) (i
 	return ms, nil
 }
 
+type pgListenConn struct {
+	dedicated *pgx.Conn
+	pooled    *pgxpool.Conn
+}
+
+func (c *pgListenConn) conn() *pgx.Conn {
+	if c == nil {
+		return nil
+	}
+	if c.dedicated != nil {
+		return c.dedicated
+	}
+	if c.pooled != nil {
+		return c.pooled.Conn()
+	}
+	return nil
+}
+
+func (c *pgListenConn) closeAndRelease() {
+	if c == nil {
+		return
+	}
+	if c.dedicated != nil {
+		closePgConnBounded(c.dedicated)
+		c.dedicated = nil
+		return
+	}
+	if c.pooled != nil {
+		// Always close the underlying connection before releasing so pgxpool destroys it
+		// instead of returning a connection with active LISTEN state to the idle pool.
+		closePgConnBounded(c.pooled.Conn())
+		c.pooled.Release()
+		c.pooled = nil
+	}
+}
+
+func (s *PostgresStore) openListenConn(ctx context.Context, listenSQL string) (*pgListenConn, error) {
+	if s.ownsPool && s.listenConnCfg != nil {
+		conn, err := pgx.ConnectConfig(ctx, s.listenConnCfg)
+		if err != nil {
+			return nil, err
+		}
+		if _, err := conn.Exec(ctx, listenSQL); err != nil {
+			closePgConnBounded(conn)
+			return nil, err
+		}
+		return &pgListenConn{dedicated: conn}, nil
+	}
+
+	pConn, err := s.pool.Acquire(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if _, err := pConn.Exec(ctx, listenSQL); err != nil {
+		closePgConnBounded(pConn.Conn())
+		pConn.Release()
+		return nil, err
+	}
+	return &pgListenConn{pooled: pConn}, nil
+}
+
+func jitterDuration(base time.Duration) time.Duration {
+	if base <= 0 {
+		return 0
+	}
+	var b [2]byte
+	_, _ = rand.Read(b[:])
+	// ±25% jitter (0.75x .. 1.25x) to avoid thundering-herd reconnects on DB restart.
+	frac := float64(binary.BigEndian.Uint16(b[:])) / 65535.0
+	return time.Duration(float64(base) * (0.75 + 0.5*frac))
+}
+
 // SubscribeCancels listens on the store's PostgreSQL NOTIFY channel so remote replicas cancel
 // in-flight LLM contexts and unwind concurrency slots immediately upon Cancel or Undo.
+// When the store owns its pool, LISTEN uses a dedicated pgx.Conn so pool capacity is never pinned.
 func (s *PostgresStore) SubscribeCancels(ctx context.Context, onCancel func(jobID string, fencedToken uint64)) (func(), error) {
+	if onCancel == nil {
+		return nil, errors.New("onCancel callback must not be nil")
+	}
 	if s.closeCtx.Err() != nil {
 		return nil, wrapPostgresErr("SubscribeCancels", errors.New("store closed"))
 	}
-	if err := s.ensureSchema(ctx); err != nil {
-		return nil, err
-	}
 
-	conn, err := s.pool.Acquire(ctx)
-	if err != nil {
-		return nil, wrapPostgresErr("SubscribeCancels", err)
-	}
+	// Tie setup to both caller ctx and store closeCtx so Close() never waits on a hung dial.
+	setupCtx, setupCancel := context.WithCancel(ctx)
+	stopWatch := context.AfterFunc(s.closeCtx, setupCancel)
 	listenSQL := "LISTEN " + pgx.Identifier{s.cancelChannel}.Sanitize()
-	if _, err := conn.Exec(ctx, listenSQL); err != nil {
-		_ = conn.Conn().Close(context.Background())
-		conn.Release()
+	lc, err := s.openListenConn(setupCtx, listenSQL)
+	stopWatch()
+	setupCancel()
+	if err != nil {
 		return nil, wrapPostgresErr("SubscribeCancels", err)
 	}
 
@@ -551,8 +727,7 @@ func (s *PostgresStore) SubscribeCancels(ctx context.Context, onCancel func(jobI
 	if s.closed {
 		s.closeMu.Unlock()
 		subCancel()
-		_ = conn.Conn().Close(context.Background())
-		conn.Release()
+		lc.closeAndRelease()
 		return nil, wrapPostgresErr("SubscribeCancels", errors.New("store closed"))
 	}
 	s.subWG.Add(1)
@@ -564,36 +739,30 @@ func (s *PostgresStore) SubscribeCancels(ctx context.Context, onCancel func(jobI
 		defer wg.Done()
 		defer s.subWG.Done()
 
-		curConn := conn
+		cur := lc
 		defer func() {
-			if curConn != nil {
-				// Close dedicated LISTEN connection before releasing so pgxpool destroys it
-				// instead of returning a connection with active LISTEN state to the idle pool.
-				_ = curConn.Conn().Close(context.Background())
-				curConn.Release()
+			if cur != nil {
+				cur.closeAndRelease()
 			}
 		}()
 
 		backoff := 200 * time.Millisecond
+		const maxBackoff = 2 * time.Second
 		for {
-			if curConn == nil {
+			if cur == nil {
+				timer := time.NewTimer(jitterDuration(backoff))
 				select {
 				case <-subCtx.Done():
+					timer.Stop()
 					return
-				case <-time.After(backoff):
+				case <-timer.C:
 				}
-				if backoff < 2*time.Second {
-					backoff *= 2
+				backoff *= 2
+				if backoff > maxBackoff {
+					backoff = maxBackoff
 				}
 				acqCtx, acqCancel := context.WithTimeout(subCtx, postgresDefaultConnectTimeout)
-				nextConn, acqErr := s.pool.Acquire(acqCtx)
-				if acqErr == nil {
-					_, acqErr = nextConn.Exec(acqCtx, listenSQL)
-					if acqErr != nil {
-						nextConn.Release()
-						nextConn = nil
-					}
-				}
+				nextLC, acqErr := s.openListenConn(acqCtx, listenSQL)
 				acqCancel()
 				if acqErr != nil {
 					if subCtx.Err() != nil {
@@ -601,19 +770,28 @@ func (s *PostgresStore) SubscribeCancels(ctx context.Context, onCancel func(jobI
 					}
 					continue
 				}
-				curConn = nextConn
+				cur = nextLC
 				backoff = 200 * time.Millisecond
 			}
 
-			notif, waitErr := curConn.Conn().WaitForNotification(subCtx)
+			waitCtx, waitCancel := context.WithTimeout(subCtx, postgresListenKeepalive)
+			notif, waitErr := cur.conn().WaitForNotification(waitCtx)
+			waitCancel()
 			if waitErr != nil {
 				if subCtx.Err() != nil {
 					return
 				}
-				// Close and release broken connection before re-acquiring.
-				_ = curConn.Conn().Close(context.Background())
-				curConn.Release()
-				curConn = nil
+				if errors.Is(waitErr, context.DeadlineExceeded) {
+					// Periodic keepalive ping detects half-open TCP drops behind cloud NAT/LBs.
+					pingCtx, pingCancel := context.WithTimeout(subCtx, postgresListenPingTimeout)
+					pingErr := cur.conn().Ping(pingCtx)
+					pingCancel()
+					if pingErr == nil {
+						continue
+					}
+				}
+				cur.closeAndRelease()
+				cur = nil
 				continue
 			}
 			if notif == nil {
@@ -674,7 +852,7 @@ func (s *PostgresStore) CreateGenerating(ctx context.Context, params CreateGener
 	if err != nil {
 		return OpLease{}, wrapPostgresErr("CreateGenerating", err)
 	}
-	defer func() { _ = tx.Rollback(ctx) }()
+	defer rollbackTx(ctx, tx)
 
 	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock($1)`, s.orgLockKey(params.Owner.OrgID)); err != nil {
 		return OpLease{}, wrapPostgresErr("CreateGenerating", err)
@@ -744,9 +922,7 @@ func (s *PostgresStore) CreateGenerating(ctx context.Context, params CreateGener
 		return OpLease{}, wrapPostgresErr("CreateGenerating", err)
 	}
 
-	_, err = tx.Exec(ctx, fmt.Sprintf(`INSERT INTO %s (slot_id, org_id, owner_key, expires_at_ms) VALUES ($1,$2,$3,$4)`, s.slotsTable),
-		slotID, params.Owner.OrgID, oKey, leaseUntilMs)
-	if err != nil {
+	if err := s.upsertSlotTx(ctx, tx, params.Owner.OrgID, slotID, oKey, leaseUntilMs); err != nil {
 		return OpLease{}, wrapPostgresErr("CreateGenerating", err)
 	}
 
@@ -795,7 +971,7 @@ func (s *PostgresStore) CreateImported(ctx context.Context, params CreateImporte
 	if err != nil {
 		return JobSnapshot{}, wrapPostgresErr("CreateImported", err)
 	}
-	defer func() { _ = tx.Rollback(ctx) }()
+	defer rollbackTx(ctx, tx)
 
 	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock($1)`, s.orgLockKey(params.Owner.OrgID)); err != nil {
 		return JobSnapshot{}, wrapPostgresErr("CreateImported", err)
@@ -925,6 +1101,13 @@ func (r *pgJobRow) isExpired(nowMs int64) bool {
 	return r.expiresAtMs > 0 && nowMs > r.expiresAtMs
 }
 
+func nextOpToken(cur uint64) (uint64, error) {
+	if cur >= math.MaxInt64 {
+		return 0, errors.New("operation token sequence exhausted")
+	}
+	return cur + 1, nil
+}
+
 func (r *pgJobRow) toSnapshot(opName string) (JobSnapshot, error) {
 	var scope *ir.ScopeFilter
 	if r.scopeJSON != "" {
@@ -997,7 +1180,7 @@ func (r *pgJobRow) toSnapshot(opName string) (JobSnapshot, error) {
 	}, nil
 }
 
-func (s *PostgresStore) selectJobRow(ctx context.Context, q pgQueryRower, jobID string, includeHistory bool, forUpdate bool) (*pgJobRow, error) {
+func (s *PostgresStore) selectJobRowWithClock(ctx context.Context, q pgQueryRower, jobID string, includeHistory bool, forUpdate bool, explicitNow time.Time) (*pgJobRow, int64, error) {
 	histExpr := "''"
 	if includeHistory {
 		histExpr = "history_json"
@@ -1006,37 +1189,44 @@ func (s *PostgresStore) selectJobRow(ctx context.Context, q pgQueryRower, jobID 
 	if forUpdate {
 		lockClause = " FOR UPDATE"
 	}
+	clockExpr := "FLOOR(EXTRACT(EPOCH FROM clock_timestamp()) * 1000)::BIGINT"
+	if !explicitNow.IsZero() {
+		clockExpr = strconv.FormatInt(normalizeTimestamp(explicitNow).UnixMilli(), 10) + "::BIGINT"
+	}
 	querySQL := fmt.Sprintf(`SELECT
 		job_id, org_id, user_login, datasource_uid, query_kind,
 		scope_json, import_source_json, status, current_ir_json, current_rev,
 		%s, history_len, last_diff_json, summary, warnings_json,
 		error_message, repair_attempts_used, max_repair_attempts, llm_meta_json,
-		known_gauges_json, updated_at_ms, expires_at_ms, active_op_token, active_op_until_ms
-	FROM %s WHERE job_id = $1%s`, histExpr, s.jobsTable, lockClause)
+		known_gauges_json, updated_at_ms, expires_at_ms, active_op_token, active_op_until_ms,
+		%s
+	FROM %s WHERE job_id = $1%s`, histExpr, clockExpr, s.jobsTable, lockClause)
 
 	var row pgJobRow
 	var opTokenSigned int64
+	var nowMs int64
 	err := q.QueryRow(ctx, querySQL, jobID).Scan(
 		&row.id, &row.orgID, &row.userLogin, &row.datasourceUID, &row.queryKind,
 		&row.scopeJSON, &row.importSourceJSON, &row.status, &row.currentIRJSON, &row.currentRev,
 		&row.historyJSON, &row.historyLen, &row.lastDiffJSON, &row.summary, &row.warningsJSON,
 		&row.errorMessage, &row.repairAttemptsUsed, &row.maxRepairAttempts, &row.llmMetaJSON,
 		&row.knownGaugesJSON, &row.updatedAtMs, &row.expiresAtMs, &opTokenSigned, &row.activeOpUntilMs,
+		&nowMs,
 	)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
-			return nil, ErrJobNotFound
+			return nil, 0, ErrJobNotFound
 		}
-		return nil, err
+		return nil, 0, err
 	}
 	if opTokenSigned > 0 {
 		row.activeOpToken = uint64(opTokenSigned)
 	}
-	return &row, nil
+	return &row, nowMs, nil
 }
 
 func (s *PostgresStore) verifyOwnedRowTx(ctx context.Context, tx pgx.Tx, owner Owner, jobID string, nowMs int64, includeHistory bool) (*pgJobRow, error) {
-	row, err := s.selectJobRow(ctx, tx, jobID, includeHistory, true)
+	row, _, err := s.selectJobRowWithClock(ctx, tx, jobID, includeHistory, true, time.UnixMilli(nowMs).UTC())
 	if err != nil {
 		if errors.Is(err, ErrJobNotFound) {
 			return nil, ErrJobNotFound
@@ -1045,7 +1235,8 @@ func (s *PostgresStore) verifyOwnedRowTx(ctx context.Context, tx pgx.Tx, owner O
 	}
 	if row.isExpired(nowMs) {
 		if row.orgID == owner.OrgID && row.userLogin == owner.UserLogin {
-			_, _ = tx.Exec(ctx, fmt.Sprintf(`DELETE FROM %s WHERE job_id = $1`, s.jobsTable), jobID)
+			_, _ = tx.Exec(ctx, fmt.Sprintf(`DELETE FROM %s WHERE job_id = $1 AND org_id = $2 AND user_login = $3`, s.jobsTable),
+				jobID, owner.OrgID, owner.UserLogin)
 			_ = tx.Commit(ctx)
 		}
 		return nil, ErrJobNotFound
@@ -1067,11 +1258,7 @@ func (s *PostgresStore) Get(ctx context.Context, owner Owner, jobID string, now 
 		return JobSnapshot{}, err
 	}
 
-	nowMs, err := resolvePostgresNowMs(ctx, s.pool, now)
-	if err != nil {
-		return JobSnapshot{}, wrapPostgresErr("Get", err)
-	}
-	row, err := s.selectJobRow(ctx, s.pool, jobID, false, false)
+	row, nowMs, err := s.selectJobRowWithClock(ctx, s.pool, jobID, false, false, now)
 	if err != nil {
 		if errors.Is(err, ErrJobNotFound) {
 			return JobSnapshot{}, ErrJobNotFound
@@ -1080,7 +1267,7 @@ func (s *PostgresStore) Get(ctx context.Context, owner Owner, jobID string, now 
 	}
 	if row.isExpired(nowMs) {
 		if row.orgID == owner.OrgID && row.userLogin == owner.UserLogin {
-			_, _ = s.pool.Exec(ctx, fmt.Sprintf(`DELETE FROM %s WHERE job_id = $1 AND org_id = $2 AND user_login = $3 AND active_op_until_ms <= $4 AND expires_at_ms < $4`, s.jobsTable),
+			_, _ = s.pool.Exec(ctx, fmt.Sprintf(`DELETE FROM %s WHERE job_id = $1 AND org_id = $2 AND user_login = $3 AND active_op_until_ms <= $4 AND expires_at_ms > 0 AND expires_at_ms < $4`, s.jobsTable),
 				jobID, owner.OrgID, owner.UserLogin, nowMs)
 		}
 		return JobSnapshot{}, ErrJobNotFound
@@ -1102,11 +1289,7 @@ func (s *PostgresStore) GetRepairCandidate(ctx context.Context, owner Owner, job
 		return RepairCandidate{}, err
 	}
 
-	nowMs, err := resolvePostgresNowMs(ctx, s.pool, now)
-	if err != nil {
-		return RepairCandidate{}, wrapPostgresErr("GetRepairCandidate", err)
-	}
-	row, err := s.selectJobRow(ctx, s.pool, jobID, false, false)
+	row, nowMs, err := s.selectJobRowWithClock(ctx, s.pool, jobID, false, false, now)
 	if err != nil {
 		if errors.Is(err, ErrJobNotFound) {
 			return RepairCandidate{}, ErrJobNotFound
@@ -1115,7 +1298,7 @@ func (s *PostgresStore) GetRepairCandidate(ctx context.Context, owner Owner, job
 	}
 	if row.isExpired(nowMs) {
 		if row.orgID == owner.OrgID && row.userLogin == owner.UserLogin {
-			_, _ = s.pool.Exec(ctx, fmt.Sprintf(`DELETE FROM %s WHERE job_id = $1 AND org_id = $2 AND user_login = $3 AND active_op_until_ms <= $4 AND expires_at_ms < $4`, s.jobsTable),
+			_, _ = s.pool.Exec(ctx, fmt.Sprintf(`DELETE FROM %s WHERE job_id = $1 AND org_id = $2 AND user_login = $3 AND active_op_until_ms <= $4 AND expires_at_ms > 0 AND expires_at_ms < $4`, s.jobsTable),
 				jobID, owner.OrgID, owner.UserLogin, nowMs)
 		}
 		return RepairCandidate{}, ErrJobNotFound
@@ -1155,9 +1338,6 @@ func (s *PostgresStore) BeginPatch(ctx context.Context, params BeginPatchParams)
 	if err := ValidateJobID(params.JobID); err != nil {
 		return BeginOpResult{}, err
 	}
-	if strings.ContainsAny(params.TargetPanelID, "\r\n") {
-		return BeginOpResult{}, fmt.Errorf("%w: %q", ir.ErrPanelNotFound, params.TargetPanelID)
-	}
 	if err := s.ensureSchema(ctx); err != nil {
 		return BeginOpResult{}, err
 	}
@@ -1172,7 +1352,7 @@ func (s *PostgresStore) BeginPatch(ctx context.Context, params BeginPatchParams)
 	if err != nil {
 		return BeginOpResult{}, wrapPostgresErr("BeginPatch", err)
 	}
-	defer func() { _ = tx.Rollback(ctx) }()
+	defer rollbackTx(ctx, tx)
 
 	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock($1)`, s.orgLockKey(params.Owner.OrgID)); err != nil {
 		return BeginOpResult{}, wrapPostgresErr("BeginPatch", err)
@@ -1202,11 +1382,30 @@ func (s *PostgresStore) BeginPatch(ctx context.Context, params BeginPatchParams)
 	if params.BaseRevision != currentIR.Revision {
 		return BeginOpResult{}, formatRevisionConflict("", params.BaseRevision, currentIR.Revision)
 	}
-	if params.TargetPanelID != "" && !panelExists(currentIR.Panels, params.TargetPanelID) {
+	if params.TargetPanelID != "" && (strings.ContainsAny(params.TargetPanelID, "\r\n") || !panelExists(currentIR.Panels, params.TargetPanelID)) {
 		return BeginOpResult{}, fmt.Errorf("%w: %q", ir.ErrPanelNotFound, params.TargetPanelID)
 	}
 	if row.isActive(nowMs) {
 		return BeginOpResult{}, ErrOperationInProgress
+	}
+
+	// Parse scope and knownGauges BEFORE committing any lease, slot, or state change.
+	var scope *ir.ScopeFilter
+	if row.scopeJSON != "" {
+		var sf ir.ScopeFilter
+		if err := json.Unmarshal([]byte(row.scopeJSON), &sf); err != nil {
+			return BeginOpResult{}, wrapPostgresErr("BeginPatch", fmt.Errorf("unmarshal scope: %w", err))
+		}
+		scope = &sf
+	}
+	knownGauges, err := unmarshalGaugeMap(row.knownGaugesJSON)
+	if err != nil {
+		return BeginOpResult{}, wrapPostgresErr("BeginPatch", fmt.Errorf("unmarshal knownGauges: %w", err))
+	}
+	mergeGaugeMapBounded(knownGauges, params.CatalogGauges)
+	gaugesJSON, err := marshalGaugeMap(knownGauges)
+	if err != nil {
+		return BeginOpResult{}, fmt.Errorf("marshal knownGauges: %w", err)
 	}
 
 	if err := s.reapExpiredOrgSlotsTx(ctx, tx, params.Owner.OrgID, nowMs); err != nil {
@@ -1221,16 +1420,12 @@ func (s *PostgresStore) BeginPatch(ctx context.Context, params BeginPatchParams)
 		return BeginOpResult{}, ErrConcurrencyLimited
 	}
 
-	knownGauges := unmarshalGaugeMap(row.knownGaugesJSON)
-	mergeGaugeMapBounded(knownGauges, params.CatalogGauges)
-	gaugesJSON, err := marshalGaugeMap(knownGauges)
+	newToken, err := nextOpToken(row.activeOpToken)
 	if err != nil {
-		return BeginOpResult{}, fmt.Errorf("marshal knownGauges: %w", err)
+		return BeginOpResult{}, wrapPostgresErr("BeginPatch", err)
 	}
-
 	jobTTLMs := maxInt64(limits.JobTTL.Milliseconds(), 1)
 	leaseTTLMs := maxInt64(limits.OpLeaseTTL.Milliseconds(), 1)
-	newToken := row.activeOpToken + 1
 	leaseUntilMs := nowMs + leaseTTLMs
 	expiresAtMs := nowMs + jobTTLMs
 
@@ -1242,23 +1437,13 @@ func (s *PostgresStore) BeginPatch(ctx context.Context, params BeginPatchParams)
 	if err != nil {
 		return BeginOpResult{}, wrapPostgresErr("BeginPatch", err)
 	}
-	_, err = tx.Exec(ctx, fmt.Sprintf(`INSERT INTO %s (slot_id, org_id, owner_key, expires_at_ms) VALUES ($1,$2,$3,$4)`, s.slotsTable),
-		slotID, params.Owner.OrgID, oKey, leaseUntilMs)
-	if err != nil {
+	if err := s.upsertSlotTx(ctx, tx, params.Owner.OrgID, slotID, oKey, leaseUntilMs); err != nil {
 		return BeginOpResult{}, wrapPostgresErr("BeginPatch", err)
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return BeginOpResult{}, wrapPostgresErr("BeginPatch", err)
 	}
 
-	var scope *ir.ScopeFilter
-	if row.scopeJSON != "" {
-		var sf ir.ScopeFilter
-		if err := json.Unmarshal([]byte(row.scopeJSON), &sf); err != nil {
-			return BeginOpResult{}, wrapPostgresErr("BeginPatch", fmt.Errorf("unmarshal scope: %w", err))
-		}
-		scope = &sf
-	}
 	qKind := query.Kind(row.queryKind)
 	if qKind == "" {
 		qKind = query.KindPromQL
@@ -1294,7 +1479,7 @@ func (s *PostgresStore) BeginRepair(ctx context.Context, params BeginRepairParam
 	if err != nil {
 		return BeginOpResult{}, wrapPostgresErr("BeginRepair", err)
 	}
-	defer func() { _ = tx.Rollback(ctx) }()
+	defer rollbackTx(ctx, tx)
 
 	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock($1)`, s.orgLockKey(params.Owner.OrgID)); err != nil {
 		return BeginOpResult{}, wrapPostgresErr("BeginRepair", err)
@@ -1331,6 +1516,25 @@ func (s *PostgresStore) BeginRepair(ctx context.Context, params BeginRepairParam
 		return BeginOpResult{}, fmt.Errorf("%w: used %d of %d repair attempts", ErrBudgetExhausted, row.repairAttemptsUsed, row.maxRepairAttempts)
 	}
 
+	// Parse scope and knownGauges BEFORE committing any budget decrement, lease, or slot.
+	var scope *ir.ScopeFilter
+	if row.scopeJSON != "" {
+		var sf ir.ScopeFilter
+		if err := json.Unmarshal([]byte(row.scopeJSON), &sf); err != nil {
+			return BeginOpResult{}, wrapPostgresErr("BeginRepair", fmt.Errorf("unmarshal scope: %w", err))
+		}
+		scope = &sf
+	}
+	knownGauges, err := unmarshalGaugeMap(row.knownGaugesJSON)
+	if err != nil {
+		return BeginOpResult{}, wrapPostgresErr("BeginRepair", fmt.Errorf("unmarshal knownGauges: %w", err))
+	}
+	mergeGaugeMapBounded(knownGauges, params.CatalogGauges)
+	gaugesJSON, err := marshalGaugeMap(knownGauges)
+	if err != nil {
+		return BeginOpResult{}, fmt.Errorf("marshal knownGauges: %w", err)
+	}
+
 	if err := s.reapExpiredOrgSlotsTx(ctx, tx, params.Owner.OrgID, nowMs); err != nil {
 		return BeginOpResult{}, wrapPostgresErr("BeginRepair", err)
 	}
@@ -1343,16 +1547,12 @@ func (s *PostgresStore) BeginRepair(ctx context.Context, params BeginRepairParam
 		return BeginOpResult{}, ErrConcurrencyLimited
 	}
 
-	knownGauges := unmarshalGaugeMap(row.knownGaugesJSON)
-	mergeGaugeMapBounded(knownGauges, params.CatalogGauges)
-	gaugesJSON, err := marshalGaugeMap(knownGauges)
+	newToken, err := nextOpToken(row.activeOpToken)
 	if err != nil {
-		return BeginOpResult{}, fmt.Errorf("marshal knownGauges: %w", err)
+		return BeginOpResult{}, wrapPostgresErr("BeginRepair", err)
 	}
-
 	jobTTLMs := maxInt64(limits.JobTTL.Milliseconds(), 1)
 	leaseTTLMs := maxInt64(limits.OpLeaseTTL.Milliseconds(), 1)
-	newToken := row.activeOpToken + 1
 	leaseUntilMs := nowMs + leaseTTLMs
 	expiresAtMs := nowMs + jobTTLMs
 
@@ -1366,23 +1566,13 @@ func (s *PostgresStore) BeginRepair(ctx context.Context, params BeginRepairParam
 	if err != nil {
 		return BeginOpResult{}, wrapPostgresErr("BeginRepair", err)
 	}
-	_, err = tx.Exec(ctx, fmt.Sprintf(`INSERT INTO %s (slot_id, org_id, owner_key, expires_at_ms) VALUES ($1,$2,$3,$4)`, s.slotsTable),
-		slotID, params.Owner.OrgID, oKey, leaseUntilMs)
-	if err != nil {
+	if err := s.upsertSlotTx(ctx, tx, params.Owner.OrgID, slotID, oKey, leaseUntilMs); err != nil {
 		return BeginOpResult{}, wrapPostgresErr("BeginRepair", err)
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return BeginOpResult{}, wrapPostgresErr("BeginRepair", err)
 	}
 
-	var scope *ir.ScopeFilter
-	if row.scopeJSON != "" {
-		var sf ir.ScopeFilter
-		if err := json.Unmarshal([]byte(row.scopeJSON), &sf); err != nil {
-			return BeginOpResult{}, wrapPostgresErr("BeginRepair", fmt.Errorf("unmarshal scope: %w", err))
-		}
-		scope = &sf
-	}
 	qKind := query.Kind(row.queryKind)
 	if qKind == "" {
 		qKind = query.KindPromQL
@@ -1413,7 +1603,7 @@ func (s *PostgresStore) SetStatus(ctx context.Context, owner Owner, jobID string
 	if err != nil {
 		return wrapPostgresErr("SetStatus", err)
 	}
-	defer func() { _ = tx.Rollback(ctx) }()
+	defer rollbackTx(ctx, tx)
 
 	nowMs, err := resolvePostgresNowMs(ctx, tx, now)
 	if err != nil {
@@ -1486,7 +1676,7 @@ func (s *PostgresStore) FinishJob(ctx context.Context, params FinishJobParams) (
 	if err != nil {
 		return JobSnapshot{}, wrapPostgresErr("FinishJob", err)
 	}
-	defer func() { _ = tx.Rollback(ctx) }()
+	defer rollbackTx(ctx, tx)
 
 	nowMs, err := resolvePostgresNowMs(ctx, tx, params.Now)
 	if err != nil {
@@ -1507,7 +1697,10 @@ func (s *PostgresStore) FinishJob(ctx context.Context, params FinishJobParams) (
 		return snap, ErrJobCancelled
 	}
 
-	newToken := row.activeOpToken + 1
+	newToken, err := nextOpToken(row.activeOpToken)
+	if err != nil {
+		return JobSnapshot{}, wrapPostgresErr("FinishJob", err)
+	}
 	row.activeOpToken = newToken
 	row.activeOpUntilMs = 0
 	row.status = string(params.Status)
@@ -1588,7 +1781,7 @@ func (s *PostgresStore) CommitRevision(ctx context.Context, params CommitRevisio
 	if err != nil {
 		return JobSnapshot{}, wrapPostgresErr("CommitRevision", err)
 	}
-	defer func() { _ = tx.Rollback(ctx) }()
+	defer rollbackTx(ctx, tx)
 
 	nowMs, err := resolvePostgresNowMs(ctx, tx, params.Now)
 	if err != nil {
@@ -1609,7 +1802,10 @@ func (s *PostgresStore) CommitRevision(ctx context.Context, params CommitRevisio
 		return snap, ErrJobCancelled
 	}
 	if row.currentIRJSON == "" || row.currentRev != params.ExpectedRev {
-		newToken := row.activeOpToken + 1
+		newToken, tokErr := nextOpToken(row.activeOpToken)
+		if tokErr != nil {
+			return JobSnapshot{}, wrapPostgresErr("CommitRevision", tokErr)
+		}
 		_, updErr := tx.Exec(ctx, fmt.Sprintf(`UPDATE %s SET active_op_token = $1, active_op_until_ms = 0 WHERE job_id = $2`, s.jobsTable),
 			int64(newToken), params.JobID)
 		if updErr != nil {
@@ -1648,7 +1844,10 @@ func (s *PostgresStore) CommitRevision(ctx context.Context, params CommitRevisio
 		return JobSnapshot{}, fmt.Errorf("marshal history: %w", err)
 	}
 
-	newToken := row.activeOpToken + 1
+	newToken, err := nextOpToken(row.activeOpToken)
+	if err != nil {
+		return JobSnapshot{}, wrapPostgresErr("CommitRevision", err)
+	}
 	row.activeOpToken = newToken
 	row.activeOpUntilMs = 0
 	row.currentIRJSON = string(nextDocBytes)
@@ -1712,7 +1911,7 @@ func (s *PostgresStore) RecordEditFailure(ctx context.Context, params RecordEdit
 	if err != nil {
 		return JobSnapshot{}, wrapPostgresErr("RecordEditFailure", err)
 	}
-	defer func() { _ = tx.Rollback(ctx) }()
+	defer rollbackTx(ctx, tx)
 
 	nowMs, err := resolvePostgresNowMs(ctx, tx, params.Now)
 	if err != nil {
@@ -1733,7 +1932,10 @@ func (s *PostgresStore) RecordEditFailure(ctx context.Context, params RecordEdit
 		return snap, ErrJobCancelled
 	}
 
-	newToken := row.activeOpToken + 1
+	newToken, err := nextOpToken(row.activeOpToken)
+	if err != nil {
+		return JobSnapshot{}, wrapPostgresErr("RecordEditFailure", err)
+	}
 	row.activeOpToken = newToken
 	row.activeOpUntilMs = 0
 	row.status = string(StatusFailed)
@@ -1774,7 +1976,7 @@ func (s *PostgresStore) RevertOnCancel(ctx context.Context, owner Owner, jobID s
 	if err != nil {
 		return JobSnapshot{}, wrapPostgresErr("RevertOnCancel", err)
 	}
-	defer func() { _ = tx.Rollback(ctx) }()
+	defer rollbackTx(ctx, tx)
 
 	nowMs, err := resolvePostgresNowMs(ctx, tx, now)
 	if err != nil {
@@ -1788,7 +1990,10 @@ func (s *PostgresStore) RevertOnCancel(ctx context.Context, owner Owner, jobID s
 		return JobSnapshot{}, wrapPostgresErr("RevertOnCancel", err)
 	}
 	if opToken > 0 && row.activeOpToken == opToken && row.isActive(nowMs) {
-		newToken := row.activeOpToken + 1
+		newToken, tokErr := nextOpToken(row.activeOpToken)
+		if tokErr != nil {
+			return JobSnapshot{}, wrapPostgresErr("RevertOnCancel", tokErr)
+		}
 		row.activeOpToken = newToken
 		row.activeOpUntilMs = 0
 		if row.currentIRJSON != "" {
@@ -1835,7 +2040,7 @@ func (s *PostgresStore) Undo(ctx context.Context, owner Owner, jobID string, now
 	if err != nil {
 		return MutationResult{}, wrapPostgresErr("Undo", err)
 	}
-	defer func() { _ = tx.Rollback(ctx) }()
+	defer rollbackTx(ctx, tx)
 
 	nowMs, err := resolvePostgresNowMs(ctx, tx, now)
 	if err != nil {
@@ -1889,7 +2094,10 @@ func (s *PostgresStore) Undo(ctx context.Context, owner Owner, jobID string, now
 		return MutationResult{}, fmt.Errorf("marshal undo diff: %w", err)
 	}
 
-	newToken := row.activeOpToken + 1
+	newToken, err := nextOpToken(row.activeOpToken)
+	if err != nil {
+		return MutationResult{}, wrapPostgresErr("Undo", err)
+	}
 	row.activeOpToken = newToken
 	row.activeOpUntilMs = 0
 	row.currentIRJSON = string(restoredBytes)
@@ -1945,7 +2153,7 @@ func (s *PostgresStore) Cancel(ctx context.Context, owner Owner, jobID string, n
 	if err != nil {
 		return MutationResult{}, wrapPostgresErr("Cancel", err)
 	}
-	defer func() { _ = tx.Rollback(ctx) }()
+	defer rollbackTx(ctx, tx)
 
 	nowMs, err := resolvePostgresNowMs(ctx, tx, now)
 	if err != nil {
@@ -1959,7 +2167,10 @@ func (s *PostgresStore) Cancel(ctx context.Context, owner Owner, jobID string, n
 		return MutationResult{}, wrapPostgresErr("Cancel", err)
 	}
 
-	newToken := row.activeOpToken + 1
+	newToken, err := nextOpToken(row.activeOpToken)
+	if err != nil {
+		return MutationResult{}, wrapPostgresErr("Cancel", err)
+	}
 	row.activeOpToken = newToken
 	row.activeOpUntilMs = 0
 	if row.currentIRJSON == "" {
@@ -1992,22 +2203,22 @@ func (s *PostgresStore) Cancel(ctx context.Context, owner Owner, jobID string, n
 	return MutationResult{Snapshot: snap, OpToken: newToken}, nil
 }
 
-func (s *PostgresStore) ReleaseSlot(ctx context.Context, owner Owner, slotID string, now time.Time) error {
+// ReleaseSlot deletes only the caller's exact slot row (single-row PK lookup) so concurrent
+// slot releases can never deadlock (40P01) against org reaping or background CleanupExpired.
+func (s *PostgresStore) ReleaseSlot(ctx context.Context, owner Owner, slotID string, _ time.Time) error {
 	if err := s.ensureSchema(ctx); err != nil {
 		return err
 	}
-	nowMs, err := resolvePostgresNowMs(ctx, s.pool, now)
-	if err != nil {
-		return wrapPostgresErr("ReleaseSlot", err)
-	}
-	_, err = s.pool.Exec(ctx, fmt.Sprintf(`DELETE FROM %s WHERE (slot_id = $1 AND org_id = $2 AND owner_key = $3) OR (org_id = $2 AND expires_at_ms <= $4)`, s.slotsTable),
-		slotID, owner.OrgID, ownerKey(owner), nowMs)
+	_, err := s.pool.Exec(ctx, fmt.Sprintf(`DELETE FROM %s WHERE org_id = $1 AND slot_id = $2 AND owner_key = $3`, s.slotsTable),
+		owner.OrgID, slotID, ownerKey(owner))
 	if err != nil {
 		return wrapPostgresErr("ReleaseSlot", err)
 	}
 	return nil
 }
 
+// CleanupExpired removes expired inactive jobs and expired slots in bounded SKIP LOCKED batches
+// so background cleanup never deadlocks concurrent org transactions or rolls back on large backlogs.
 func (s *PostgresStore) CleanupExpired(ctx context.Context, now time.Time) error {
 	if err := s.ensureSchema(ctx); err != nil {
 		return err
@@ -2016,11 +2227,39 @@ func (s *PostgresStore) CleanupExpired(ctx context.Context, now time.Time) error
 	if err != nil {
 		return wrapPostgresErr("CleanupExpired", err)
 	}
-	if _, err := s.pool.Exec(ctx, fmt.Sprintf(`DELETE FROM %s WHERE active_op_until_ms <= $1 AND expires_at_ms < $1`, s.jobsTable), nowMs); err != nil {
-		return wrapPostgresErr("CleanupExpired", err)
+
+	deleteJobsSQL := fmt.Sprintf(`DELETE FROM %s WHERE job_id IN (
+		SELECT job_id FROM %s
+		WHERE active_op_until_ms <= $1 AND expires_at_ms > 0 AND expires_at_ms < $1
+		ORDER BY job_id
+		LIMIT $2
+		FOR UPDATE SKIP LOCKED
+	)`, s.jobsTable, s.jobsTable)
+	for ctx.Err() == nil {
+		tag, err := s.pool.Exec(ctx, deleteJobsSQL, nowMs, postgresCleanupBatchSize)
+		if err != nil {
+			return wrapPostgresErr("CleanupExpired", err)
+		}
+		if tag.RowsAffected() < postgresCleanupBatchSize {
+			break
+		}
 	}
-	if _, err := s.pool.Exec(ctx, fmt.Sprintf(`DELETE FROM %s WHERE expires_at_ms <= $1`, s.slotsTable), nowMs); err != nil {
-		return wrapPostgresErr("CleanupExpired", err)
+
+	deleteSlotsSQL := fmt.Sprintf(`DELETE FROM %s WHERE (org_id, slot_id) IN (
+		SELECT org_id, slot_id FROM %s
+		WHERE expires_at_ms <= $1
+		ORDER BY org_id, slot_id
+		LIMIT $2
+		FOR UPDATE SKIP LOCKED
+	)`, s.slotsTable, s.slotsTable)
+	for ctx.Err() == nil {
+		tag, err := s.pool.Exec(ctx, deleteSlotsSQL, nowMs, postgresCleanupBatchSize)
+		if err != nil {
+			return wrapPostgresErr("CleanupExpired", err)
+		}
+		if tag.RowsAffected() < postgresCleanupBatchSize {
+			break
+		}
 	}
 	return nil
 }
@@ -2052,7 +2291,7 @@ func (s *PostgresStore) Close() error {
 // --- Transactional capacity & slot helpers ---
 
 func (s *PostgresStore) evictExpiredOrgTx(ctx context.Context, tx pgx.Tx, orgID int64, nowMs int64) error {
-	_, err := tx.Exec(ctx, fmt.Sprintf(`DELETE FROM %s WHERE org_id = $1 AND active_op_until_ms <= $2 AND expires_at_ms < $2`, s.jobsTable),
+	_, err := tx.Exec(ctx, fmt.Sprintf(`DELETE FROM %s WHERE org_id = $1 AND active_op_until_ms <= $2 AND expires_at_ms > 0 AND expires_at_ms < $2`, s.jobsTable),
 		orgID, nowMs)
 	return err
 }
@@ -2077,6 +2316,15 @@ func (s *PostgresStore) canAcquireSlotTx(ctx context.Context, tx pgx.Tx, orgID i
 		return false, nil
 	}
 	return true, nil
+}
+
+func (s *PostgresStore) upsertSlotTx(ctx context.Context, tx pgx.Tx, orgID int64, slotID string, oKey string, leaseUntilMs int64) error {
+	_, err := tx.Exec(ctx, fmt.Sprintf(`INSERT INTO %s (org_id, slot_id, owner_key, expires_at_ms)
+		VALUES ($1,$2,$3,$4)
+		ON CONFLICT (org_id, slot_id) DO UPDATE
+		SET owner_key = EXCLUDED.owner_key, expires_at_ms = EXCLUDED.expires_at_ms`, s.slotsTable),
+		orgID, slotID, oKey, leaseUntilMs)
+	return err
 }
 
 func (s *PostgresStore) ensureCapacityTx(ctx context.Context, tx pgx.Tx, caller Owner, callerKey string, nowMs int64, limits StoreLimits) error {
@@ -2143,7 +2391,8 @@ func (s *PostgresStore) ensureCapacityTx(ctx context.Context, tx pgx.Tx, caller 
 	}
 
 	if len(victims) > 0 {
-		if _, err := tx.Exec(ctx, fmt.Sprintf(`DELETE FROM %s WHERE job_id = ANY($1)`, s.jobsTable), victims); err != nil {
+		if _, err := tx.Exec(ctx, fmt.Sprintf(`DELETE FROM %s WHERE org_id = $1 AND job_id = ANY($2) AND active_op_until_ms <= $3`, s.jobsTable),
+			caller.OrgID, victims, nowMs); err != nil {
 			return wrapPostgresErr("ensureCapacity", err)
 		}
 	}
@@ -2197,7 +2446,8 @@ func (s *PostgresStore) ensureImportCapacityTx(ctx context.Context, tx pgx.Tx, c
 		return ErrConcurrencyLimited
 	}
 	if needTotal > 0 {
-		if _, err := tx.Exec(ctx, fmt.Sprintf(`DELETE FROM %s WHERE job_id = ANY($1)`, s.jobsTable), callerInactive[:needTotal]); err != nil {
+		if _, err := tx.Exec(ctx, fmt.Sprintf(`DELETE FROM %s WHERE org_id = $1 AND job_id = ANY($2) AND active_op_until_ms <= $3`, s.jobsTable),
+			caller.OrgID, callerInactive[:needTotal], nowMs); err != nil {
 			return wrapPostgresErr("ensureImportCapacity", err)
 		}
 	}
@@ -2223,17 +2473,17 @@ func marshalGaugeMap(gauges map[string]bool) (string, error) {
 	return string(b), nil
 }
 
-func unmarshalGaugeMap(raw string) map[string]bool {
+func unmarshalGaugeMap(raw string) (map[string]bool, error) {
 	out := make(map[string]bool)
 	if raw == "" || raw == "[]" {
-		return out
+		return out, nil
 	}
 	var list []string
 	if err := json.Unmarshal([]byte(raw), &list); err != nil {
-		return out
+		return nil, err
 	}
 	mergeGaugeMapBounded(out, list)
-	return out
+	return out, nil
 }
 
 func isPgUniqueViolation(err error) bool {

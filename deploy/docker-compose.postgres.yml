@@ -10,6 +10,7 @@
 # default deployments remain zero-dependency in-memory.
 services:
   grafana:
+    restart: on-failure
     environment:
       GF_DATABASE_TYPE: "postgres"
       GF_DATABASE_HOST: "postgres:5432"
@@ -36,7 +37,7 @@ services:
     volumes:
       - postgres-data:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${GF_DATABASE_USER:-grafana} -d ${GF_DATABASE_NAME:-grafana}"]
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U \"$$POSTGRES_USER\" -d \"$$POSTGRES_DB\""]
       interval: 5s
       timeout: 3s
       retries: 10

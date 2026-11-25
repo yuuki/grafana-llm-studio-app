@@ -26,9 +26,9 @@ jobs:
           POSTGRES_USER: grafana
           POSTGRES_PASSWORD: grafana-ci-password
         ports:
-          - 5432:5432
+          - 5432
         options: >-
-          --health-cmd="pg_isready -U grafana -d grafana"
+          --health-cmd="pg_isready -h 127.0.0.1 -U grafana -d grafana"
           --health-interval=5s
           --health-timeout=3s
           --health-retries=10
@@ -72,7 +72,8 @@ jobs:
 
       - name: Go race tests (Memory, Redis/miniredis, PostgreSQL 16)
         env:
-          LLM_STUDIO_TEST_POSTGRES_ADDR: 127.0.0.1:5432
+          LLM_STUDIO_REQUIRE_POSTGRES_TESTS: "1"
+          LLM_STUDIO_TEST_POSTGRES_ADDR: 127.0.0.1:${{ job.services.postgres.ports[5432] }}
           LLM_STUDIO_TEST_POSTGRES_DB: grafana
           LLM_STUDIO_TEST_POSTGRES_USER: grafana
           LLM_STUDIO_TEST_POSTGRES_PASSWORD: grafana-ci-password

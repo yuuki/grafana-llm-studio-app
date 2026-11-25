@@ -142,15 +142,15 @@ Configured via **Administration → Plugins → LLM Dashboard Studio** (`jsonDat
 | `redisDb` | `jsonData` | `0` | `0..15` | Redis logical database index (use `0` when connecting through a Redis Cluster proxy) |
 | `redisKeyPrefix` | `jsonData` | `"llmstudio:jobs"` | `[a-zA-Z0-9:_-]{1,64}` | Redis key namespace prefix wrapped in `{prefix}` hash tag (all Lua scripts access only declared `KEYS[]`) |
 | `redisTls` | `jsonData` | `false` | `boolean` | Enable TLS (minimum TLS 1.2) using the container/host system CA trust store |
-| `redisUsername` | `jsonData` | *(unset)* | `<= 128` chars | Optional Redis 6+ ACL username |
+| `redisUsername` | `jsonData` | *(unset)* | `<= 128` UTF-8 bytes | Optional Redis 6+ ACL username |
 | `redisPassword` | `secureJsonData` | *(unset)* | Encrypted secret | Optional Redis password stored encrypted in `secureJsonData` (never exposed to browser) |
-| `postgresAddr` | `jsonData` | *(unset)* | `host:port` or `[ipv6]:port` | Single-endpoint PostgreSQL server address (required when `jobStoreBackend="postgres"`; can share Grafana's PostgreSQL server; no URL scheme, whitespace, or credentials) |
-| `postgresDatabase` | `jsonData` | *(unset)* | `1..63` chars (no whitespace) | Target PostgreSQL database name (required when `jobStoreBackend="postgres"`) |
-| `postgresSchema` | `jsonData` | `"public"` | `[a-zA-Z_][a-zA-Z0-9_]{0,62}` | PostgreSQL schema where plugin tables are auto-created (use a dedicated schema such as `llm_studio` when sharing Grafana's database) |
-| `postgresTablePrefix` | `jsonData` | `"llm_studio_"` | `[a-zA-Z_][a-zA-Z0-9_]{0,31}` | Prefix for plugin-owned PostgreSQL tables (`<prefix>jobs`, `<prefix>slots`) |
-| `postgresUsername` | `jsonData` | *(unset)* | `1..128` chars | PostgreSQL login username (required when `jobStoreBackend="postgres"`) |
+| `postgresAddr` | `jsonData` | *(unset)* | `host:port` or `[ipv6]:port` | Single-endpoint PostgreSQL server address (required when `jobStoreBackend="postgres"`; connect directly or via session pooling — PgBouncer transaction pooling breaks `LISTEN`/`NOTIFY`; no URL scheme, whitespace, or credentials) |
+| `postgresDatabase` | `jsonData` | *(unset)* | `1..63` UTF-8 bytes (no whitespace/control/BOM) | Target PostgreSQL database name (required when `jobStoreBackend="postgres"`) |
+| `postgresSchema` | `jsonData` | `"public"` | `[a-z_][a-z0-9_]{0,62}` (excl. `pg_*`, `information_schema`) | Lowercase PostgreSQL schema for plugin tables (on PG 15+ or when sharing Grafana's DB, pre-create a dedicated schema such as `llm_studio`, or pre-create tables for a least-privilege DML-only role) |
+| `postgresTablePrefix` | `jsonData` | `"llm_studio_"` | `[a-z_][a-z0-9_]{0,31}` | Lowercase prefix for plugin-owned PostgreSQL tables (`<prefix>jobs`, `<prefix>slots`) |
+| `postgresUsername` | `jsonData` | *(unset)* | `1..128` UTF-8 bytes (no control/BOM) | PostgreSQL login username (required when `jobStoreBackend="postgres"`) |
 | `postgresPassword` | `secureJsonData` | *(unset)* | Encrypted secret | Optional PostgreSQL password stored encrypted in `secureJsonData` (never exposed to browser) |
-| `postgresSslMode` | `jsonData` | `"prefer"` | `"disable"`, `"prefer"`, `"require"`, `"verify-ca"`, `"verify-full"` | PostgreSQL TLS transport mode (minimum TLS 1.2; use `require`, `verify-ca`, or `verify-full` in production) |
+| `postgresSslMode` | `jsonData` | `"prefer"` | `"disable"`, `"prefer"`, `"require"`, `"verify-ca"`, `"verify-full"` | PostgreSQL TLS mode (minimum TLS 1.2; sends SNI for DNS hosts; `verify-ca`/`verify-full` validate against the container/host system root CA trust store; use `require`, `verify-ca`, or `verify-full` in production) |
 
 ## Security & Trust Boundaries
 
@@ -175,10 +175,13 @@ npm run typecheck        # TypeScript strict type checking (src + Playwright E2E
 npm run test:ci          # Jest unit, Scenes/Foundation parity, saver, and UI lifecycle tests
 npm run build            # Production Webpack bundle (dist/module.js)
 npm run verify:bundle    # Verify dist/module.js externalizes react/jsx-runtime and contains zero SECRET_INTERNALS
-go vet ./pkg/...         # Go static analysis
-go test -race -count=1 ./pkg/...  # Go unit, PromQL AST, job isolation, and grafana-llm-app contract tests
+go vet ./pkg/... ./cmd/...        # Go static analysis
+go test -race -count=1 ./pkg/... ./cmd/...  # Go unit, PromQL/MetricsQL AST, job isolation, and contract tests
+# To include live PostgreSQL integration & race tests locally:
+LLM_STUDIO_TEST_POSTGRES_ADDR=127.0.0.1:5432 LLM_STUDIO_TEST_POSTGRES_DB=grafana LLM_STUDIO_TEST_POSTGRES_USER=grafana LLM_STUDIO_TEST_POSTGRES_PASSWORD=grafana-dev-pass LLM_STUDIO_TEST_POSTGRES_SSLMODE=disable go test -race -count=1 ./pkg/... ./cmd/...
 make build-backend       # Linux amd64 Go plugin binary (dist/gpx_yuuki_llmstudio_app_linux_amd64)
 docker compose -f deploy/docker-compose.yml config --quiet
+docker compose -f deploy/docker-compose.yml -f deploy/docker-compose.postgres.yml up -d  # Optional PostgreSQL HA overlay
 ```
 
 ### Live E2E Tests (Playwright + `@grafana/plugin-e2e`)

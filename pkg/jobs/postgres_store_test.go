@@ -2,19 +2,31 @@ package jobs_test
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
+	"fmt"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/yuuki/grafana-llm-studio-app/pkg/ir"
 	"github.com/yuuki/grafana-llm-studio-app/pkg/jobs"
 	"github.com/yuuki/grafana-llm-studio-app/pkg/llm"
 )
 
 func TestPostgresStore_StrictConfigAndIdentifierValidation(t *testing.T) {
-	validAddrs := []string{"localhost:5432", "postgres.internal:5432", "127.0.0.1:5432", "[::1]:5432", "[2001:db8::1]:5433"}
+	validAddrs := []string{
+		"localhost:5432",
+		"postgres.internal:5432",
+		"127.0.0.1:5432",
+		"[::1]:5432",
+		"[2001:db8::1]:5433",
+		"[::ffff:127.0.0.1]:5432",
+	}
 	for _, addr := range validAddrs {
 		if err := jobs.ValidatePostgresAddr(addr); err != nil {
 			t.Fatalf("expected valid postgresAddr %q to pass, got %v", addr, err)
@@ -34,6 +46,9 @@ func TestPostgresStore_StrictConfigAndIdentifierValidation(t *testing.T) {
 		"[]:5432",
 		"[::1:5432",
 		"::1]:5432",
+		"[127.0.0.1]:5432",
+		"[postgres]:5432",
+		"[:::]:5432",
 		"postgres://localhost:5432/grafana",
 		"user:pass@localhost:5432",
 	}
@@ -43,8 +58,16 @@ func TestPostgresStore_StrictConfigAndIdentifierValidation(t *testing.T) {
 		}
 	}
 
-	// Database validation.
-	for _, badDB := range []string{"", "   ", "my db", "db\nname", strings.Repeat("d", 64)} {
+	// Database validation (UTF-8 byte cap, whitespace, control, BOM).
+	for _, badDB := range []string{
+		"",
+		"   ",
+		"my db",
+		"db\nname",
+		"\ufeffgrafana",
+		strings.Repeat("d", 64),
+		strings.Repeat("あ", 22), // 66 UTF-8 bytes > 63
+	} {
 		if err := jobs.ValidatePostgresDatabase(badDB); err == nil {
 			t.Fatalf("expected invalid postgresDatabase %q to fail", badDB)
 		}
@@ -53,8 +76,16 @@ func TestPostgresStore_StrictConfigAndIdentifierValidation(t *testing.T) {
 		t.Fatalf("expected valid postgresDatabase to pass, got %v", err)
 	}
 
-	// Username validation.
-	for _, badUser := range []string{"", "   ", "user\x00name", "user\nname", strings.Repeat("u", 129)} {
+	// Username validation (UTF-8 byte cap, control, BOM).
+	for _, badUser := range []string{
+		"",
+		"   ",
+		"user\x00name",
+		"user\nname",
+		"\ufeffgrafana",
+		strings.Repeat("u", 129),
+		strings.Repeat("あ", 43), // 129 UTF-8 bytes > 128
+	} {
 		if err := jobs.ValidatePostgresUsername(badUser); err == nil {
 			t.Fatalf("expected invalid postgresUsername %q to fail", badUser)
 		}
@@ -63,13 +94,26 @@ func TestPostgresStore_StrictConfigAndIdentifierValidation(t *testing.T) {
 		t.Fatalf("expected Azure/managed Postgres username with @ to pass, got %v", err)
 	}
 
-	// Schema and tablePrefix SQL identifier validation.
-	for _, badSchema := range []string{"123schema", "bad-schema", "public; DROP TABLE x;", "bad schema", strings.Repeat("s", 64)} {
+	// Schema and tablePrefix SQL identifier validation (lowercase only + reserved schema rejection).
+	for _, badSchema := range []string{
+		"123schema",
+		"bad-schema",
+		"public; DROP TABLE x;",
+		"bad schema",
+		"PUBLIC",
+		"MySchema",
+		"pg_catalog",
+		"pg_temp",
+		"pg_toast",
+		"pg_custom",
+		"information_schema",
+		strings.Repeat("s", 64),
+	} {
 		if err := jobs.ValidatePostgresSchema(badSchema); err == nil {
 			t.Fatalf("expected invalid postgresSchema %q to fail", badSchema)
 		}
 	}
-	for _, badPrefix := range []string{"1prefix", "bad-prefix", "llm;drop", strings.Repeat("p", 33)} {
+	for _, badPrefix := range []string{"1prefix", "bad-prefix", "llm;drop", "LLM_", strings.Repeat("p", 33)} {
 		if err := jobs.ValidatePostgresTablePrefix(badPrefix); err == nil {
 			t.Fatalf("expected invalid postgresTablePrefix %q to fail", badPrefix)
 		}
@@ -101,6 +145,9 @@ func TestPostgresStore_StrictConfigAndIdentifierValidation(t *testing.T) {
 		if err != nil {
 			t.Fatalf("NewPostgresStore sslMode=%s failed: %v", mode, err)
 		}
+		if _, err := s.SubscribeCancels(context.Background(), nil); err == nil {
+			t.Fatal("expected nil onCancel callback to be rejected")
+		}
 		_ = s.Close()
 	}
 
@@ -126,6 +173,47 @@ func TestPostgresStore_StrictConfigAndIdentifierValidation(t *testing.T) {
 	}
 	if strings.Contains(pingErr.Error(), "super-secret-pg-pass-never-leak") {
 		t.Fatalf("password leaked in Postgres Ping error: %v", pingErr)
+	}
+}
+
+func TestPostgresStore_AmbientPGEnvVarsDoNotHijackOrBreakStore(t *testing.T) {
+	// Poison every ambient libpq env var that pgconn.parseEnvSettings() reads.
+	t.Setenv("PGHOST", "evil.example.invalid")
+	t.Setenv("PGPORT", "not-a-port")
+	t.Setenv("PGDATABASE", "wrong_db")
+	t.Setenv("PGUSER", "wrong_user")
+	t.Setenv("PGPASSWORD", "wrong_pass")
+	t.Setenv("PGSSLMODE", "verify-full")
+	t.Setenv("PGSSLROOTCERT", "/nonexistent/ca.pem")
+	t.Setenv("PGSSLCERT", "/nonexistent/client.crt")
+	t.Setenv("PGSSLKEY", "/nonexistent/client.key")
+	t.Setenv("PGCONNECT_TIMEOUT", "invalid-timeout")
+	t.Setenv("PGTARGETSESSIONATTRS", "read-only")
+	t.Setenv("PGSSLNEGOTIATION", "direct")
+
+	s, err := jobs.NewPostgresStore(jobs.PostgresConfig{
+		Addr:     "127.0.0.1:5432",
+		Database: "grafana",
+		Username: "grafana",
+		Password: "pw",
+		SSLMode:  jobs.PostgresSSLModeDisable,
+	})
+	if err != nil {
+		t.Fatalf("NewPostgresStore failed under hostile PG* env vars: %v", err)
+	}
+	_ = s.Close()
+
+	// If live Postgres is available, verify writes actually succeed despite PGTARGETSESSIONATTRS=read-only.
+	if cfg, ok := testPostgresConfigFromEnv(t); ok {
+		defer dropTestPostgresSchema(cfg)
+		live, err := jobs.NewPostgresStore(cfg)
+		if err != nil {
+			t.Fatalf("live NewPostgresStore under hostile PG* env vars failed: %v", err)
+		}
+		defer func() { _ = live.Close() }()
+		if err := live.Ping(context.Background()); err != nil {
+			t.Fatalf("live Ping under hostile PG* env vars failed: %v", err)
+		}
 	}
 }
 
@@ -290,5 +378,207 @@ func TestPostgresStore_ConcurrentSchemaInitAndWallClockTTL(t *testing.T) {
 	}
 	if _, err := mgr.Get(alice, snap.JobID); !errors.Is(err, jobs.ErrJobNotFound) {
 		t.Fatalf("expected ErrJobNotFound after PostgreSQL TTL expiration, got %v", err)
+	}
+}
+
+func TestPostgresStore_MultiOrgSameSlotIDAndDeadlockFreeCleanupStress_Race(t *testing.T) {
+	cfg, ok := testPostgresConfigFromEnv(t)
+	if !ok {
+		t.Skip("set LLM_STUDIO_TEST_POSTGRES_ADDR to run live PostgreSQL integration tests")
+	}
+	defer dropTestPostgresSchema(cfg)
+
+	store, err := jobs.NewPostgresStore(cfg)
+	if err != nil {
+		t.Fatalf("NewPostgresStore: %v", err)
+	}
+	defer func() { _ = store.Close() }()
+
+	t0 := time.Date(2026, 11, 24, 16, 0, 0, 0, time.UTC)
+	limits := jobs.StoreLimits{
+		MaxJobs:                  20,
+		MaxJobsPerUser:           10,
+		JobTTL:                   30 * time.Second,
+		MaxConcurrentJobs:        8,
+		MaxConcurrentJobsPerUser: 4,
+		OpLeaseTTL:               10 * time.Second,
+	}
+
+	// Multi-org identical SlotID MUST NOT collide across orgs.
+	org1Owner := jobs.Owner{OrgID: 101, UserLogin: "alice"}
+	org2Owner := jobs.Owner{OrgID: 202, UserLogin: "alice"}
+	if _, err := store.CreateGenerating(context.Background(), jobs.CreateGeneratingParams{
+		JobID: "job-org1-shared-slot", Owner: org1Owner, DatasourceUID: "prom-main",
+		SlotID: "identical-slot-id", Now: t0, Limits: limits,
+	}); err != nil {
+		t.Fatalf("org1 CreateGenerating: %v", err)
+	}
+	if _, err := store.CreateGenerating(context.Background(), jobs.CreateGeneratingParams{
+		JobID: "job-org2-shared-slot", Owner: org2Owner, DatasourceUID: "prom-main",
+		SlotID: "identical-slot-id", Now: t0, Limits: limits,
+	}); err != nil {
+		t.Fatalf("org2 CreateGenerating with same SlotID failed (cross-org slot collision): %v", err)
+	}
+
+	// Seed several expired jobs & slots, then hammer CleanupExpired + ReleaseSlot + CreateGenerating
+	// concurrently to verify zero PostgreSQL 40P01 deadlocks.
+	for i := 0; i < 6; i++ {
+		u := jobs.Owner{OrgID: 1, UserLogin: fmt.Sprintf("user-%d", i)}
+		_, err := store.CreateGenerating(context.Background(), jobs.CreateGeneratingParams{
+			JobID: fmt.Sprintf("exp-job-%d", i), Owner: u, DatasourceUID: "prom-main",
+			SlotID: fmt.Sprintf("exp-slot-%d", i), Now: t0, Limits: limits,
+		})
+		if err != nil {
+			t.Fatalf("seed CreateGenerating %d: %v", i, err)
+		}
+	}
+
+	later := t0.Add(2 * time.Minute)
+	var wg sync.WaitGroup
+	errCh := make(chan error, 32)
+	start := make(chan struct{})
+
+	for i := 0; i < 4; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			for j := 0; j < 5; j++ {
+				if e := store.CleanupExpired(context.Background(), later); e != nil {
+					errCh <- fmt.Errorf("CleanupExpired: %w", e)
+				}
+			}
+		}()
+	}
+	for i := 0; i < 6; i++ {
+		wg.Add(1)
+		idx := i
+		go func() {
+			defer wg.Done()
+			<-start
+			u := jobs.Owner{OrgID: 1, UserLogin: fmt.Sprintf("user-%d", idx)}
+			if e := store.ReleaseSlot(context.Background(), u, fmt.Sprintf("exp-slot-%d", idx), later); e != nil {
+				errCh <- fmt.Errorf("ReleaseSlot %d: %w", idx, e)
+			}
+			lease, e := store.CreateGenerating(context.Background(), jobs.CreateGeneratingParams{
+				JobID: fmt.Sprintf("fresh-job-%d", idx), Owner: u, DatasourceUID: "prom-main",
+				SlotID: fmt.Sprintf("fresh-slot-%d", idx), Now: later, Limits: limits,
+			})
+			if e != nil {
+				errCh <- fmt.Errorf("CreateGenerating %d: %w", idx, e)
+				return
+			}
+			if e := store.ReleaseSlot(context.Background(), u, lease.SlotID, later); e != nil {
+				errCh <- fmt.Errorf("ReleaseSlot fresh %d: %w", idx, e)
+			}
+		}()
+	}
+	close(start)
+	wg.Wait()
+	close(errCh)
+	for e := range errCh {
+		t.Fatalf("deadlock/concurrency stress failure: %v", e)
+	}
+}
+
+func TestPostgresStore_LeastPrivilegeDMLOnlyRoleAndExternalPoolOwnership(t *testing.T) {
+	cfg, ok := testPostgresConfigFromEnv(t)
+	if !ok {
+		t.Skip("set LLM_STUDIO_TEST_POSTGRES_ADDR to run live PostgreSQL integration tests")
+	}
+	defer dropTestPostgresSchema(cfg)
+
+	// Step 1: Bootstrap schema & tables using the admin test user.
+	adminStore, err := jobs.NewPostgresStore(cfg)
+	if err != nil {
+		t.Fatalf("admin NewPostgresStore: %v", err)
+	}
+	if err := adminStore.Ping(context.Background()); err != nil {
+		_ = adminStore.Close()
+		t.Fatalf("admin Ping bootstrap: %v", err)
+	}
+	_ = adminStore.Close()
+
+	// Step 2: Create a least-privilege DML-only role (NO CREATE on schema, NO table ownership).
+	var rnd [4]byte
+	_, _ = rand.Read(rnd[:])
+	roleName := "llmstudio_dml_" + hex.EncodeToString(rnd[:])
+	rolePass := "dml-pass-@#:test"
+
+	adminPool, err := pgxpool.New(context.Background(), buildTestPostgresDSN(cfg))
+	if err != nil {
+		t.Fatalf("admin pgxpool.New: %v", err)
+	}
+	defer func() {
+		_, _ = adminPool.Exec(context.Background(), "REVOKE ALL PRIVILEGES ON ALL TABLES IN SCHEMA "+pgx.Identifier{cfg.Schema}.Sanitize()+" FROM "+pgx.Identifier{roleName}.Sanitize())
+		_, _ = adminPool.Exec(context.Background(), "REVOKE ALL PRIVILEGES ON SCHEMA "+pgx.Identifier{cfg.Schema}.Sanitize()+" FROM "+pgx.Identifier{roleName}.Sanitize())
+		_, _ = adminPool.Exec(context.Background(), "DROP ROLE IF EXISTS "+pgx.Identifier{roleName}.Sanitize())
+		adminPool.Close()
+	}()
+
+	roleIdent := pgx.Identifier{roleName}.Sanitize()
+	schemaIdent := pgx.Identifier{cfg.Schema}.Sanitize()
+	for _, stmt := range []string{
+		fmt.Sprintf("CREATE ROLE %s LOGIN PASSWORD '%s'", roleIdent, rolePass),
+		fmt.Sprintf("GRANT USAGE ON SCHEMA %s TO %s", schemaIdent, roleIdent),
+		fmt.Sprintf("GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA %s TO %s", schemaIdent, roleIdent),
+	} {
+		if _, err := adminPool.Exec(context.Background(), stmt); err != nil {
+			t.Fatalf("setup DML role (%s): %v", stmt, err)
+		}
+	}
+
+	dmlCfg := cfg
+	dmlCfg.Username = roleName
+	dmlCfg.Password = rolePass
+	dmlStore, err := jobs.NewPostgresStore(dmlCfg)
+	if err != nil {
+		t.Fatalf("DML NewPostgresStore: %v", err)
+	}
+	defer func() { _ = dmlStore.Close() }()
+
+	if err := dmlStore.Ping(context.Background()); err != nil {
+		t.Fatalf("DML-only role Ping failed (ensureSchema must skip DDL when tables exist): %v", err)
+	}
+	mgr := jobs.NewManager(&llm.MockClient{}, jobs.Config{
+		AllowedDSUIDs: []string{"prom-main"},
+		Store:         dmlStore,
+	})
+	defer mgr.Close()
+
+	alice := jobs.Owner{OrgID: 1, UserLogin: "alice"}
+	snap, err := mgr.Generate(context.Background(), alice, jobs.GenerateInput{
+		DatasourceUID: "prom-main",
+		Scope:         &ir.ScopeFilter{LabelName: "service", LabelValue: "checkout-api"},
+		UserIntent:    "Show request rate",
+		Catalog:       testCatalog(),
+	})
+	if err != nil {
+		t.Fatalf("DML-only Generate failed: %v", err)
+	}
+	if _, err := mgr.Get(alice, snap.JobID); err != nil {
+		t.Fatalf("DML-only Get failed: %v", err)
+	}
+
+	// Step 3: Verify externally supplied Pool is NOT closed by PostgresStore.Close().
+	extStore, err := jobs.NewPostgresStore(jobs.PostgresConfig{
+		Pool:        adminPool,
+		Schema:      cfg.Schema,
+		TablePrefix: cfg.TablePrefix,
+	})
+	if err != nil {
+		t.Fatalf("external pool NewPostgresStore: %v", err)
+	}
+	stopSub, err := extStore.SubscribeCancels(context.Background(), func(string, uint64) {})
+	if err != nil {
+		t.Fatalf("external pool SubscribeCancels: %v", err)
+	}
+	// Closing extStore MUST stop its listener without closing adminPool.
+	if err := extStore.Close(); err != nil {
+		t.Fatalf("extStore.Close: %v", err)
+	}
+	stopSub()
+	if err := adminPool.Ping(context.Background()); err != nil {
+		t.Fatalf("external pool was closed by PostgresStore.Close(): %v", err)
 	}
 }

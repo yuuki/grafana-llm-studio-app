@@ -5,8 +5,8 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
-	"fmt"
 	"net/http"
+	"net/url"
 	"os"
 	"strings"
 	"testing"
@@ -475,6 +475,9 @@ func TestApp_PostgresUnreachableSecretIsolation(t *testing.T) {
 func TestApp_MultiReplicaPostgresJobStoreHTTPAndSecretIsolation(t *testing.T) {
 	pgAddr := strings.TrimSpace(os.Getenv("LLM_STUDIO_TEST_POSTGRES_ADDR"))
 	if pgAddr == "" {
+		if strings.TrimSpace(os.Getenv("LLM_STUDIO_REQUIRE_POSTGRES_TESTS")) == "1" {
+			t.Fatal("LLM_STUDIO_REQUIRE_POSTGRES_TESTS=1 is set but LLM_STUDIO_TEST_POSTGRES_ADDR is empty")
+		}
 		t.Skip("set LLM_STUDIO_TEST_POSTGRES_ADDR to run live PostgreSQL plugin HTTP tests")
 	}
 	pgDB := strings.TrimSpace(os.Getenv("LLM_STUDIO_TEST_POSTGRES_DB"))
@@ -497,8 +500,16 @@ func TestApp_MultiReplicaPostgresJobStoreHTTPAndSecretIsolation(t *testing.T) {
 	defer func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
-		dsn := fmt.Sprintf("postgres://%s:%s@%s/%s?sslmode=%s", pgUser, pgPass, pgAddr, pgDB, pgSSLMode)
-		if pool, err := pgxpool.New(ctx, dsn); err == nil {
+		u := &url.URL{
+			Scheme: "postgres",
+			User:   url.UserPassword(pgUser, pgPass),
+			Host:   pgAddr,
+			Path:   "/" + pgDB,
+		}
+		q := u.Query()
+		q.Set("sslmode", pgSSLMode)
+		u.RawQuery = q.Encode()
+		if pool, err := pgxpool.New(ctx, u.String()); err == nil {
 			defer pool.Close()
 			_, _ = pool.Exec(ctx, "DROP SCHEMA IF EXISTS "+pgx.Identifier{schema}.Sanitize()+" CASCADE")
 		}
