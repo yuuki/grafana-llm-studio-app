@@ -565,4 +565,67 @@ describe('Scenes and Foundation SDK adapter parity', () => {
     expect(fPanel.targets?.[0]).not.toHaveProperty('editorMode');
     expect(fPanel.targets?.[0]).not.toHaveProperty('range');
   });
+
+  test('scopes query variable label_values(...) with requiredScope in both Scenes preview and Foundation SDK output', () => {
+    const scopedDoc: DashboardIR = {
+      schemaVersion: '1.1',
+      revision: 1,
+      title: 'Scoped Variables Dashboard',
+      timeRange: { from: 'now-15m', to: 'now' },
+      variables: [
+        {
+          name: 'instance',
+          label: 'Instance',
+          type: 'query',
+          datasourceRef: 'selected_prometheus',
+          labelName: 'instance',
+          metricName: 'http_requests_total',
+          defaultValue: 'pod-1',
+        },
+        {
+          name: 'az',
+          label: 'AZ',
+          type: 'query',
+          datasourceRef: 'selected_prometheus',
+          labelName: 'az',
+          defaultValue: 'ap-northeast-1a',
+        },
+      ],
+      panels: [
+        {
+          id: 'panel-req',
+          type: 'timeseries',
+          title: 'Request Rate',
+          datasourceRef: 'selected_prometheus',
+          query: {
+            expr: 'sum(rate(http_requests_total{service="checkout-api",instance="$instance"}[5m]))',
+          },
+          unit: 'reqps',
+          layout: { row: 0, col: 0, width: 'full' },
+        },
+      ],
+    };
+
+    const spec = normalizeDashboardIR(scopedDoc, resolvedDs, 6, {
+      labelName: 'service',
+      labelValue: 'checkout-api',
+    });
+    const scene = buildPreviewScene(spec);
+    const foundationDash = buildFoundationDashboard(spec, { uid: 'llmstudio-scoped-vars' });
+
+    const sceneVars = (scene.state.$variables as SceneVariableSet).state.variables;
+    const foundationVars = foundationDash.templating?.list ?? [];
+
+    expect((sceneVars[0] as QueryVariable).state.query).toBe(
+      'label_values(http_requests_total{service="checkout-api"}, instance)'
+    );
+    expect(foundationVars[0].query).toBe(
+      'label_values(http_requests_total{service="checkout-api"}, instance)'
+    );
+
+    expect((sceneVars[1] as QueryVariable).state.query).toBe(
+      'label_values({service="checkout-api"}, az)'
+    );
+    expect(foundationVars[1].query).toBe('label_values({service="checkout-api"}, az)');
+  });
 });

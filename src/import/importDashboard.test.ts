@@ -434,4 +434,67 @@ describe('Safe Grafana dashboard import into constrained IR v1.1 draft', () => {
     expect(report.warnings.some((w) => w.includes('WITH template'))).toBe(true);
     expect(validateIRClient(draft)).toEqual([]);
   });
+
+  test('accepts label_values filtered strictly by active import scope while rejecting mismatched or foreign filters', () => {
+    const dash = {
+      title: 'Scoped Round-Trip Dashboard',
+      time: { from: 'now-15m', to: 'now' },
+      templating: {
+        list: [
+          {
+            name: 'instance',
+            type: 'query',
+            datasource: { type: 'prometheus', uid: 'prom-main' },
+            query: 'label_values(http_requests_total{service="checkout-api"}, instance)',
+            current: { value: 'pod-1' },
+          },
+          {
+            name: 'wrong_service_var',
+            type: 'query',
+            datasource: { type: 'prometheus', uid: 'prom-main' },
+            query: 'label_values(http_requests_total{service="billing-api"}, instance)',
+            current: { value: 'pod-2' },
+          },
+          {
+            name: 'foreign_filter_var',
+            type: 'query',
+            datasource: { type: 'prometheus', uid: 'prom-main' },
+            query: 'label_values(http_requests_total{tenant="a"}, instance)',
+            current: { value: 'pod-3' },
+          },
+        ],
+      },
+      panels: [
+        {
+          id: 10,
+          type: 'timeseries',
+          title: 'Requests',
+          datasource: { type: 'prometheus', uid: 'prom-main' },
+          gridPos: { x: 0, y: 0, w: 24, h: 8 },
+          targets: [
+            {
+              expr: 'sum(rate(http_requests_total{service="checkout-api",instance="$instance"}[5m]))',
+            },
+          ],
+        },
+      ],
+    };
+
+    const { draft, report, patchContext } = convertGrafanaDashboardToIR(dash, {
+      selectedDatasourceUid: 'prom-main',
+      scope: { labelName: 'service', labelValue: 'checkout-api' },
+    });
+
+    expect(draft.variables?.map((v) => v.name)).toEqual(['instance']);
+    expect(report.skippedVariables.map((v) => v.title)).toEqual([
+      'wrong_service_var',
+      'foreign_filter_var',
+    ]);
+    expect(patchContext.variableBindings).toEqual({ instance: 0 });
+    expect(patchContext.panelBindings['panel-requests']).toEqual({
+      topIndex: 0,
+      originalNumericId: 10,
+      importedTargetIndices: [0],
+    });
+  });
 });

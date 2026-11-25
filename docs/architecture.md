@@ -90,7 +90,7 @@ sequenceDiagram
 3. **LLM Inference Authentication (`llmclient` Service Account):**
    - `plugin.json` `iam.permissions` requests only `{"action":"plugins.app:access","scope":"plugins:grafana-llm-app"}`.
    - When manually creating a service account in Grafana OSS, the minimum available basic role is `Viewer` (custom RBAC roles are a Grafana Enterprise/Cloud feature).
-   - **Important distinction:** In Grafana OSS, the `Viewer` basic role grants organization-wide read/query access in addition to `plugins.app:access`. *"Using a token exclusively for LLM calls"* is not the same as *"having no non-LLM permissions."* The Go backend enforces this boundary structurally by never passing the token anywhere outside `llmclient`, restricting `grafanaUrl` to loopback or the instance's `AppURL` origin, and disabling HTTP redirects.
+   - **Important distinction:** In Grafana OSS, the `Viewer` basic role grants organization-wide read/query access in addition to `plugins.app:access`. *"Using a token exclusively for LLM calls"* is not the same as *"having no non-LLM permissions."* The Go backend enforces this boundary structurally by never passing the token anywhere outside `llmclient`, strictly pinning `grafanaUrl` to Grafana's trusted `AppURL` base URL (or operator-pinned `LLMSTUDIO_GRAFANA_URL`, falling back to loopback only when neither is present), binding stored UI secrets to their destination, and disabling HTTP redirects.
 
 ## 4. MVP Scope & Multi-Tenant Isolation Boundaries
 

@@ -331,9 +331,6 @@ func ValidateExprWithVariables(
 						seenVars[v.Name] = true
 						res.ReferencedVariables = append(res.ReferencedVariables, v.Name)
 					}
-					if !scopeMatched && query.MatcherSatisfiesScopeWithVariable(qm, v, normalizedScope) {
-						scopeMatched = true
-					}
 				} else {
 					if qm.Type == query.MatchRegexp || qm.Type == query.MatchNotRegexp {
 						if err := query.ValidateRegexMatcher(qm.Name, qm.Type, qm.Value, policy.MaxRegexLength, policy.MaxRegexRepeat); err != nil {
@@ -352,7 +349,7 @@ func ValidateExprWithVariables(
 			}
 
 			if !scopeMatched {
-				setErr(fmt.Errorf("%w: selector for %q must retain %s=%q (or an anchored single-value $%s variable)", ErrScopeFilterMissing, metricName, normalizedScope.LabelName, normalizedScope.LabelValue, normalizedScope.LabelName))
+				setErr(fmt.Errorf("%w: selector for %q must retain literal %s=%q", ErrScopeFilterMissing, metricName, normalizedScope.LabelName, normalizedScope.LabelValue))
 				return nil
 			}
 		}

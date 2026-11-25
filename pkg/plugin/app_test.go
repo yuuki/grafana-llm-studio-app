@@ -35,12 +35,57 @@ func TestLoadSettings_SecurityAndDefaults(t *testing.T) {
 		t.Fatal("expected untrusted external grafanaUrl to be rejected")
 	}
 
-	// C-1: Matching trusted AppURL origin is allowed.
+	// Trusted AppURL pins grafanaUrl strictly to that base URL — arbitrary loopback ports and mismatched paths MUST be rejected.
+	if _, err := plugin.LoadSettings(backend.AppInstanceSettings{
+		JSONData: []byte(`{"llmMode":"grafana-llm-app","grafanaUrl":"http://127.0.0.1:9999","allowedDatasourceUids":["prom-1"]}`),
+	}, "https://grafana.internal/subpath"); err == nil {
+		t.Fatal("expected arbitrary loopback grafanaUrl to be rejected when trusted AppURL is configured")
+	}
+	if _, err := plugin.LoadSettings(backend.AppInstanceSettings{
+		JSONData: []byte(`{"llmMode":"grafana-llm-app","grafanaUrl":"https://grafana.internal","allowedDatasourceUids":["prom-1"]}`),
+	}, "https://grafana.internal/subpath"); err == nil {
+		t.Fatal("expected mismatched base path on trusted AppURL origin to be rejected")
+	}
+
+	// Exact matching trusted AppURL base URL (including default port / trailing slash normalization) is allowed.
 	s, err := plugin.LoadSettings(backend.AppInstanceSettings{
-		JSONData: []byte(`{"llmMode":"grafana-llm-app","grafanaUrl":"https://grafana.internal","maxRepairAttempts":0,"allowedDatasourceUids":["prom-1"]}`),
+		JSONData: []byte(`{"llmMode":"grafana-llm-app","grafanaUrl":"https://grafana.internal:443/subpath/","maxRepairAttempts":0,"allowedDatasourceUids":["prom-1"]}`),
 	}, "https://grafana.internal/subpath")
 	if err != nil {
-		t.Fatalf("expected matching trusted AppURL origin to pass, got %v", err)
+		t.Fatalf("expected matching trusted AppURL base URL to pass, got %v", err)
+	}
+	// Bound Grafana token succeeds for matching URL and is rejected if grafanaUrl changes (even loopback-to-loopback without trusted AppURL).
+	boundToken, err := plugin.EncodeBoundGrafanaToken("http://localhost:3000", "glsa_bound_secret")
+	if err != nil {
+		t.Fatalf("EncodeBoundGrafanaToken: %v", err)
+	}
+	if _, err := plugin.LoadSettings(backend.AppInstanceSettings{
+		JSONData:                []byte(`{"llmMode":"grafana-llm-app","grafanaUrl":"http://localhost:3000/","allowedDatasourceUids":["prom-1"]}`),
+		DecryptedSecureJSONData: map[string]string{"llmServiceAccountToken": boundToken},
+	}); err != nil {
+		t.Fatalf("expected bound grafana token to pass for matching URL, got %v", err)
+	}
+	if _, err := plugin.LoadSettings(backend.AppInstanceSettings{
+		JSONData:                []byte(`{"llmMode":"grafana-llm-app","grafanaUrl":"http://127.0.0.1:9999","allowedDatasourceUids":["prom-1"]}`),
+		DecryptedSecureJSONData: map[string]string{"llmServiceAccountToken": boundToken},
+	}); err == nil {
+		t.Fatal("expected bound grafana token to be rejected when grafanaUrl changed to a different loopback port")
+	}
+	defaultBoundToken, err := plugin.EncodeBoundGrafanaToken("", "glsa_default_bound")
+	if err != nil {
+		t.Fatalf("EncodeBoundGrafanaToken empty url: %v", err)
+	}
+	if _, err := plugin.LoadSettings(backend.AppInstanceSettings{
+		JSONData:                []byte(`{"llmMode":"grafana-llm-app","allowedDatasourceUids":["prom-1"]}`),
+		DecryptedSecureJSONData: map[string]string{"llmServiceAccountToken": defaultBoundToken},
+	}, "https://grafana.internal/subpath"); err != nil {
+		t.Fatalf("expected default-bound token to pass with empty grafanaUrl and trusted AppURL, got %v", err)
+	}
+	if _, err := plugin.LoadSettings(backend.AppInstanceSettings{
+		JSONData:                []byte(`{"llmMode":"grafana-llm-app","grafanaUrl":"http://127.0.0.1:9999","allowedDatasourceUids":["prom-1"]}`),
+		DecryptedSecureJSONData: map[string]string{"llmServiceAccountToken": defaultBoundToken},
+	}); err == nil {
+		t.Fatal("expected default-bound token to be rejected when grafanaUrl changed to custom loopback port")
 	}
 	// Default reasoningEffort is "" (compatible with standard OpenAI/OpenAI-compat models),
 	// structuredOutputMode defaults to "json_schema", tokenLimitField defaults to "max_completion_tokens",

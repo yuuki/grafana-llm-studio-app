@@ -186,12 +186,12 @@ func TestValidateExprWithVariables_AndMultiQueryDashboard(t *testing.T) {
 
 	vars := []ir.VariableIR{
 		{
-			Name:          "service",
+			Name:          "instance",
 			Type:          "query",
 			DatasourceRef: ir.SelectedDatasourceRef,
-			LabelName:     "service",
+			LabelName:     "instance",
 			MetricName:    "http_requests_total",
-			DefaultValue:  "checkout-api",
+			DefaultValue:  "pod-1",
 		},
 		{
 			Name:         "status_class",
@@ -211,10 +211,10 @@ func TestValidateExprWithVariables_AndMultiQueryDashboard(t *testing.T) {
 	}
 
 	validExprs := []string{
-		`sum by (status) (rate(http_requests_total{service="$service"}[5m]))`,
-		`sum(rate(http_requests_total{service="$service",status=~"$status_class"}[5m]))`,
-		`sum(rate(http_requests_total{service="${service}",status=~"${multi_status:regex}"}[5m]))`,
-		`sum(rate(http_requests_total{service="$service",status=~"${status_class:pipe}"}[5m]))`,
+		`sum by (status) (rate(http_requests_total{service="checkout-api",instance="$instance"}[5m]))`,
+		`sum(rate(http_requests_total{service="checkout-api",status=~"$status_class"}[5m]))`,
+		`sum(rate(http_requests_total{service="checkout-api",instance="${instance}",status=~"${multi_status:regex}"}[5m]))`,
+		`sum(rate(http_requests_total{service="checkout-api",status=~"${status_class:pipe}"}[5m]))`,
 	}
 	for _, expr := range validExprs {
 		res, err := promql.ValidateExprWithVariables(expr, cat, scope, vars, pol)
@@ -234,42 +234,42 @@ func TestValidateExprWithVariables_AndMultiQueryDashboard(t *testing.T) {
 	}{
 		{
 			name:    "undeclared variable rejected",
-			expr:    `sum(rate(http_requests_total{service="$unknown_svc"}[5m]))`,
+			expr:    `sum(rate(http_requests_total{service="checkout-api",instance="$unknown_inst"}[5m]))`,
 			wantErr: promql.ErrPolicyViolation,
 		},
 		{
 			name:    "mixed wildcard regex with variable rejected",
-			expr:    `sum(rate(http_requests_total{service="$service",status=~".*$status_class.*"}[5m]))`,
+			expr:    `sum(rate(http_requests_total{service="checkout-api",status=~".*$status_class.*"}[5m]))`,
 			wantErr: promql.ErrPolicyViolation,
 		},
 		{
 			name:    "variable in negative matcher rejected",
-			expr:    `sum(rate(http_requests_total{service="$service",status!="$status_class"}[5m]))`,
+			expr:    `sum(rate(http_requests_total{service="checkout-api",status!="$status_class"}[5m]))`,
 			wantErr: promql.ErrPolicyViolation,
 		},
 		{
 			name:    "multi variable with equality matcher rejected",
-			expr:    `sum(rate(http_requests_total{service="$service",status="$multi_status"}[5m]))`,
+			expr:    `sum(rate(http_requests_total{service="checkout-api",status="$multi_status"}[5m]))`,
 			wantErr: promql.ErrPolicyViolation,
 		},
 		{
 			name:    "C-1: query variable in =~ matcher without :regex rejected",
-			expr:    `sum(rate(http_requests_total{service="$service",status=~"${multi_status:pipe}"}[5m]))`,
+			expr:    `sum(rate(http_requests_total{service="checkout-api",status=~"${multi_status:pipe}"}[5m]))`,
 			wantErr: promql.ErrPolicyViolation,
 		},
 		{
 			name:    "C-1: raw query variable in =~ matcher rejected",
-			expr:    `sum(rate(http_requests_total{service="$service",status=~"$multi_status"}[5m]))`,
+			expr:    `sum(rate(http_requests_total{service="checkout-api",status=~"$multi_status"}[5m]))`,
 			wantErr: promql.ErrPolicyViolation,
 		},
 		{
 			name:    "H-1: variable token in PromQL StringLiteral rejected",
-			expr:    `label_replace(sum(rate(http_requests_total{service="$service"}[5m])), "dst", "$service", "src", "(.*)")`,
+			expr:    `label_replace(sum(rate(http_requests_total{service="checkout-api"}[5m])), "dst", "$instance", "src", "(.*)")`,
 			wantErr: promql.ErrPolicyViolation,
 		},
 		{
 			name:    "H-1: legacy [[var]] token in matcher rejected",
-			expr:    `sum(rate(http_requests_total{service="[[service]]"}[5m]))`,
+			expr:    `sum(rate(http_requests_total{service="checkout-api",instance="[[instance]]"}[5m]))`,
 			wantErr: promql.ErrPolicyViolation,
 		},
 		{
@@ -281,6 +281,34 @@ func TestValidateExprWithVariables_AndMultiQueryDashboard(t *testing.T) {
 			name:    "H-3: complementary class catch-all regex (\\s|\\S)+ rejected",
 			expr:    `sum(rate(http_requests_total{service="checkout-api",status=~"(\\s|\\S)+"}[5m]))`,
 			wantErr: promql.ErrPolicyViolation,
+		},
+		{
+			name: "single-select query variable CANNOT satisfy required scope (must be literal)",
+			expr: `sum(rate(http_requests_total{service="$service"}[5m]))`,
+			customVar: []ir.VariableIR{
+				{
+					Name:          "service",
+					Type:          "query",
+					DatasourceRef: ir.SelectedDatasourceRef,
+					LabelName:     "service",
+					MetricName:    "http_requests_total",
+					DefaultValue:  "checkout-api",
+				},
+			},
+			wantErr: promql.ErrScopeFilterMissing,
+		},
+		{
+			name: "single-option custom variable CANNOT satisfy required scope (must be literal)",
+			expr: `sum(rate(http_requests_total{service="$service"}[5m]))`,
+			customVar: []ir.VariableIR{
+				{
+					Name:         "service",
+					Type:         "custom",
+					Options:      []string{"checkout-api"},
+					DefaultValue: "checkout-api",
+				},
+			},
+			wantErr: promql.ErrScopeFilterMissing,
 		},
 		{
 			name: "C-2: includeAll variable cannot satisfy required scope",
@@ -371,7 +399,7 @@ func TestValidateExprWithVariables_AndMultiQueryDashboard(t *testing.T) {
 		})
 	}
 
-	t.Run("ValidateDashboardIR validates query variable metricName against catalog and all multi-query entries", func(t *testing.T) {
+	t.Run("ValidateDashboardIR validates query variable metricName against catalog, locks scope label, and validates multi-query entries", func(t *testing.T) {
 		doc := ir.DashboardIR{
 			SchemaVersion: ir.SchemaVersion,
 			Revision:      1,
@@ -385,8 +413,8 @@ func TestValidateExprWithVariables_AndMultiQueryDashboard(t *testing.T) {
 					Title:         "Latency",
 					DatasourceRef: ir.SelectedDatasourceRef,
 					Queries: []ir.QueryIR{
-						{RefID: "A", Expr: `histogram_quantile(0.50, sum by (le) (rate(http_request_duration_seconds_bucket{service="$service"}[5m])))`},
-						{RefID: "B", Expr: `histogram_quantile(0.95, sum by (le) (rate(http_request_duration_seconds_bucket{service="$service"}[5m])))`},
+						{RefID: "A", Expr: `histogram_quantile(0.50, sum by (le) (rate(http_request_duration_seconds_bucket{service="checkout-api",instance="$instance"}[5m])))`},
+						{RefID: "B", Expr: `histogram_quantile(0.95, sum by (le) (rate(http_request_duration_seconds_bucket{service="checkout-api",instance="$instance"}[5m])))`},
 					},
 					Unit:   "s",
 					Layout: ir.LayoutHint{Row: 0, Col: 0, Width: "full"},
@@ -397,9 +425,16 @@ func TestValidateExprWithVariables_AndMultiQueryDashboard(t *testing.T) {
 			t.Fatalf("expected valid multi-query dashboard to pass, got %v", err)
 		}
 
+		// Query variable targeting the locked scope label must be rejected.
+		scopeVarDoc := doc.Clone()
+		scopeVarDoc.Variables[0].LabelName = "service"
+		if _, err := promql.ValidateDashboardIR(scopeVarDoc, cat, scope, ir.ValidateOptions{MaxPanels: 6}, pol); !errors.Is(err, promql.ErrPolicyViolation) {
+			t.Fatalf("expected ErrPolicyViolation when query variable targets locked scope label, got %v", err)
+		}
+
 		// Query B referencing unknown metric must fail.
 		badMulti := doc.Clone()
-		badMulti.Panels[0].Queries[1].Expr = `rate(nonexistent_metric{service="$service"}[5m])`
+		badMulti.Panels[0].Queries[1].Expr = `rate(nonexistent_metric{service="checkout-api"}[5m])`
 		if _, err := promql.ValidateDashboardIR(badMulti, cat, scope, ir.ValidateOptions{MaxPanels: 6}, pol); !errors.Is(err, promql.ErrMetricNotInCatalog) {
 			t.Fatalf("expected ErrMetricNotInCatalog on query B, got %v", err)
 		}
@@ -420,9 +455,9 @@ func TestValidateExprWithVariables_AndMultiQueryDashboard(t *testing.T) {
 	})
 
 	t.Run("InterpolateVariables is single-pass and escapes PromQL string + RE2 properly (C-3)", func(t *testing.T) {
-		in := `sum(rate(http_requests_total{service="$service",status=~"${status_class:pipe}"}[5m]))`
+		in := `sum(rate(http_requests_total{service="checkout-api",instance="$instance",status=~"${status_class:pipe}"}[5m]))`
 		got := promql.InterpolateVariables(in, vars[:2])
-		want := `sum(rate(http_requests_total{service="checkout-api",status=~"5.."}[5m]))`
+		want := `sum(rate(http_requests_total{service="checkout-api",instance="pod-1",status=~"5.."}[5m]))`
 		if got != want {
 			t.Fatalf("InterpolateVariables = %q, want %q", got, want)
 		}

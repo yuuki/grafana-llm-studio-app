@@ -30,6 +30,7 @@ import {
   ExistingDashboardSummary,
   fetchExistingDashboardByUid,
   ImportConversionReport,
+  ImportPatchContext,
   listExistingDashboards,
 } from '../import/importDashboard';
 import {
@@ -75,6 +76,7 @@ interface PreservedImportMeta {
   folderUid?: string;
   preservedAnnotations?: Record<string, string>;
   preservedLabels?: Record<string, string>;
+  patchContext?: ImportPatchContext;
 }
 
 const VALIDATION_BADGE_COLOR: Record<ValidationCategory, 'green' | 'orange' | 'red' | 'blue'> = {
@@ -591,16 +593,17 @@ export const StudioPage: React.FC = () => {
       if (controller.signal.aborted || seq !== contextSeqRef.current) {
         return;
       }
-      const { draft, report } = convertGrafanaDashboardToIR(fetched.rawDashboard, {
-        selectedDatasourceUid: selectedDatasource.uid,
-        selectedDatasourceName: selectedDatasource.name,
-        queryKind: activeDialect.kind,
-        maxPanels: publicCfg?.maxPanels ?? 6,
-      });
       const scope: ScopeFilter | undefined =
         isCatalogFresh && scopeLabelValue.trim()
           ? { labelName: scopeLabelName, labelValue: scopeLabelValue.trim() }
           : undefined;
+      const { draft, report, patchContext } = convertGrafanaDashboardToIR(fetched.rawDashboard, {
+        selectedDatasourceUid: selectedDatasource.uid,
+        selectedDatasourceName: selectedDatasource.name,
+        queryKind: activeDialect.kind,
+        maxPanels: publicCfg?.maxPanels ?? 6,
+        scope,
+      });
       const importedJob = await importDraft(
         {
           datasourceUid: selectedDatasource.uid,
@@ -632,6 +635,7 @@ export const StudioPage: React.FC = () => {
             folderUid: importedJob.importSource.folderUid ?? '',
             preservedAnnotations: fetched.preservedAnnotations,
             preservedLabels: fetched.preservedLabels,
+            patchContext,
           }
         );
       }
@@ -761,7 +765,8 @@ export const StudioPage: React.FC = () => {
       const normalized = normalizeDashboardIR(
         job.currentIR,
         selectedDatasource,
-        publicCfg?.maxPanels ?? 6
+        publicCfg?.maxPanels ?? 6,
+        job.scope
       );
       const varsFingerprint = computeVariablesFingerprint(normalized);
 
@@ -939,8 +944,15 @@ export const StudioPage: React.FC = () => {
     }
   };
 
+  const activeImportMeta =
+    job?.importSource?.uid
+      ? latestImportMetaRef.current.get(`${job.jobId}:${job.importSource.uid}`)
+      : undefined;
+
   const canOptInUpdate = Boolean(
-    job?.importSource?.uid && job?.importSource?.resourceVersion
+    job?.importSource?.uid &&
+      job?.importSource?.resourceVersion &&
+      activeImportMeta?.patchContext
   );
 
   const handleSaveDashboard = async () => {
@@ -967,24 +979,28 @@ export const StudioPage: React.FC = () => {
       const currentSpec = normalizeDashboardIR(
         job.currentIR,
         selectedDatasource,
-        publicCfg?.maxPanels ?? 6
+        publicCfg?.maxPanels ?? 6,
+        job.scope
       );
-      const useUpdate =
-        optInUpdateExisting &&
-        Boolean(job.importSource?.uid) &&
-        Boolean(job.importSource?.resourceVersion);
-
       const importMetaKey = job.importSource?.uid
         ? `${job.jobId}:${job.importSource.uid}`
         : '';
       const preservedMeta = importMetaKey
         ? latestImportMetaRef.current.get(importMetaKey)
         : undefined;
+      const useUpdate =
+        optInUpdateExisting &&
+        Boolean(job.importSource?.uid) &&
+        Boolean(job.importSource?.resourceVersion) &&
+        Boolean(preservedMeta?.patchContext);
+
       const updateFolderUid = job.importSource?.folderUid ?? preservedMeta?.folderUid ?? '';
 
       const res = useUpdate
         ? await saverRef.current.updateExistingDashboard({
             spec: currentSpec,
+            currentIR: job.currentIR,
+            patchContext: preservedMeta!.patchContext!,
             previewedRevision: previewMeta.revision,
             targetUid: job.importSource!.uid,
             expectedResourceVersion:
@@ -1040,7 +1056,8 @@ export const StudioPage: React.FC = () => {
       const spec = normalizeDashboardIR(
         job.currentIR,
         selectedDatasource,
-        publicCfg?.maxPanels ?? 6
+        publicCfg?.maxPanels ?? 6,
+        job.scope
       );
       const json = buildExportableDashboardJson(spec);
       const blob = new Blob([json], { type: 'application/json' });
@@ -1063,13 +1080,14 @@ export const StudioPage: React.FC = () => {
       const spec = normalizeDashboardIR(
         job.currentIR,
         selectedDatasource,
-        publicCfg?.maxPanels ?? 6
+        publicCfg?.maxPanels ?? 6,
+        job.scope
       );
       return buildExportableDashboardJson(spec);
     } catch {
       return '';
     }
-  }, [job?.currentIR, selectedDatasource, publicCfg?.maxPanels]);
+  }, [job?.currentIR, job?.scope, selectedDatasource, publicCfg?.maxPanels]);
 
   const canSave =
     Boolean(previewSpec) &&

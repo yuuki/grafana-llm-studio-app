@@ -122,12 +122,12 @@ Configured via **Administration → Plugins → LLM Dashboard Studio** (`jsonDat
 | `allowedDatasourceUids` | `jsonData` | `[]` | Prometheus-compatible UIDs | Allowlist of datasources selectable in Studio; LLMs cannot choose arbitrary UIDs |
 | `llmMode` | `jsonData` | `"grafana-llm-app"` | `"grafana-llm-app"`, `"mock"` | Inference backend mode (`"mock"` requires `allowMockInDev: true`) |
 | `allowMockInDev` | `jsonData` | `false` | `boolean` | Explicit opt-in for dev/test mock mode; normalized to `false` outside mock mode |
-| `grafanaUrl` | `jsonData` | `"http://localhost:3000"` | Loopback or same-origin `AppURL` | Internal Grafana URL used by Go `llmclient` (HTTP redirects disabled) |
+| `grafanaUrl` | `jsonData` | *(uses trusted `AppURL`)* | Exact trusted `AppURL` / `LLMSTUDIO_GRAFANA_URL` (loopback fallback only if unset) | Internal Grafana URL used by Go `llmclient` (HTTP redirects disabled) |
 | `modelTier` | `jsonData` | `"base"` | `"base"`, `"large"` | Logical model tier mapped by `grafana-llm-app` |
 | `structuredOutputMode` | `jsonData` | `"json_schema"` | `"json_schema"`, `"json_object"` | `json_schema` for OpenAI/vLLM/OpenRouter/Gemini; `json_object` for providers without `json_schema` (e.g., DeepSeek API) |
 | `tokenLimitField` | `jsonData` | `"max_completion_tokens"` | `"max_completion_tokens"`, `"max_tokens"` | Output token limit field (`max_tokens` for legacy/third-party OpenAI-compatible APIs) |
 | `reasoningEffort` | `jsonData` | `""` | `""`, `"low"`, `"medium"`, `"high"` | Omit (`""`) for standard models (`gpt-4o`, `gpt-4.1`, Llama); set `"low"` for reasoning models (`o3`, `gpt-5`, `GLM-5.3`) |
-| `llmServiceAccountToken` | `secureJsonData` | *(unset)* | Grafana SA token (`glsa_...`) | Encrypted token dedicated solely to calling `grafana-llm-app` |
+| `llmServiceAccountToken` | `secureJsonData` | *(unset)* | Grafana SA token (`glsa_...`) | Encrypted token dedicated solely to calling `grafana-llm-app` (bound to `grafanaUrl`; re-entry required on URL change) |
 | `maxPanels` | `jsonData` | `6` | `1..6` | Maximum panels per generated dashboard |
 | `maxRepairAttempts` | `jsonData` | `2` | `0..2` | Maximum syntax-only auto-repair calls per job (`0` disables repair) |
 | `maxOutputTokens` | `jsonData` | `2048` | `256..8192` | Output token cap per LLM call |
@@ -139,18 +139,18 @@ Configured via **Administration → Plugins → LLM Dashboard Studio** (`jsonDat
 | `enableSseProgress` | `jsonData` | `false` | `boolean` | Opt-in decoupled SSE stage-progress streaming over `CallResource` (`generating` -> `validating_ir` -> `awaiting_preview`, never raw LLM tokens); requires reverse-proxy `proxy_buffering off` and HTTP/1.1, with graceful non-streaming fallback |
 | `jobStoreBackend` | `jsonData` | `"memory"` | `"memory"`, `"redis"` | Job storage backend (`"memory"` zero-dependency default; `"redis"` for HA multi-replica persistence) |
 | `jobTtlMinutes` | `jsonData` | `30` | `1..1440` | Automatic expiration TTL (minutes) for idle draft jobs |
-| `redisAddr` | `jsonData` | *(unset)* | `host:port` or `[ipv6]:port` | Single-endpoint Redis/Valkey server or cluster proxy address (required when `jobStoreBackend="redis"`; no URL scheme, whitespace, or credentials) |
+| `redisAddr` | `jsonData` | *(unset)* | `host:port` or `[ipv6]:port` | Single-endpoint Redis/Valkey server or cluster proxy address (required when `jobStoreBackend="redis"`; optionally operator-pinned via `LLMSTUDIO_REDIS_ADDR`) |
 | `redisDb` | `jsonData` | `0` | `0..15` | Redis logical database index (use `0` when connecting through a Redis Cluster proxy) |
 | `redisKeyPrefix` | `jsonData` | `"llmstudio:jobs"` | `[a-zA-Z0-9:_-]{1,64}` | Redis key namespace prefix wrapped in `{prefix}` hash tag (all Lua scripts access only declared `KEYS[]`) |
 | `redisTls` | `jsonData` | `false` | `boolean` | Enable TLS (minimum TLS 1.2) using the container/host system CA trust store |
 | `redisUsername` | `jsonData` | *(unset)* | `<= 128` chars | Optional Redis 6+ ACL username |
-| `redisPassword` | `secureJsonData` | *(unset)* | Encrypted secret | Optional Redis password stored encrypted in `secureJsonData` (never exposed to browser) |
+| `redisPassword` | `secureJsonData` | *(unset)* | Encrypted secret | Optional Redis password stored encrypted in `secureJsonData`, bound to `redisAddr` + `redisTls` (re-entry required on change) |
 
 ## Security & Trust Boundaries
 
 - **Trusted Identity & Isolation:** Job ownership is bound to Grafana's server-supplied `PluginContext` (`OrgID` + `User.Login`). Browser-supplied IDs are never trusted for authorization.
 - **No Cross-User Metadata Cache:** Metric names, `HELP` strings, and label values are kept strictly in browser memory per session and cleared on organization or datasource switch.
-- **SSRF & Redirect Protection:** `grafanaUrl` is restricted to loopback addresses or the Grafana instance's own `AppURL` origin, and `llmclient` disables HTTP redirects.
+- **SSRF, Redirect, & Credential-Redirection Protection:** When Grafana's trusted `AppURL` (or operator-pinned `LLMSTUDIO_GRAFANA_URL`) is present, `grafanaUrl` is strictly pinned to that exact base URL (arbitrary loopback ports are rejected) and `llmclient` disables HTTP redirects. Stored UI credentials (`redisPassword` and `llmServiceAccountToken`) are bound to their target endpoint/TLS mode so changing the destination requires re-entering or clearing the secret; operators can also pin Redis at the deployment level via `LLMSTUDIO_REDIS_ADDR`.
 - **Prompt Injection Defense-in-Depth:** User prompts, metric metadata, LLM outputs, and datasource errors are treated as untrusted input—sanitized, length-bounded, and checked against deterministic schemas, catalog allowlists, and PromQL AST/regex safety rules. Raw URLs, HTML, JavaScript, and arbitrary datasource UIDs are disallowed in the IR.
 - **Multi-Tenancy Caveat (Grafana OSS):** Within a single Grafana OSS organization, folder permissions or UI hiding do **not** isolate Prometheus metric access. Serving users with different data-access scopes in production requires separate Grafana organizations paired with upstream credential, tenant, or authorization-proxy isolation (detailed in [`docs/architecture.md`](docs/architecture.md)).
 
