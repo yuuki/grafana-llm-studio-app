@@ -182,7 +182,7 @@ func (c *GrafanaLLMClient) callStructured(
 		ResponseFormat:  responseFormat,
 	}
 	if c.cfg.TokenLimitField == TokenLimitMaxTokens {
-		chatReq.MaxTokens = c.cfg.MaxOutputTokens
+		chatReq.MaxTokens = c.cfg.MaxOutputTokens //nolint:staticcheck // SA1019: intentionally supports max_tokens for OpenAI-compatible providers that reject max_completion_tokens
 	} else {
 		chatReq.MaxCompletionTokens = c.cfg.MaxOutputTokens
 	}
