@@ -58,7 +58,7 @@ This plugin intentionally pins and verifies concrete target versions rather than
 | **`@grafana/grafana-foundation-sdk`** | `0.0.22` | Generates Classic Dashboard JSON (`schemaVersion: 42`) |
 | **`grafana-plugin-sdk-go`** | `v0.278.0` | `ProtocolVersion = 2` (wire-compatible with Grafana 12.4.x and 13.x) |
 | **LLM Backends (via `grafana-llm-app`)** | OpenAI / OpenAI-compatible APIs or local `vLLM >= v0.12.0` | Supports `json_schema` / `json_object` and `max_completion_tokens` / `max_tokens`; model-agnostic via `base`/`large` |
-| **Build Toolchain** | Node.js `>=22.0.0`, Go `1.24.3` | Reproducible builds (`npm ci` + `go mod vendor` supported for offline packaging) |
+| **Build Toolchain** | Node.js `26`, Go `1.27.4` (`mise.toml`) | Reproducible builds (`npm ci` + `go mod vendor` supported for offline packaging) |
 
 See [`docs/compatibility.md`](docs/compatibility.md) for the full source-verified matrix and [`docs/openai-compatible-apis.md`](docs/openai-compatible-apis.md) for provider-by-provider setup.
 
@@ -68,8 +68,8 @@ The included Docker Compose stack launches Grafana OSS, Prometheus (with query g
 
 ### Prerequisites
 
-- Node.js `>= 22.0.0` and npm
-- Go `1.24.x`
+- Node.js `26` and npm
+- Go `1.27.4` (the version in `go.mod`; `mise install` installs both)
 - Docker & Docker Compose
 
 ### 1. Install dependencies & build the plugin

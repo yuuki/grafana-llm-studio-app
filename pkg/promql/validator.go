@@ -22,6 +22,11 @@ var (
 		"label_replace": true,
 		"label_join":    true,
 	}
+
+	// promqlParser accepts only stable PromQL: every experimental option of the
+	// Prometheus parser (functions, duration expressions, extended range
+	// selectors, fill modifiers) stays off, as the parser's former globals were.
+	promqlParser = parser.NewParser(parser.Options{})
 )
 
 // Policy configures deterministic PromQL static inspection bounds.
@@ -149,7 +154,7 @@ func ValidateExprWithVariables(
 		return ValidationResult{}, err
 	}
 
-	ast, err := parser.ParseExpr(trimmed)
+	ast, err := promqlParser.ParseExpr(trimmed)
 	if err != nil {
 		return ValidationResult{}, fmt.Errorf("PromQL syntax error: %w", err)
 	}
