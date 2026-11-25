@@ -71,6 +71,9 @@ jobs:
           EVENT_NAME: ${{ github.event_name }}
           REF_NAME: ${{ github.ref_name }}
         run: |
+          # Single quotes on purpose: the ${...} below are JavaScript template
+          # literals for node, not shell expansions.
+          # shellcheck disable=SC2016
           node --input-type=module -e '
             import fs from "node:fs";
             import { execFileSync } from "node:child_process";
