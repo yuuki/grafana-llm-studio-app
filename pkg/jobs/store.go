@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -25,10 +26,21 @@ const (
 	defaultMaxUndoHistory           = 10
 	defaultOpLeaseGrace             = 15 * time.Second
 	defaultStoreOpTimeout           = 5 * time.Second
+	maxKnownGaugesPerJob            = 512
 )
 
+var validJobIDRe = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$`)
+
+// ValidateJobID checks that jobID is a safe bounded identifier before hitting any JobStore.
+func ValidateJobID(jobID string) error {
+	if !validJobIDRe.MatchString(jobID) {
+		return ErrJobNotFound
+	}
+	return nil
+}
+
 // StoreLimits defines bounded capacity, TTL, undo depth, and concurrency parameters
-// enforced atomically by a JobStore implementation.
+// enforced atomically per Grafana organization by a JobStore implementation.
 type StoreLimits struct {
 	MaxJobs                  int
 	MaxJobsPerUser           int
@@ -68,6 +80,13 @@ func (l StoreLimits) normalized() StoreLimits {
 type OpLease struct {
 	OpToken uint64
 	SlotID  string
+}
+
+// MutationResult pairs the resulting JobSnapshot with the updated monotonic fencing token
+// produced by Undo or Cancel so callers only cancel local contexts older than OpToken.
+type MutationResult struct {
+	Snapshot JobSnapshot
+	OpToken  uint64
 }
 
 // BeginOpResult contains the fencing token, slot lease, and authoritative job state
@@ -179,6 +198,8 @@ type CommitRevisionParams struct {
 }
 
 // RecordEditFailureParams specifies parameters for recording a Patch or Repair failure.
+// RecordEditFailure returns (snapshot, nil) when the failure state is persisted cleanly,
+// or (snapshot, ErrJobCancelled) when the opToken/lease is no longer active.
 type RecordEditFailureParams struct {
 	Owner        Owner
 	JobID        string
@@ -190,8 +211,11 @@ type RecordEditFailureParams struct {
 }
 
 // JobStore abstracts job persistence, strict (OrgID, UserLogin) owner isolation,
-// per-user and global concurrency locking, atomic repair-budget accounting, and
+// per-org/per-user concurrency locking, atomic repair-budget accounting, and
 // TTL-based expiration across single-process or multi-replica HA deployments.
+//
+// Timestamps and TTLs have millisecond resolution normalized to UTC. When Now is zero,
+// implementations use their authoritative clock (time.Now for MemoryStore, Redis TIME for RedisStore).
 //
 // Implementations MUST verify exact Owner (OrgID and UserLogin) equality on every
 // read and write operation, returning ErrForbidden if a job exists for another owner
@@ -208,15 +232,22 @@ type JobStore interface {
 	CommitRevision(ctx context.Context, params CommitRevisionParams) (JobSnapshot, error)
 	RecordEditFailure(ctx context.Context, params RecordEditFailureParams) (JobSnapshot, error)
 	RevertOnCancel(ctx context.Context, owner Owner, jobID string, opToken uint64, now time.Time, jobTTL time.Duration) (JobSnapshot, error)
-	Undo(ctx context.Context, owner Owner, jobID string, now time.Time, jobTTL time.Duration) (JobSnapshot, error)
-	Cancel(ctx context.Context, owner Owner, jobID string, now time.Time, jobTTL time.Duration) (JobSnapshot, error)
+	Undo(ctx context.Context, owner Owner, jobID string, now time.Time, jobTTL time.Duration) (MutationResult, error)
+	Cancel(ctx context.Context, owner Owner, jobID string, now time.Time, jobTTL time.Duration) (MutationResult, error)
 	ReleaseSlot(ctx context.Context, owner Owner, slotID string, now time.Time) error
 	CleanupExpired(ctx context.Context, now time.Time) error
 	Ping(ctx context.Context) error
 	Close() error
 }
 
-// ownerKey produces a deterministic, collision-free, PII-free Redis key component for an Owner.
+// CancelSubscription is an optional extension implemented by distributed JobStores
+// (such as RedisStore) to broadcast Cancel/Undo fencing events across replicas so
+// in-flight LLM requests and concurrency slots unwind immediately on remote replicas.
+type CancelSubscription interface {
+	SubscribeCancels(ctx context.Context, onCancel func(jobID string, fencedToken uint64)) (stop func(), err error)
+}
+
+// ownerKey produces a deterministic, collision-free, PII-free key component for an Owner.
 // Using a NUL delimiter inside SHA-256 prevents any collision regardless of characters in UserLogin.
 func ownerKey(owner Owner) string {
 	sum := sha256.Sum256([]byte(strconv.FormatInt(owner.OrgID, 10) + "\x00" + owner.UserLogin))
@@ -235,7 +266,7 @@ func extractPanelIDs(panels []ir.PanelIR) []string {
 	}
 	ids := make([]string, 0, len(panels))
 	for _, p := range panels {
-		if id := strings.TrimSpace(p.ID); id != "" {
+		if id := strings.TrimSpace(p.ID); id != "" && !strings.ContainsAny(id, "\r\n") {
 			ids = append(ids, id)
 		}
 	}
@@ -251,7 +282,7 @@ func extractGaugeNames(catalog []ir.MetricCatalogItem) []string {
 	for _, item := range catalog {
 		if strings.EqualFold(strings.TrimSpace(item.Type), "gauge") {
 			name := strings.TrimSpace(item.Name)
-			if name != "" {
+			if name != "" && !strings.ContainsAny(name, "\r\n") {
 				if _, ok := seen[name]; !ok {
 					seen[name] = struct{}{}
 					out = append(out, name)
@@ -260,7 +291,29 @@ func extractGaugeNames(catalog []ir.MetricCatalogItem) []string {
 		}
 	}
 	sort.Strings(out)
+	if len(out) > maxKnownGaugesPerJob {
+		out = out[:maxKnownGaugesPerJob]
+	}
 	return out
+}
+
+func mergeGaugeMapBounded(dst map[string]bool, incoming []string) {
+	if dst == nil {
+		return
+	}
+	for _, g := range incoming {
+		g = strings.TrimSpace(g)
+		if g == "" || strings.ContainsAny(g, "\r\n") {
+			continue
+		}
+		if dst[g] {
+			continue
+		}
+		if len(dst) >= maxKnownGaugesPerJob {
+			break
+		}
+		dst[g] = true
+	}
 }
 
 func cloneStringBoolMap(src map[string]bool) map[string]bool {
@@ -288,4 +341,11 @@ func formatRevisionConflict(prefix string, requested, current int) error {
 		return fmt.Errorf("%w: request baseRevision=%d != current revision=%d", ir.ErrRevisionConflict, requested, current)
 	}
 	return fmt.Errorf("%w: %s baseRevision=%d != current revision=%d", ir.ErrRevisionConflict, prefix, requested, current)
+}
+
+func normalizeTimestamp(t time.Time) time.Time {
+	if t.IsZero() {
+		t = time.Now()
+	}
+	return t.UTC().Truncate(time.Millisecond)
 }

@@ -402,7 +402,7 @@ func TestJobStore_PerUserAndGlobalConcurrencyLocking_Race(t *testing.T) {
 				{OrgID: 1, UserLogin: "u1"},
 				{OrgID: 1, UserLogin: "u2"},
 				{OrgID: 1, UserLogin: "u3"},
-				{OrgID: 2, UserLogin: "u1"},
+				{OrgID: 1, UserLogin: "u4"},
 			}
 
 			var wg sync.WaitGroup
@@ -917,5 +917,377 @@ func TestRedisStore_NativeTTLExpirationValidationAndPingFailure(t *testing.T) {
 	}
 	if _, err := mgr.Get(alice, snap.JobID); !errors.Is(err, jobs.ErrStoreUnavailable) {
 		t.Fatalf("expected ErrStoreUnavailable on Get after Redis shutdown, got %v", err)
+	}
+}
+
+func TestJobStore_MultiOrgIsolation(t *testing.T) {
+	for _, sf := range allStoreFactories() {
+		t.Run(sf.name, func(t *testing.T) {
+			store, cleanup := sf.new(t)
+			defer cleanup()
+
+			org2Started := make(chan struct{}, 2)
+			org2Release := make(chan struct{})
+			llmStub := &stubLLM{
+				onGenerate: func(ctx context.Context, req llm.GenerateRequest) ([]byte, llm.CompletionMeta, error) {
+					if req.UserIntent == "org2-hold" {
+						org2Started <- struct{}{}
+						<-org2Release
+					}
+					return (&llm.MockClient{}).GenerateIR(ctx, req)
+				},
+				onPatch: (&llm.MockClient{}).GeneratePatch,
+			}
+
+			cfg := jobs.Config{
+				AllowedDSUIDs:            []string{"prom-main"},
+				MaxJobs:                  1,
+				MaxJobsPerUser:           1,
+				MaxConcurrentJobs:        1,
+				MaxConcurrentJobsPerUser: 1,
+				Store:                    store,
+			}
+			mgr1 := jobs.NewManager(llmStub, cfg)
+			mgr2 := jobs.NewManager(llmStub, cfg)
+			defer mgr1.Close()
+			defer mgr2.Close()
+
+			org1Alice := jobs.Owner{OrgID: 1, UserLogin: "alice"}
+			org2Bob := jobs.Owner{OrgID: 2, UserLogin: "bob"}
+
+			// Org 1 creates a job (fills Org 1's MaxJobs=1).
+			org1Job, err := mgr1.Generate(context.Background(), org1Alice, jobs.GenerateInput{
+				DatasourceUID: "prom-main",
+				Scope:         &ir.ScopeFilter{LabelName: "service", LabelValue: "checkout-api"},
+				UserIntent:    "Show request rate and error rate",
+				Catalog:       testCatalog(),
+			})
+			if err != nil {
+				t.Fatalf("org1 Generate: %v", err)
+			}
+
+			// Org 2 holds its full concurrency slot (MaxConcurrentJobs=1) and creates a job (MaxJobs=1).
+			doneOrg2 := make(chan error, 1)
+			go func() {
+				_, gErr := mgr2.Generate(context.Background(), org2Bob, jobs.GenerateInput{
+					DatasourceUID: "prom-main",
+					Scope:         &ir.ScopeFilter{LabelName: "service", LabelValue: "checkout-api"},
+					UserIntent:    "org2-hold",
+					Catalog:       testCatalog(),
+				})
+				doneOrg2 <- gErr
+			}()
+			<-org2Started
+
+			// Org 1 MUST NOT be starved by Org 2's concurrency slot AND Org 1's job MUST NOT be evicted by Org 2!
+			if _, err := mgr1.Get(org1Alice, org1Job.JobID); err != nil {
+				t.Fatalf("org1 job was evicted by org2: %v", err)
+			}
+			if _, err := mgr1.Patch(context.Background(), org1Alice, org1Job.JobID, jobs.PatchInput{
+				BaseRevision:  1,
+				TargetPanelID: "panel-error-rate",
+				EditIntent:    "Switch error panel to timeseries",
+				Catalog:       testCatalog(),
+			}); err != nil {
+				t.Fatalf("org1 Patch failed while org2 held org2 slot: %v", err)
+			}
+
+			close(org2Release)
+			if err := <-doneOrg2; err != nil {
+				t.Fatalf("org2 Generate failed: %v", err)
+			}
+			// Org 1's job MUST still exist after Org 2 finished.
+			if _, err := mgr1.Get(org1Alice, org1Job.JobID); err != nil {
+				t.Fatalf("org1 job missing after org2 completed: %v", err)
+			}
+		})
+	}
+}
+
+func TestRedisStore_CrossReplicaCancelPubSubUnwindsSlotImmediately(t *testing.T) {
+	mr := miniredis.RunT(t)
+	store1, err := jobs.NewRedisStore(jobs.RedisConfig{Addr: mr.Addr(), KeyPrefix: "pubsubtest"})
+	if err != nil {
+		t.Fatalf("NewRedisStore 1: %v", err)
+	}
+	defer func() { _ = store1.Close() }()
+	store2, err := jobs.NewRedisStore(jobs.RedisConfig{Addr: mr.Addr(), KeyPrefix: "pubsubtest"})
+	if err != nil {
+		t.Fatalf("NewRedisStore 2: %v", err)
+	}
+	defer func() { _ = store2.Close() }()
+
+	patchStarted := make(chan struct{})
+	cancelledInLLM := make(chan struct{})
+	stub1 := &stubLLM{
+		onGenerate: (&llm.MockClient{}).GenerateIR,
+		onPatch: func(ctx context.Context, _ llm.PatchRequest) ([]byte, llm.CompletionMeta, error) {
+			close(patchStarted)
+			<-ctx.Done()
+			close(cancelledInLLM)
+			return nil, llm.CompletionMeta{ProviderMode: "stub"}, ctx.Err()
+		},
+	}
+
+	mgr1 := jobs.NewManager(stub1, jobs.Config{
+		AllowedDSUIDs:            []string{"prom-main"},
+		MaxConcurrentJobs:        1,
+		MaxConcurrentJobsPerUser: 1,
+		JobDeadline:              60 * time.Second,
+		Store:                    store1,
+	})
+	defer mgr1.Close()
+	mgr2 := jobs.NewManager(&llm.MockClient{}, jobs.Config{
+		AllowedDSUIDs:            []string{"prom-main"},
+		MaxConcurrentJobs:        1,
+		MaxConcurrentJobsPerUser: 1,
+		JobDeadline:              60 * time.Second,
+		Store:                    store2,
+	})
+	defer mgr2.Close()
+
+	alice := jobs.Owner{OrgID: 1, UserLogin: "alice"}
+	s1, err := mgr1.Generate(context.Background(), alice, jobs.GenerateInput{
+		DatasourceUID: "prom-main",
+		Scope:         &ir.ScopeFilter{LabelName: "service", LabelValue: "checkout-api"},
+		UserIntent:    "Show request rate and error rate",
+		Catalog:       testCatalog(),
+	})
+	if err != nil {
+		t.Fatalf("Generate: %v", err)
+	}
+
+	patchDone := make(chan error, 1)
+	go func() {
+		_, pErr := mgr1.Patch(context.Background(), alice, s1.JobID, jobs.PatchInput{
+			BaseRevision:  1,
+			TargetPanelID: "panel-error-rate",
+			EditIntent:    "Slow edit",
+			Catalog:       testCatalog(),
+		})
+		patchDone <- pErr
+	}()
+	<-patchStarted
+
+	// Cancel arrives at Replica 2 -> Pub/Sub MUST immediately cancel Replica 1's LLM context and release the slot!
+	if _, err := mgr2.Cancel(alice, s1.JobID); err != nil {
+		t.Fatalf("Replica 2 Cancel failed: %v", err)
+	}
+
+	select {
+	case <-cancelledInLLM:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for cross-replica Pub/Sub to cancel Replica 1 LLM context")
+	}
+	if pErr := <-patchDone; !errors.Is(pErr, jobs.ErrJobCancelled) {
+		t.Fatalf("expected Replica 1 Patch to return ErrJobCancelled, got %v", pErr)
+	}
+
+	// Slot is immediately free on Replica 2 (no 60-75s lockout!).
+	if _, err := mgr2.Generate(context.Background(), alice, jobs.GenerateInput{
+		DatasourceUID: "prom-main",
+		Scope:         &ir.ScopeFilter{LabelName: "service", LabelValue: "checkout-api"},
+		UserIntent:    "Fresh generation after cross-replica cancel",
+		Catalog:       testCatalog(),
+	}); err != nil {
+		t.Fatalf("expected immediate Generate on Replica 2 after cross-replica cancel, got %v", err)
+	}
+}
+
+func TestJobStore_AdversarialFencingNewlineInjectionHistoryAndErrors(t *testing.T) {
+	for _, sf := range allStoreFactories() {
+		t.Run(sf.name, func(t *testing.T) {
+			store, cleanup := sf.new(t)
+			defer cleanup()
+
+			clk := newTestClock(time.Date(2026, 11, 24, 15, 0, 0, 0, time.UTC))
+			var llmPatchCalls atomic.Int64
+			var patchErrToReturn error
+			stub := &stubLLM{
+				onGenerate: (&llm.MockClient{}).GenerateIR,
+				onPatch: func(ctx context.Context, req llm.PatchRequest) ([]byte, llm.CompletionMeta, error) {
+					llmPatchCalls.Add(1)
+					if patchErrToReturn != nil {
+						return nil, llm.CompletionMeta{ProviderMode: "stub"}, patchErrToReturn
+					}
+					patch := ir.DashboardPatch{
+						SchemaVersion: ir.SchemaVersion,
+						BaseRevision:  req.CurrentIR.Revision,
+						Summary:       fmt.Sprintf("Title rev %d", req.CurrentIR.Revision+1),
+						Operations: []ir.PatchOperation{
+							{
+								Op:      "update_panel",
+								PanelID: "panel-error-rate",
+								Panel:   &ir.PanelUpdate{Title: fmt.Sprintf("Errors v%d", req.CurrentIR.Revision+1)},
+							},
+						},
+					}
+					b, _ := json.Marshal(patch)
+					return b, llm.CompletionMeta{FinishReason: "stop", ProviderMode: "stub"}, nil
+				},
+			}
+
+			mgr := jobs.NewManager(stub, jobs.Config{
+				AllowedDSUIDs: []string{"prom-main"},
+				JobTTL:        5 * time.Minute,
+				OpLeaseTTL:    10 * time.Second,
+				Store:         store,
+				NowFunc:       clk.Now,
+			})
+			defer mgr.Close()
+
+			alice := jobs.Owner{OrgID: 1, UserLogin: "alice"}
+			snap, err := mgr.Generate(context.Background(), alice, jobs.GenerateInput{
+				DatasourceUID: "prom-main",
+				Scope:         &ir.ScopeFilter{LabelName: "service", LabelValue: "checkout-api"},
+				UserIntent:    "Show request rate and error rate",
+				Catalog:       testCatalog(),
+			})
+			if err != nil {
+				t.Fatalf("Generate: %v", err)
+			}
+
+			// H-8: TargetPanelID with embedded newline MUST be rejected with ErrPanelNotFound before LLM call.
+			if _, err := mgr.Patch(context.Background(), alice, snap.JobID, jobs.PatchInput{
+				BaseRevision:  1,
+				TargetPanelID: "panel-request-rate\npanel-error-rate",
+				EditIntent:    "newline injection",
+				Catalog:       testCatalog(),
+			}); !errors.Is(err, ir.ErrPanelNotFound) {
+				t.Fatalf("expected ErrPanelNotFound for newline TargetPanelID, got %v", err)
+			}
+			if llmPatchCalls.Load() != 0 {
+				t.Fatalf("LLM should not have been called on newline TargetPanelID, calls=%d", llmPatchCalls.Load())
+			}
+
+			// M-8: Invalid JobIDs rejected cleanly.
+			for _, badID := range []string{"", "job:evil", "../secret", "job with space", "job*"} {
+				if _, err := mgr.Get(alice, badID); !errors.Is(err, jobs.ErrJobNotFound) {
+					t.Fatalf("expected ErrJobNotFound for bad jobID %q, got %v", badID, err)
+				}
+			}
+
+			// H-5: Replaying FinishJob / RecordEditFailure with old token after completion MUST return ErrJobCancelled.
+			if _, err := store.FinishJob(context.Background(), jobs.FinishJobParams{
+				Owner: alice, JobID: snap.JobID, OpToken: 1, Status: jobs.StatusFailed, ErrorMessage: "replay", Now: clk.Now(), JobTTL: time.Minute,
+			}); !errors.Is(err, jobs.ErrJobCancelled) {
+				t.Fatalf("expected replayed FinishJob after completion to return ErrJobCancelled, got %v", err)
+			}
+			if _, err := store.RecordEditFailure(context.Background(), jobs.RecordEditFailureParams{
+				Owner: alice, JobID: snap.JobID, OpToken: 2, ErrorMessage: "inactive-replay", Now: clk.Now(), JobTTL: time.Minute,
+			}); !errors.Is(err, jobs.ErrJobCancelled) {
+				t.Fatalf("expected RecordEditFailure on idle job to return ErrJobCancelled, got %v", err)
+			}
+
+			// H-5: After OpLeaseTTL expires, late CommitRevision from the stalled op MUST return ErrJobCancelled.
+			opRes, err := store.BeginPatch(context.Background(), jobs.BeginPatchParams{
+				Owner: alice, JobID: snap.JobID, BaseRevision: 1, SlotID: "stalled-slot", Now: clk.Now(),
+				Limits: jobs.StoreLimits{JobTTL: 5 * time.Minute, OpLeaseTTL: 10 * time.Second},
+			})
+			if err != nil {
+				t.Fatalf("BeginPatch: %v", err)
+			}
+			clk.Advance(15 * time.Second)
+			nextDoc := opRes.CurrentIR.Clone()
+			nextDoc.Revision = 2
+			if _, err := store.CommitRevision(context.Background(), jobs.CommitRevisionParams{
+				Owner: alice, JobID: snap.JobID, OpToken: opRes.OpToken, ExpectedRev: 1, NextIR: nextDoc, Now: clk.Now(), JobTTL: 5 * time.Minute,
+			}); !errors.Is(err, jobs.ErrJobCancelled) {
+				t.Fatalf("expected late CommitRevision after lease expiry to return ErrJobCancelled, got %v", err)
+			}
+			_ = store.ReleaseSlot(context.Background(), alice, "stalled-slot", clk.Now())
+
+			// M-4: Error causes (context.DeadlineExceeded, llm.ErrOutputTruncated) MUST survive RecordEditFailure.
+			patchErrToReturn = context.DeadlineExceeded
+			if _, err := mgr.Patch(context.Background(), alice, snap.JobID, jobs.PatchInput{
+				BaseRevision: 1, EditIntent: "timeout test", Catalog: testCatalog(),
+			}); !errors.Is(err, context.DeadlineExceeded) {
+				t.Fatalf("expected context.DeadlineExceeded preserved, got %v", err)
+			}
+			patchErrToReturn = llm.ErrOutputTruncated
+			if _, err := mgr.Patch(context.Background(), alice, snap.JobID, jobs.PatchInput{
+				BaseRevision: 1, EditIntent: "truncated test", Catalog: testCatalog(),
+			}); !errors.Is(err, llm.ErrOutputTruncated) {
+				t.Fatalf("expected llm.ErrOutputTruncated preserved, got %v", err)
+			}
+			patchErrToReturn = nil
+
+			// M-5: Commit 12 revisions -> verify 10-deep undo stack, Undo -> Patch -> Undo, and MaxUndoHistory shrink.
+			curRev := 1
+			for i := 0; i < 12; i++ {
+				clk.Advance(time.Second)
+				pSnap, pErr := mgr.Patch(context.Background(), alice, snap.JobID, jobs.PatchInput{
+					BaseRevision: curRev, TargetPanelID: "panel-error-rate", EditIntent: "step", Catalog: testCatalog(),
+				})
+				if pErr != nil {
+					t.Fatalf("patch step %d failed: %v", i, pErr)
+				}
+				curRev = pSnap.CurrentIR.Revision
+			}
+			// Now shrink MaxUndoHistory from 10 -> 3 via direct CommitRevision and verify the 3 NEWEST revisions remain.
+			shrinkOp, err := store.BeginPatch(context.Background(), jobs.BeginPatchParams{
+				Owner: alice, JobID: snap.JobID, BaseRevision: curRev, SlotID: "shrink-slot", Now: clk.Now(),
+				Limits: jobs.StoreLimits{JobTTL: 5 * time.Minute, OpLeaseTTL: 10 * time.Second},
+			})
+			if err != nil {
+				t.Fatalf("shrink BeginPatch: %v", err)
+			}
+			shrunkDoc := shrinkOp.CurrentIR.Clone()
+			shrunkDoc.Revision = curRev + 1
+			shrunkSnap, err := store.CommitRevision(context.Background(), jobs.CommitRevisionParams{
+				Owner: alice, JobID: snap.JobID, OpToken: shrinkOp.OpToken, ExpectedRev: curRev,
+				NextIR: shrunkDoc, Now: clk.Now(), JobTTL: 5 * time.Minute, MaxUndoHistory: 3,
+			})
+			_ = store.ReleaseSlot(context.Background(), alice, "shrink-slot", clk.Now())
+			if err != nil || shrunkSnap.CurrentIR.Revision != curRev+1 {
+				t.Fatalf("shrink CommitRevision failed: err=%v snap=%+v", err, shrunkSnap)
+			}
+			// Expect exactly 3 undos restoring curRev, curRev-1, curRev-2 (newest, NOT oldest!).
+			expectedRestored := []int{curRev, curRev - 1, curRev - 2}
+			for idx, wantPrev := range expectedRestored {
+				uSnap, uErr := mgr.Undo(alice, snap.JobID)
+				if uErr != nil {
+					t.Fatalf("undo %d failed: %v", idx, uErr)
+				}
+				wantSubstring := fmt.Sprintf("restored from rev %d as rev", wantPrev)
+				if len(uSnap.LastDiff) != 1 || !strings.Contains(uSnap.LastDiff[0].After, wantSubstring) {
+					t.Fatalf("undo %d restored wrong revision: got %+v, want %q", idx, uSnap.LastDiff, wantSubstring)
+				}
+			}
+			if _, err := mgr.Undo(alice, snap.JobID); !errors.Is(err, jobs.ErrNoUndoHistory) {
+				t.Fatalf("expected ErrNoUndoHistory after 3 undos on shrunk stack, got %v", err)
+			}
+		})
+	}
+}
+
+func TestRedisStore_StrictAddrValidation(t *testing.T) {
+	valid := []string{"localhost:6379", "redis.internal:6379", "127.0.0.1:6379", "[::1]:6379", "[2001:db8::1]:6380"}
+	for _, addr := range valid {
+		if err := jobs.ValidateRedisAddr(addr); err != nil {
+			t.Fatalf("expected valid redisAddr %q to pass, got %v", addr, err)
+		}
+	}
+	invalid := []string{
+		"",
+		"redis:0",
+		"redis:65536",
+		"redis:+6379",
+		"redis:06379",
+		"redis : 6379",
+		"redis host:6379",
+		"redis\r\n:6379",
+		"redis/path:6379",
+		"::1:6379",
+		"[]:6379",
+		"[::1:6379",
+		"::1]:6379",
+		"redis://localhost:6379",
+		"user:pass@localhost:6379",
+	}
+	for _, addr := range invalid {
+		if err := jobs.ValidateRedisAddr(addr); err == nil {
+			t.Fatalf("expected invalid redisAddr %q to be rejected", addr)
+		}
 	}
 }

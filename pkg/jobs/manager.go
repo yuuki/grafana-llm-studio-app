@@ -31,6 +31,11 @@ var (
 	ErrStoreUnavailable    = errors.New("job store unavailable")
 )
 
+const (
+	cancelSubscribeTimeout = 3 * time.Second
+	maxFencedTokenEntries  = 1024
+)
+
 // Owner identifies the authenticated Grafana caller from trusted PluginContext only.
 type Owner struct {
 	OrgID     int64
@@ -75,6 +80,7 @@ type Config struct {
 	// When nil, NewManager creates a process-local MemoryStore.
 	Store JobStore
 	// NowFunc optionally overrides wall-clock time for deterministic tests.
+	// When nil, stores use their authoritative clock (time.Now for MemoryStore, Redis TIME for RedisStore).
 	NowFunc func() time.Time
 }
 
@@ -163,9 +169,15 @@ type Manager struct {
 	registry     *query.Registry
 	store        JobStore
 	ownsStore    bool
-	nowFunc      func() time.Time
+	customNow    func() time.Time
 	localMu      sync.Mutex
 	localCancels map[string]localCancelEntry
+	latestFenced map[string]uint64
+	opWG         sync.WaitGroup
+	bgWG         sync.WaitGroup
+	stopCh       chan struct{}
+	stopCancelSub func()
+	closeOnce    sync.Once
 }
 
 // NewManager creates a new bounded job manager.
@@ -184,19 +196,74 @@ func NewManager(client llm.Client, cfg Config) *Manager {
 		store = NewMemoryStore()
 		ownsStore = true
 	}
-	nowFn := cfg.NowFunc
-	if nowFn == nil {
-		nowFn = time.Now
-	}
-	return &Manager{
+	m := &Manager{
 		cfg:          cfg,
 		client:       client,
 		registry:     reg,
 		store:        store,
 		ownsStore:    ownsStore,
-		nowFunc:      nowFn,
+		customNow:    cfg.NowFunc,
 		localCancels: make(map[string]localCancelEntry),
+		latestFenced: make(map[string]uint64),
+		stopCh:       make(chan struct{}),
 	}
+
+	// Subscribe to cross-replica Cancel/Undo fencing events when supported by the JobStore (e.g. RedisStore).
+	if sub, ok := store.(CancelSubscription); ok {
+		subCtx, cancel := context.WithTimeout(context.Background(), cancelSubscribeTimeout)
+		stopFn, err := sub.SubscribeCancels(subCtx, func(jobID string, fencedToken uint64) {
+			m.cancelLocalOp(jobID, fencedToken)
+		})
+		cancel()
+		if err == nil && stopFn != nil {
+			m.stopCancelSub = stopFn
+		}
+	}
+
+	// Start periodic background cleanup for idle MemoryStore/RedisStore expiration when using real wall clock.
+	if m.customNow == nil && cfg.JobTTL > 0 {
+		interval := cfg.JobTTL / 2
+		if interval < 10*time.Second {
+			interval = 10 * time.Second
+		}
+		if interval > 5*time.Minute {
+			interval = 5 * time.Minute
+		}
+		m.bgWG.Add(1)
+		go func() {
+			defer m.bgWG.Done()
+			ticker := time.NewTicker(interval)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-m.stopCh:
+					return
+				case <-ticker.C:
+					cleanCtx, cancel := context.WithTimeout(context.Background(), defaultStoreOpTimeout)
+					_ = m.store.CleanupExpired(cleanCtx, time.Time{})
+					cancel()
+				}
+			}
+		}()
+	}
+
+	return m
+}
+
+func (m *Manager) now() time.Time {
+	if m.customNow != nil {
+		return m.customNow()
+	}
+	return time.Now()
+}
+
+// storeNow returns the explicit test clock if configured, or zero time.Time{} so RedisStore
+// uses authoritative Redis TIME in production across HA replicas.
+func (m *Manager) storeNow() time.Time {
+	if m.customNow != nil {
+		return m.customNow()
+	}
+	return time.Time{}
 }
 
 // Ping verifies connectivity to the underlying JobStore.
@@ -206,29 +273,52 @@ func (m *Manager) Ping(ctx context.Context) error {
 
 // CleanupExpired triggers explicit cleanup of expired non-active jobs and slot leases.
 func (m *Manager) CleanupExpired(ctx context.Context) error {
-	return m.store.CleanupExpired(ctx, m.nowFunc())
+	return m.store.CleanupExpired(ctx, m.storeNow())
 }
 
-// Close cancels all active in-flight local job contexts during plugin shutdown/reload.
+// Close cancels all active in-flight local job contexts during plugin shutdown/reload,
+// waits up to defaultStoreOpTimeout for in-flight goroutines to finish releasing slots
+// and reverting state, and stops background helpers.
 // If the Manager created its own default MemoryStore, Close also closes it; externally
 // supplied stores remain owned by the caller.
 func (m *Manager) Close() {
-	m.localMu.Lock()
-	cancels := make([]context.CancelFunc, 0, len(m.localCancels))
-	for id, entry := range m.localCancels {
-		if entry.cancel != nil {
-			cancels = append(cancels, entry.cancel)
+	m.closeOnce.Do(func() {
+		close(m.stopCh)
+		if m.stopCancelSub != nil {
+			m.stopCancelSub()
 		}
-		delete(m.localCancels, id)
-	}
-	m.localMu.Unlock()
+		m.bgWG.Wait()
 
-	for _, cancel := range cancels {
-		cancel()
-	}
-	if m.ownsStore {
-		_ = m.store.Close()
-	}
+		m.localMu.Lock()
+		cancels := make([]context.CancelFunc, 0, len(m.localCancels))
+		for id, entry := range m.localCancels {
+			if entry.cancel != nil {
+				cancels = append(cancels, entry.cancel)
+			}
+			delete(m.localCancels, id)
+		}
+		m.localMu.Unlock()
+
+		for _, cancel := range cancels {
+			cancel()
+		}
+
+		// Wait with bounded timeout for cancelled in-flight operations to complete ReleaseSlot / RevertOnCancel
+		// before App.Dispose() closes the shared Redis client.
+		done := make(chan struct{})
+		go func() {
+			m.opWG.Wait()
+			close(done)
+		}()
+		select {
+		case <-done:
+		case <-time.After(defaultStoreOpTimeout):
+		}
+
+		if m.ownsStore {
+			_ = m.store.Close()
+		}
+	})
 }
 
 // GenerateInput is the request payload for starting a new draft generation job.
@@ -296,15 +386,17 @@ func (m *Manager) Generate(ctx context.Context, owner Owner, in GenerateInput) (
 			Scope:             safeScope,
 			MaxRepairAttempts: m.cfg.MaxRepairAttempts,
 			ErrorMessage:      "選択スコープに利用可能なメトリクス候補がありません。メトリクス名を捏造せず中断しました。",
-			UpdatedAt:         m.nowFunc(),
+			UpdatedAt:         m.now().UTC(),
 		}, nil
 	}
 
-	now := m.nowFunc()
 	jobID := newJobID()
 	slotID := newSlotID()
 	opCtx, cancel := context.WithTimeout(ctx, m.cfg.JobDeadline)
 	defer cancel()
+
+	m.opWG.Add(1)
+	defer m.opWG.Done()
 
 	lease, err := m.store.CreateGenerating(ctx, CreateGeneratingParams{
 		JobID:             jobID,
@@ -315,10 +407,13 @@ func (m *Manager) Generate(ctx context.Context, owner Owner, in GenerateInput) (
 		MaxRepairAttempts: m.cfg.MaxRepairAttempts,
 		KnownGauges:       extractGaugeNames(boundedCatalog),
 		SlotID:            slotID,
-		Now:               now,
+		Now:               m.storeNow(),
 		Limits:            m.cfg.storeLimits(),
 	})
 	if err != nil {
+		if errors.Is(err, ErrStoreUnavailable) {
+			m.releaseSlot(ctx, owner, slotID)
+		}
 		return JobSnapshot{}, err
 	}
 	opToken := lease.OpToken
@@ -427,7 +522,6 @@ func (m *Manager) ImportContext(ctx context.Context, owner Owner, in ImportInput
 		return JobSnapshot{}, fmt.Errorf("imported IR validation failed: %w", err)
 	}
 
-	now := m.nowFunc()
 	jobID := newJobID()
 	summary := "既存ダッシュボードを安全な IR ドラフトとしてインポートしました。検証・プレビューを実行して内容を確認してください。"
 	if in.ImportSource != nil && in.ImportSource.UID != "" {
@@ -446,7 +540,7 @@ func (m *Manager) ImportContext(ctx context.Context, owner Owner, in ImportInput
 		Warnings:          warnings,
 		MaxRepairAttempts: m.cfg.MaxRepairAttempts,
 		KnownGauges:       extractGaugeNames(boundedCatalog),
-		Now:               now,
+		Now:               m.storeNow(),
 		Limits:            m.cfg.storeLimits(),
 	})
 }
@@ -454,6 +548,9 @@ func (m *Manager) ImportContext(ctx context.Context, owner Owner, in ImportInput
 // Patch performs a partial edit anchored to baseRevision without regenerating untouched panels.
 func (m *Manager) Patch(ctx context.Context, owner Owner, jobID string, in PatchInput) (JobSnapshot, error) {
 	if err := validateOwner(owner); err != nil {
+		return JobSnapshot{}, err
+	}
+	if err := ValidateJobID(jobID); err != nil {
 		return JobSnapshot{}, err
 	}
 	if strings.TrimSpace(in.EditIntent) == "" {
@@ -465,21 +562,31 @@ func (m *Manager) Patch(ctx context.Context, owner Owner, jobID string, in Patch
 		return JobSnapshot{}, errors.New("non-empty scoped metric catalog is required")
 	}
 	targetPanelID := strings.TrimSpace(in.TargetPanelID)
+	if strings.ContainsAny(targetPanelID, "\r\n") {
+		return JobSnapshot{}, fmt.Errorf("%w: %q", ir.ErrPanelNotFound, targetPanelID)
+	}
 
 	opCtx, cancel := context.WithTimeout(ctx, m.cfg.JobDeadline)
 	defer cancel()
 
+	m.opWG.Add(1)
+	defer m.opWG.Done()
+
+	slotID := newSlotID()
 	op, err := m.store.BeginPatch(ctx, BeginPatchParams{
 		Owner:         owner,
 		JobID:         jobID,
 		BaseRevision:  in.BaseRevision,
 		TargetPanelID: targetPanelID,
 		CatalogGauges: extractGaugeNames(boundedCatalog),
-		SlotID:        newSlotID(),
-		Now:           m.nowFunc(),
+		SlotID:        slotID,
+		Now:           m.storeNow(),
 		Limits:        m.cfg.storeLimits(),
 	})
 	if err != nil {
+		if errors.Is(err, ErrStoreUnavailable) {
+			m.releaseSlot(ctx, owner, slotID)
+		}
 		return JobSnapshot{}, err
 	}
 	opToken := op.OpToken
@@ -493,7 +600,7 @@ func (m *Manager) Patch(ctx context.Context, owner Owner, jobID string, in Patch
 	}
 	adapter, err := m.registry.Get(qKind)
 	if err != nil {
-		return m.recordEditFailure(ctx, owner, jobID, opToken, err.Error(), nil)
+		return m.recordEditFailure(ctx, owner, jobID, opToken, err, err.Error(), nil)
 	}
 
 	// Preserve and monotonically expand known gauge types across revisions/replicas so clients cannot spoof gauge->counter.
@@ -512,12 +619,12 @@ func (m *Manager) Patch(ctx context.Context, owner Owner, jobID string, in Patch
 		if errors.Is(err, context.Canceled) || opCtx.Err() == context.Canceled {
 			return m.revertToPreviousOnCancel(ctx, owner, jobID, opToken)
 		}
-		return m.recordEditFailure(ctx, owner, jobID, opToken, err.Error(), &meta)
+		return m.recordEditFailure(ctx, owner, jobID, opToken, err, err.Error(), &meta)
 	}
 
 	patch, err := ir.DecodeStrictPatch(raw)
 	if err != nil {
-		return m.recordEditFailure(ctx, owner, jobID, opToken, fmt.Sprintf("パッチ JSON 検査に失敗しました: %v", err), &meta)
+		return m.recordEditFailure(ctx, owner, jobID, opToken, err, fmt.Sprintf("パッチ JSON 検査に失敗しました: %v", err), &meta)
 	}
 
 	// When user explicitly targeted a single panel, enforce that the LLM only updates that panel.
@@ -529,6 +636,7 @@ func (m *Manager) Patch(ctx context.Context, owner Owner, jobID string, in Patch
 					owner,
 					jobID,
 					opToken,
+					nil,
 					fmt.Sprintf("対象パネル指定 (%s) に反するパッチ操作 (%s:%s) を拒否しました", targetPanelID, pOp.Op, pOp.PanelID),
 					&meta,
 				)
@@ -538,7 +646,7 @@ func (m *Manager) Patch(ctx context.Context, owner Owner, jobID string, in Patch
 
 	nextIR, diffs, err := ir.ApplyPatch(op.CurrentIR, patch, ir.ValidateOptions{MaxPanels: m.cfg.MaxPanels})
 	if err != nil {
-		return m.recordEditFailure(ctx, owner, jobID, opToken, fmt.Sprintf("パッチ適用に失敗しました: %v", err), &meta)
+		return m.recordEditFailure(ctx, owner, jobID, opToken, err, fmt.Sprintf("パッチ適用に失敗しました: %v", err), &meta)
 	}
 	if qKind != query.KindPromQL {
 		nextIR.StampQueryKind(string(qKind))
@@ -553,7 +661,7 @@ func (m *Manager) Patch(ctx context.Context, owner Owner, jobID string, in Patch
 		query.ValidateOptions{RequireCatalogMatch: true},
 	)
 	if err != nil {
-		return m.recordEditFailure(ctx, owner, jobID, opToken, fmt.Sprintf("パッチ後の %s 検査に失敗しました: %v", adapter.DisplayName(), err), &meta)
+		return m.recordEditFailure(ctx, owner, jobID, opToken, err, fmt.Sprintf("パッチ後の %s 検査に失敗しました: %v", adapter.DisplayName(), err), &meta)
 	}
 
 	return m.commitRevision(ctx, owner, jobID, opToken, op.CurrentIR.Revision, nextIR, diffs, patch.Summary, warnings, &meta)
@@ -566,6 +674,9 @@ func (m *Manager) Repair(ctx context.Context, owner Owner, jobID string, in Repa
 	if err := validateOwner(owner); err != nil {
 		return JobSnapshot{}, err
 	}
+	if err := ValidateJobID(jobID); err != nil {
+		return JobSnapshot{}, err
+	}
 
 	boundedCatalog := prompt.BoundCatalog(in.Catalog)
 	if len(boundedCatalog) == 0 {
@@ -574,7 +685,7 @@ func (m *Manager) Repair(ctx context.Context, owner Owner, jobID string, in Repa
 
 	// Pre-read job state to validate syntax_error targets before atomically consuming repair budget.
 	// BeginRepair re-verifies ownership, revision, active op lock, repair budget, and concurrency slots atomically.
-	cand, err := m.store.GetRepairCandidate(ctx, owner, jobID, m.nowFunc())
+	cand, err := m.store.GetRepairCandidate(ctx, owner, jobID, m.storeNow())
 	if err != nil {
 		return JobSnapshot{}, err
 	}
@@ -656,17 +767,24 @@ func (m *Manager) Repair(ctx context.Context, owner Owner, jobID string, in Repa
 	opCtx, cancel := context.WithTimeout(ctx, m.cfg.JobDeadline)
 	defer cancel()
 
+	m.opWG.Add(1)
+	defer m.opWG.Done()
+
+	slotID := newSlotID()
 	// Atomically verify revision/lock/budget/concurrency and consume repair budget BEFORE calling LLM.
 	op, err := m.store.BeginRepair(ctx, BeginRepairParams{
 		Owner:         owner,
 		JobID:         jobID,
 		BaseRevision:  in.BaseRevision,
 		CatalogGauges: extractGaugeNames(boundedCatalog),
-		SlotID:        newSlotID(),
-		Now:           m.nowFunc(),
+		SlotID:        slotID,
+		Now:           m.storeNow(),
 		Limits:        m.cfg.storeLimits(),
 	})
 	if err != nil {
+		if errors.Is(err, ErrStoreUnavailable) {
+			m.releaseSlot(ctx, owner, slotID)
+		}
 		return JobSnapshot{}, err
 	}
 	opToken := op.OpToken
@@ -688,12 +806,12 @@ func (m *Manager) Repair(ctx context.Context, owner Owner, jobID string, in Repa
 		if errors.Is(err, context.Canceled) || opCtx.Err() == context.Canceled {
 			return m.revertToPreviousOnCancel(ctx, owner, jobID, opToken)
 		}
-		return m.recordEditFailure(ctx, owner, jobID, opToken, fmt.Sprintf("自動修復に失敗しました: %v", err), &meta)
+		return m.recordEditFailure(ctx, owner, jobID, opToken, err, fmt.Sprintf("自動修復に失敗しました: %v", err), &meta)
 	}
 
 	patch, err := ir.DecodeStrictPatch(raw)
 	if err != nil {
-		return m.recordEditFailure(ctx, owner, jobID, opToken, fmt.Sprintf("修復パッチ JSON 検査に失敗しました: %v", err), &meta)
+		return m.recordEditFailure(ctx, owner, jobID, opToken, err, fmt.Sprintf("修復パッチ JSON 検査に失敗しました: %v", err), &meta)
 	}
 
 	// Enforce that repair ONLY touches Query or Queries on the failing syntax_error panels
@@ -704,22 +822,22 @@ func (m *Manager) Repair(ctx context.Context, owner Owner, jobID string, in Repa
 	}
 	for _, pOp := range patch.Operations {
 		if pOp.Op != "update_panel" || !allowedTargetIDs[pOp.PanelID] || pOp.Panel == nil || (pOp.Panel.Query == nil && pOp.Panel.Queries == nil) {
-			return m.recordEditFailure(ctx, owner, jobID, opToken, fmt.Sprintf("修復パッチが対象外パネル/操作 (%s:%s) を含んでいたため拒否しました", pOp.Op, pOp.PanelID), &meta)
+			return m.recordEditFailure(ctx, owner, jobID, opToken, nil, fmt.Sprintf("修復パッチが対象外パネル/操作 (%s:%s) を含んでいたため拒否しました", pOp.Op, pOp.PanelID), &meta)
 		}
 		p := pOp.Panel
 		if p.DatasourceRef != "" && p.DatasourceRef != ir.SelectedDatasourceRef {
-			return m.recordEditFailure(ctx, owner, jobID, opToken, "修復パッチによるデータソース変更は禁止されています", &meta)
+			return m.recordEditFailure(ctx, owner, jobID, opToken, nil, "修復パッチによるデータソース変更は禁止されています", &meta)
 		}
 		if p.Type != "" || p.Title != "" || p.Description != nil || p.Unit != "" || p.Thresholds != nil || p.Layout != nil {
-			return m.recordEditFailure(ctx, owner, jobID, opToken, fmt.Sprintf("修復パッチは失敗パネルの %s クエリのみ変更可能です", adapter.DisplayName()), &meta)
+			return m.recordEditFailure(ctx, owner, jobID, opToken, nil, fmt.Sprintf("修復パッチは失敗パネルの %s クエリのみ変更可能です", adapter.DisplayName()), &meta)
 		}
 		if p.Query != nil && p.Query.Kind != nil && *p.Query.Kind != "" && *p.Query.Kind != string(qKind) {
-			return m.recordEditFailure(ctx, owner, jobID, opToken, fmt.Sprintf("修復パッチによるクエリ方言変更 (%q -> %q) は禁止されています", qKind, *p.Query.Kind), &meta)
+			return m.recordEditFailure(ctx, owner, jobID, opToken, nil, fmt.Sprintf("修復パッチによるクエリ方言変更 (%q -> %q) は禁止されています", qKind, *p.Query.Kind), &meta)
 		}
 		if p.Queries != nil {
 			for _, q := range *p.Queries {
 				if q.Kind != "" && q.Kind != string(qKind) {
-					return m.recordEditFailure(ctx, owner, jobID, opToken, fmt.Sprintf("修復パッチによるクエリ方言変更 (%q -> %q) は禁止されています", qKind, q.Kind), &meta)
+					return m.recordEditFailure(ctx, owner, jobID, opToken, nil, fmt.Sprintf("修復パッチによるクエリ方言変更 (%q -> %q) は禁止されています", qKind, q.Kind), &meta)
 				}
 			}
 		}
@@ -727,7 +845,7 @@ func (m *Manager) Repair(ctx context.Context, owner Owner, jobID string, in Repa
 
 	nextIR, diffs, err := ir.ApplyPatch(op.CurrentIR, patch, ir.ValidateOptions{MaxPanels: m.cfg.MaxPanels})
 	if err != nil {
-		return m.recordEditFailure(ctx, owner, jobID, opToken, fmt.Sprintf("修復パッチ適用に失敗しました: %v", err), &meta)
+		return m.recordEditFailure(ctx, owner, jobID, opToken, err, fmt.Sprintf("修復パッチ適用に失敗しました: %v", err), &meta)
 	}
 	if qKind != query.KindPromQL {
 		nextIR.StampQueryKind(string(qKind))
@@ -742,7 +860,7 @@ func (m *Manager) Repair(ctx context.Context, owner Owner, jobID string, in Repa
 		query.ValidateOptions{RequireCatalogMatch: true},
 	)
 	if err != nil {
-		return m.recordEditFailure(ctx, owner, jobID, opToken, fmt.Sprintf("修復後の %s/スコープ検査に失敗しました: %v", adapter.DisplayName(), err), &meta)
+		return m.recordEditFailure(ctx, owner, jobID, opToken, err, fmt.Sprintf("修復後の %s/スコープ検査に失敗しました: %v", adapter.DisplayName(), err), &meta)
 	}
 
 	return m.commitRevision(ctx, owner, jobID, opToken, op.CurrentIR.Revision, nextIR, diffs, "構文エラーのパネルを修復しました。変更パネルを再検証してください。", warnings, &meta)
@@ -759,13 +877,16 @@ func (m *Manager) UndoContext(ctx context.Context, owner Owner, jobID string) (J
 	if err := validateOwner(owner); err != nil {
 		return JobSnapshot{}, err
 	}
-	snap, err := m.store.Undo(ctx, owner, jobID, m.nowFunc(), m.cfg.JobTTL)
+	if err := ValidateJobID(jobID); err != nil {
+		return JobSnapshot{}, err
+	}
+	res, err := m.store.Undo(ctx, owner, jobID, m.storeNow(), m.cfg.JobTTL)
 	if err != nil {
 		return JobSnapshot{}, err
 	}
-	// Cancel any local in-flight LLM goroutine AFTER store ownership check succeeded.
-	m.cancelLocalOp(jobID)
-	return snap, nil
+	// Cancel only local in-flight LLM goroutines older than res.OpToken AFTER ownership check succeeded.
+	m.cancelLocalOp(jobID, res.OpToken)
+	return res.Snapshot, nil
 }
 
 // Cancel aborts any in-flight LLM operation for an owner's job and prevents stale results from applying.
@@ -778,13 +899,16 @@ func (m *Manager) CancelContext(ctx context.Context, owner Owner, jobID string) 
 	if err := validateOwner(owner); err != nil {
 		return JobSnapshot{}, err
 	}
-	snap, err := m.store.Cancel(ctx, owner, jobID, m.nowFunc(), m.cfg.JobTTL)
+	if err := ValidateJobID(jobID); err != nil {
+		return JobSnapshot{}, err
+	}
+	res, err := m.store.Cancel(ctx, owner, jobID, m.storeNow(), m.cfg.JobTTL)
 	if err != nil {
 		return JobSnapshot{}, err
 	}
-	// Cancel any local in-flight LLM goroutine AFTER store ownership check succeeded.
-	m.cancelLocalOp(jobID)
-	return snap, nil
+	// Cancel only local in-flight LLM goroutines older than res.OpToken AFTER ownership check succeeded.
+	m.cancelLocalOp(jobID, res.OpToken)
+	return res.Snapshot, nil
 }
 
 // Get returns the current state of an owner's job.
@@ -797,7 +921,10 @@ func (m *Manager) GetContext(ctx context.Context, owner Owner, jobID string) (Jo
 	if err := validateOwner(owner); err != nil {
 		return JobSnapshot{}, err
 	}
-	return m.store.Get(ctx, owner, jobID, m.nowFunc())
+	if err := ValidateJobID(jobID); err != nil {
+		return JobSnapshot{}, err
+	}
+	return m.store.Get(ctx, owner, jobID, m.storeNow())
 }
 
 func (m *Manager) finishJob(
@@ -826,7 +953,7 @@ func (m *Manager) finishJob(
 		Warnings:     warnings,
 		ErrorMessage: errMsg,
 		LLMMeta:      meta,
-		Now:          m.nowFunc(),
+		Now:          m.storeNow(),
 		JobTTL:       m.cfg.JobTTL,
 	})
 }
@@ -855,7 +982,7 @@ func (m *Manager) commitRevision(
 		Summary:        summary,
 		Warnings:       warnings,
 		LLMMeta:        meta,
-		Now:            m.nowFunc(),
+		Now:            m.storeNow(),
 		JobTTL:         m.cfg.JobTTL,
 		MaxUndoHistory: defaultMaxUndoHistory,
 	})
@@ -864,27 +991,45 @@ func (m *Manager) commitRevision(
 func (m *Manager) revertToPreviousOnCancel(parentCtx context.Context, owner Owner, jobID string, opToken uint64) (JobSnapshot, error) {
 	storeCtx, cancel := detachedStoreContext(parentCtx)
 	defer cancel()
-	return m.store.RevertOnCancel(storeCtx, owner, jobID, opToken, m.nowFunc(), m.cfg.JobTTL)
+	return m.store.RevertOnCancel(storeCtx, owner, jobID, opToken, m.storeNow(), m.cfg.JobTTL)
 }
 
-func (m *Manager) recordEditFailure(parentCtx context.Context, owner Owner, jobID string, opToken uint64, errMsg string, meta *llm.CompletionMeta) (JobSnapshot, error) {
+func (m *Manager) recordEditFailure(
+	parentCtx context.Context,
+	owner Owner,
+	jobID string,
+	opToken uint64,
+	cause error,
+	errMsg string,
+	meta *llm.CompletionMeta,
+) (JobSnapshot, error) {
 	storeCtx, cancel := detachedStoreContext(parentCtx)
 	defer cancel()
-	return m.store.RecordEditFailure(storeCtx, RecordEditFailureParams{
+	snap, storeErr := m.store.RecordEditFailure(storeCtx, RecordEditFailureParams{
 		Owner:        owner,
 		JobID:        jobID,
 		OpToken:      opToken,
 		ErrorMessage: errMsg,
 		LLMMeta:      meta,
-		Now:          m.nowFunc(),
+		Now:          m.storeNow(),
 		JobTTL:       m.cfg.JobTTL,
 	})
+	if storeErr != nil {
+		return snap, storeErr
+	}
+	if cause != nil {
+		if errMsg == "" || errMsg == cause.Error() {
+			return snap, cause
+		}
+		return snap, fmt.Errorf("%s: %w", errMsg, cause)
+	}
+	return snap, errors.New(errMsg)
 }
 
 func (m *Manager) setStatusIfToken(parentCtx context.Context, owner Owner, jobID string, opToken uint64, status JobStatus) {
 	storeCtx, cancel := detachedStoreContext(parentCtx)
 	defer cancel()
-	_ = m.store.SetStatus(storeCtx, owner, jobID, opToken, status, m.nowFunc(), m.cfg.JobTTL)
+	_ = m.store.SetStatus(storeCtx, owner, jobID, opToken, status, m.storeNow(), m.cfg.JobTTL)
 }
 
 func (m *Manager) releaseSlot(parentCtx context.Context, owner Owner, slotID string) {
@@ -893,13 +1038,19 @@ func (m *Manager) releaseSlot(parentCtx context.Context, owner Owner, slotID str
 	}
 	storeCtx, cancel := detachedStoreContext(parentCtx)
 	defer cancel()
-	_ = m.store.ReleaseSlot(storeCtx, owner, slotID, m.nowFunc())
+	_ = m.store.ReleaseSlot(storeCtx, owner, slotID, m.storeNow())
 }
 
 func (m *Manager) registerLocalCancel(jobID string, opToken uint64, cancel context.CancelFunc) {
 	m.localMu.Lock()
-	m.localCancels[jobID] = localCancelEntry{opToken: opToken, cancel: cancel}
+	alreadyFenced := m.latestFenced[jobID] >= opToken
+	if !alreadyFenced {
+		m.localCancels[jobID] = localCancelEntry{opToken: opToken, cancel: cancel}
+	}
 	m.localMu.Unlock()
+	if alreadyFenced && cancel != nil {
+		cancel()
+	}
 }
 
 func (m *Manager) unregisterLocalCancel(jobID string, opToken uint64) {
@@ -910,14 +1061,22 @@ func (m *Manager) unregisterLocalCancel(jobID string, opToken uint64) {
 	m.localMu.Unlock()
 }
 
-func (m *Manager) cancelLocalOp(jobID string) {
+func (m *Manager) cancelLocalOp(jobID string, fencedToken uint64) {
 	m.localMu.Lock()
+	if fencedToken > m.latestFenced[jobID] {
+		if len(m.latestFenced) >= maxFencedTokenEntries {
+			// Clear stale fencing cache when bounded cap is reached.
+			m.latestFenced = make(map[string]uint64, maxFencedTokenEntries/2)
+		}
+		m.latestFenced[jobID] = fencedToken
+	}
 	entry, ok := m.localCancels[jobID]
-	if ok {
+	shouldCancel := ok && entry.opToken < fencedToken
+	if shouldCancel {
 		delete(m.localCancels, jobID)
 	}
 	m.localMu.Unlock()
-	if ok && entry.cancel != nil {
+	if shouldCancel && entry.cancel != nil {
 		entry.cancel()
 	}
 }

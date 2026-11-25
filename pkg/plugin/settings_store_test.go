@@ -217,12 +217,26 @@ func TestApp_MultiReplicaRedisJobStoreHTTPAndSecretIsolation(t *testing.T) {
 		t.Fatalf("replica 2 undo failed: %+v", undoSender.resp)
 	}
 
-	// Stop Redis -> CheckHealth MUST report ERROR and /jobs/{id} MUST return 503 without leaking Redis addr/password.
+	// Stop Redis -> CheckHealth MUST report ERROR, non-admin /health MUST return 503 with generic message,
+	// and /jobs/{id} MUST return 503 without leaking Redis addr/password.
 	mr.Close()
 	healthDown, _ := app2.CheckHealth(context.Background(), &backend.CheckHealthRequest{})
 	if healthDown.Status != backend.HealthStatusError {
 		t.Fatalf("expected HealthStatusError when Redis is unreachable, got %+v", healthDown)
 	}
+	nonAdminHealth := &captureSender{}
+	_ = app2.CallResource(context.Background(), &backend.CallResourceRequest{
+		PluginContext: bobCtx,
+		Path:          "health",
+		Method:        http.MethodGet,
+	}, nonAdminHealth)
+	if nonAdminHealth.resp == nil || nonAdminHealth.resp.Status != http.StatusServiceUnavailable {
+		t.Fatalf("expected non-admin /health to return 503 when Redis is down, got %+v", nonAdminHealth.resp)
+	}
+	if strings.Contains(string(nonAdminHealth.resp.Body), redisAddr) || strings.Contains(string(nonAdminHealth.resp.Body), "super-secret-redis-pass-999") {
+		t.Fatalf("internal Redis details leaked in non-admin /health body: %s", string(nonAdminHealth.resp.Body))
+	}
+
 	downSender := &captureSender{}
 	_ = app2.CallResource(context.Background(), &backend.CallResourceRequest{
 		PluginContext: aliceCtx,
@@ -234,5 +248,76 @@ func TestApp_MultiReplicaRedisJobStoreHTTPAndSecretIsolation(t *testing.T) {
 	}
 	if strings.Contains(string(downSender.resp.Body), redisAddr) || strings.Contains(string(downSender.resp.Body), "super-secret-redis-pass-999") {
 		t.Fatalf("internal Redis address or password leaked in 503 body: %s", string(downSender.resp.Body))
+	}
+}
+
+func TestApp_AuthBeforeServiceUnavailableAndJobIDValidation(t *testing.T) {
+	// Missing SA token in grafana-llm-app mode -> a.jobManager == nil.
+	inst, err := plugin.NewApp(context.Background(), backend.AppInstanceSettings{
+		JSONData: []byte(`{"llmMode":"grafana-llm-app","allowedDatasourceUids":["prom-1"]}`),
+	})
+	if err != nil {
+		t.Fatalf("NewApp: %v", err)
+	}
+	app := inst.(*plugin.App)
+	defer app.Dispose()
+
+	// Unauthenticated callers MUST receive 401 (not 503) even when jobManager == nil.
+	for _, tc := range []struct {
+		method string
+		path   string
+	}{
+		{http.MethodPost, "jobs/generate"},
+		{http.MethodPost, "jobs/import"},
+		{http.MethodGet, "jobs/job-123"},
+	} {
+		sender := &captureSender{}
+		_ = app.CallResource(context.Background(), &backend.CallResourceRequest{
+			Path:   tc.path,
+			Method: tc.method,
+			Body:   []byte(`{}`),
+		}, sender)
+		if sender.resp == nil || sender.resp.Status != http.StatusUnauthorized {
+			t.Fatalf("expected 401 for unauthenticated %s /%s when jobManager==nil, got %+v", tc.method, tc.path, sender.resp)
+		}
+	}
+
+	// Authenticated caller with invalid jobID syntax MUST get 404 before hitting JobStore.
+	instMock, err := plugin.NewApp(context.Background(), backend.AppInstanceSettings{
+		JSONData: []byte(`{"llmMode":"mock","allowMockInDev":true,"allowedDatasourceUids":["prom-1"]}`),
+	})
+	if err != nil {
+		t.Fatalf("NewApp mock: %v", err)
+	}
+	appMock := instMock.(*plugin.App)
+	defer appMock.Dispose()
+
+	authCtx := backend.PluginContext{OrgID: 1, User: &backend.User{Login: "alice", Role: "Editor"}}
+	badIDSender := &captureSender{}
+	_ = appMock.CallResource(context.Background(), &backend.CallResourceRequest{
+		PluginContext: authCtx,
+		Path:          "jobs/bad:id*",
+		Method:        http.MethodGet,
+	}, badIDSender)
+	if badIDSender.resp == nil || badIDSender.resp.Status != http.StatusNotFound {
+		t.Fatalf("expected 404 for invalid jobID path, got %+v", badIDSender.resp)
+	}
+
+	// IPv6 [::1]:6379 accepted; >128 char redisUsername rejected only for redis backend.
+	if _, err := plugin.LoadSettings(backend.AppInstanceSettings{
+		JSONData: []byte(`{"llmMode":"mock","allowMockInDev":true,"allowedDatasourceUids":["prom-1"],"jobStoreBackend":"redis","redisAddr":"[::1]:6379"}`),
+	}); err != nil {
+		t.Fatalf("expected IPv6 [::1]:6379 redisAddr to pass, got %v", err)
+	}
+	longUser := strings.Repeat("a", 129)
+	if _, err := plugin.LoadSettings(backend.AppInstanceSettings{
+		JSONData: []byte(`{"llmMode":"mock","allowMockInDev":true,"allowedDatasourceUids":["prom-1"],"jobStoreBackend":"redis","redisAddr":"redis:6379","redisUsername":"` + longUser + `"}`),
+	}); err == nil {
+		t.Fatal("expected >128 char redisUsername to fail when jobStoreBackend=redis")
+	}
+	if _, err := plugin.LoadSettings(backend.AppInstanceSettings{
+		JSONData: []byte(`{"llmMode":"mock","allowMockInDev":true,"allowedDatasourceUids":["prom-1"],"jobStoreBackend":"memory","redisUsername":"` + longUser + `"}`),
+	}); err != nil {
+		t.Fatalf("expected stale redisUsername to be ignored when jobStoreBackend=memory, got %v", err)
 	}
 }

@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/grafana/grafana-llm-app/llmclient"
 	"github.com/grafana/grafana-plugin-sdk-go/backend"
@@ -158,6 +159,8 @@ func (a *App) CallResource(ctx context.Context, req *backend.CallResourceRequest
 	return a.resourceHandler.CallResource(ctx, req, sender)
 }
 
+const healthPingTimeout = 3 * time.Second
+
 // CheckHealth verifies configuration, job store connectivity, and connectivity to grafana-llm-app (or explicit dev mock).
 func (a *App) CheckHealth(ctx context.Context, _ *backend.CheckHealthRequest) (*backend.CheckHealthResult, error) {
 	if a.llmInitErr != nil || a.llmClient == nil {
@@ -172,7 +175,9 @@ func (a *App) CheckHealth(ctx context.Context, _ *backend.CheckHealthRequest) (*
 			Message: fmt.Sprintf("Job store not initialized (%s): %v", a.settings.JobStoreBackend, a.storeInitErr),
 		}, nil
 	}
-	if err := a.jobStore.Ping(ctx); err != nil {
+	pingCtx, pingCancel := context.WithTimeout(ctx, healthPingTimeout)
+	defer pingCancel()
+	if err := a.jobStore.Ping(pingCtx); err != nil {
 		return &backend.CheckHealthResult{
 			Status:  backend.HealthStatusError,
 			Message: fmt.Sprintf("Job store health check failed (%s): %v", a.settings.JobStoreBackend, err),
@@ -242,8 +247,17 @@ func (a *App) handleHealth(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// Avoid triggering live LLM test completions on non-admin /health probes;
-	// only Admin probes call CheckHealth.
+	// verify job store reachability without exposing internal details.
 	if !isAdmin {
+		pingCtx, pingCancel := context.WithTimeout(r.Context(), healthPingTimeout)
+		defer pingCancel()
+		if err := a.jobStore.Ping(pingCtx); err != nil {
+			writeJSON(w, http.StatusServiceUnavailable, map[string]any{
+				"status":  "ERROR",
+				"message": "service not ready",
+			})
+			return
+		}
 		writeJSON(w, http.StatusOK, map[string]any{
 			"status": "OK",
 		})
@@ -278,13 +292,13 @@ func (a *App) handleGenerate(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
 		return
 	}
-	if a.jobManager == nil {
-		writeError(w, http.StatusServiceUnavailable, "LLM client unavailable; check plugin configuration")
-		return
-	}
 	owner, err := callerOwnerFromContext(r.Context())
 	if err != nil {
 		writeError(w, http.StatusUnauthorized, err.Error())
+		return
+	}
+	if a.jobManager == nil {
+		writeError(w, http.StatusServiceUnavailable, "LLM client or job store unavailable; check plugin configuration")
 		return
 	}
 
@@ -316,13 +330,13 @@ func (a *App) handleImport(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
 		return
 	}
-	if a.jobManager == nil {
-		writeError(w, http.StatusServiceUnavailable, "LLM client unavailable; check plugin configuration")
-		return
-	}
 	owner, err := callerOwnerFromContext(r.Context())
 	if err != nil {
 		writeError(w, http.StatusUnauthorized, err.Error())
+		return
+	}
+	if a.jobManager == nil {
+		writeError(w, http.StatusServiceUnavailable, "LLM client or job store unavailable; check plugin configuration")
 		return
 	}
 
@@ -353,13 +367,13 @@ func (a *App) handleImport(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *App) handleJobAction(w http.ResponseWriter, r *http.Request) {
-	if a.jobManager == nil {
-		writeError(w, http.StatusServiceUnavailable, "LLM client or job store unavailable; check plugin configuration")
-		return
-	}
 	owner, err := callerOwnerFromContext(r.Context())
 	if err != nil {
 		writeError(w, http.StatusUnauthorized, err.Error())
+		return
+	}
+	if a.jobManager == nil {
+		writeError(w, http.StatusServiceUnavailable, "LLM client or job store unavailable; check plugin configuration")
 		return
 	}
 
@@ -370,6 +384,10 @@ func (a *App) handleJobAction(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	jobID := parts[0]
+	if err := jobs.ValidateJobID(jobID); err != nil {
+		writeError(w, http.StatusNotFound, err.Error())
+		return
+	}
 	action := ""
 	if len(parts) == 2 {
 		action = parts[1]

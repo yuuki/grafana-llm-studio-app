@@ -8,10 +8,12 @@
 services:
   grafana:
     volumes:
-      - ./redis/llm-studio-redis.yml:/etc/grafana/provisioning/plugins/llm-studio-dev.yaml:ro
+      - ./redis/llm-studio-redis.yml:/etc/grafana/provisioning/plugins/llm-studio-dev.yml:ro
     depends_on:
-      - prometheus
-      - redis
+      prometheus:
+        condition: service_started
+      redis:
+        condition: service_healthy
 
   redis:
     image: redis:7.4-alpine
@@ -19,6 +21,8 @@ services:
       - "127.0.0.1:6379:6379"
     command:
       - "redis-server"
+      - "--appendonly"
+      - "yes"
       - "--save"
       - "60"
       - "1"
@@ -26,3 +30,13 @@ services:
       - "128mb"
       - "--maxmemory-policy"
       - "noeviction"
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+volumes:
+  redis-data:

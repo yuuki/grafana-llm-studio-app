@@ -272,10 +272,10 @@ func LoadSettings(appSettings backend.AppInstanceSettings, trustedGrafanaAppURL 
 	js.RedisAddr = strings.TrimSpace(js.RedisAddr)
 	js.RedisKeyPrefix = strings.TrimSpace(js.RedisKeyPrefix)
 	js.RedisUsername = strings.TrimSpace(js.RedisUsername)
-	if len(js.RedisUsername) > 128 {
-		return Settings{}, errors.New("redisUsername exceeds maximum length of 128 characters")
-	}
 	if js.JobStoreBackend == JobStoreBackendRedis {
+		if len(js.RedisUsername) > 128 {
+			return Settings{}, errors.New("redisUsername exceeds maximum length of 128 characters")
+		}
 		if err := jobs.ValidateRedisAddr(js.RedisAddr); err != nil {
 			return Settings{}, err
 		}
