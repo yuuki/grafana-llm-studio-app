@@ -107,7 +107,7 @@ To connect directly to an **OpenAI or OpenAI-compatible API** via `grafana-llm-a
    ```
 2. **Install and configure `grafana-llm-app`** (`v1.2.0` for Grafana 13.x or `v1.0.8` for Grafana 12.4.x) pointing either to an OpenAI / OpenAI-compatible HTTPS API (`provider: "openai"`, `"azure"`, or `"custom"`) or your self-hosted vLLM server (`provider: "custom"`, TLS, API key), with `base` / `large` model mappings.
 3. **Create a dedicated Grafana Service Account** with the minimum OSS basic role **`Viewer`** (never `Editor` or `Admin`) and store its token in **Plugin Configuration → `llmServiceAccountToken` (`secureJsonData`)**.
-4. **Switch `llmMode` to `grafana-llm-app`** and remove development provisioning files (`deploy/grafana/provisioning/plugins/llm-studio-dev.yaml`). Production mode never silently falls back to mock mode.
+4. **Switch `llmMode` to `grafana-llm-app`** and remove development provisioning files (`deploy/grafana/provisioning/plugins/llm-studio-dev.yml`). Production mode never silently falls back to mock mode.
 5. **Enforce upstream query limits** on Prometheus (`--query.timeout`, `--query.max-concurrency`, `--query.max-samples`) or VictoriaMetrics (`-search.maxQueryDuration`, `-search.maxConcurrentRequests`, `-search.maxSeries`). Browser-side dry-run caps are UX guardrails, not a DoS boundary.
 
 - **Internet-connected OpenAI / OpenAI-compatible APIs** (OpenAI, Azure OpenAI, OpenRouter, Groq, DeepSeek, Together, Fireworks, Gemini): see [`docs/openai-compatible-apis.md`](docs/openai-compatible-apis.md).
@@ -133,9 +133,17 @@ Configured via **Administration → Plugins → LLM Dashboard Studio** (`jsonDat
 | `maxOutputTokens` | `jsonData` | `2048` | `256..8192` | Output token cap per LLM call |
 | `llmTimeoutSeconds` | `jsonData` | `45` | `5..120` | Per-attempt LLM request timeout |
 | `jobDeadlineSeconds` | `jsonData` | `90` | `10..180` | End-to-end deadline per generation/patch/repair job |
-| `maxConcurrentJobs` | `jsonData` | `4` | `1..16` | Global concurrent LLM job cap (per-user cap is `1`) |
+| `maxConcurrentJobs` | `jsonData` | `4` | `1..16` | Global concurrent LLM job cap per Grafana organization (per-user cap is `1`) |
 | `validationTimeoutSeconds` | `jsonData` | `10` | `2..30` | Per-panel dry-run query timeout |
 | `maxConcurrentQueries` | `jsonData` | `2` | `1..4` | Concurrent dry-run query cap in the browser |
+| `jobStoreBackend` | `jsonData` | `"memory"` | `"memory"`, `"redis"` | Job storage backend (`"memory"` zero-dependency default; `"redis"` for HA multi-replica persistence) |
+| `jobTtlMinutes` | `jsonData` | `30` | `1..1440` | Automatic expiration TTL (minutes) for idle draft jobs |
+| `redisAddr` | `jsonData` | *(unset)* | `host:port` or `[ipv6]:port` | Single-endpoint Redis/Valkey server or cluster proxy address (required when `jobStoreBackend="redis"`; no URL scheme, whitespace, or credentials) |
+| `redisDb` | `jsonData` | `0` | `0..15` | Redis logical database index (use `0` when connecting through a Redis Cluster proxy) |
+| `redisKeyPrefix` | `jsonData` | `"llmstudio:jobs"` | `[a-zA-Z0-9:_-]{1,64}` | Redis key namespace prefix wrapped in `{prefix}` hash tag (all Lua scripts access only declared `KEYS[]`) |
+| `redisTls` | `jsonData` | `false` | `boolean` | Enable TLS (minimum TLS 1.2) using the container/host system CA trust store |
+| `redisUsername` | `jsonData` | *(unset)* | `<= 128` chars | Optional Redis 6+ ACL username |
+| `redisPassword` | `secureJsonData` | *(unset)* | Encrypted secret | Optional Redis password stored encrypted in `secureJsonData` (never exposed to browser) |
 
 ## Security & Trust Boundaries
 
@@ -198,7 +206,7 @@ GitHub Actions (`.github/workflows/ci.yml`) runs all verification checks plus th
 ## Known Limitations (MVP Scope)
 
 - **Scope:** Single Grafana organization, Prometheus-compatible datasources only, `timeseries` and `stat` panels only, fixed grid layout, auto-refresh disabled, non-streaming LLM requests. (Loki, Tempo, ClickHouse, template variables, repeat panels, existing dashboard import, GitOps sync, and MCP/tool execution are out of scope for MVP.)
-- **In-Memory Job State:** Draft jobs are stored in a single Go backend process and reset on Grafana restart.
+- **Job State Persistence:** Defaults to process-local in-memory storage (`jobStoreBackend: "memory"`). For multi-replica HA Grafana deployments or restart persistence, enable `jobStoreBackend: "redis"` (see `deploy/docker-compose.redis.yml` for a local overlay).
 - **`grafana-llm-app` JSON Schema Proxy Behavior:** `grafana-llm-app` (`v1.0.8` / `v1.2.0`) unmarshals `response_format.json_schema.schema` into `go-openai/jsonschema.Definition`, which strips numeric/length/regex keywords and `extra_body`. Structure, `additionalProperties: false`, and string enums are enforced via structured outputs (or system-prompt schema in `json_object` mode), while bounds, regexes, PromQL AST rules, and catalog membership are deterministically re-enforced in the Go backend.
 - **Verification Coverage:** Automated unit tests, Scenes/Foundation parity tests, bundle externalization checks (`verify:bundle`), `grafana-llm-app` HTTP contract tests, and live Playwright / `@grafana/plugin-e2e` tests against running Grafana `13.3.1` (React 19) and `12.4.15` (React 18) containers (in mock mode with live Prometheus) run in GitHub Actions CI. Live LLM inference backends (vLLM or OpenAI-compatible APIs via `grafana-llm-app`) should still be validated in your target environment before production rollout.
 

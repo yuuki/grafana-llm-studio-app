@@ -1,0 +1,28 @@
+apiVersion: 1
+
+apps:
+  # Local HA Redis job store verification plugin config (dev/mock mode only).
+  - type: yuuki-llmstudio-app
+    org_id: 1
+    disabled: false
+    jsonData:
+      allowedDatasourceUids:
+        - prom-main
+      llmMode: mock
+      allowMockInDev: true
+      grafanaUrl: http://localhost:3000
+      modelTier: base
+      maxPanels: 6
+      maxRepairAttempts: 2
+      maxOutputTokens: 2048
+      llmTimeoutSeconds: 45
+      jobDeadlineSeconds: 90
+      maxConcurrentJobs: 4
+      validationTimeoutSeconds: 10
+      maxConcurrentQueries: 2
+      jobStoreBackend: redis
+      jobTtlMinutes: 30
+      redisAddr: redis:6379
+      redisDb: 0
+      redisKeyPrefix: llmstudio:jobs
+      redisTls: false

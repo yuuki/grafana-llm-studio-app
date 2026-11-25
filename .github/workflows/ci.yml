@@ -68,6 +68,7 @@ jobs:
         run: |
           docker compose -f deploy/docker-compose.yml config --quiet
           docker compose -f deploy/docker-compose.yml -f deploy/docker-compose.bench-verify.yml config --quiet
+          docker compose -f deploy/docker-compose.yml -f deploy/docker-compose.redis.yml config --quiet
 
       - name: Upload built plugin dist artifact
         uses: actions/upload-artifact@v4

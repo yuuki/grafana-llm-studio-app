@@ -240,6 +240,120 @@ describe.each(SUPPORTED_LOCALES)(
       await waitFor(() => expect(mockFetch).toHaveBeenCalledTimes(2));
       expect(mockFetch.mock.calls[1][0].data.jsonData.datasourceDialects).toEqual({});
     });
+
+    test('validates redisAddr, saves HA Redis job store settings, and supports resetting redisPassword secret', async () => {
+      const plugin = makePlugin(
+        {
+          allowedDatasourceUids: ['prom-main'],
+          llmMode: 'grafana-llm-app',
+          jobStoreBackend: 'memory',
+        },
+        { redisPassword: true }
+      );
+
+      render(<AppConfig plugin={plugin as never} query={{}} />);
+
+      const storeSelect = screen.getByLabelText(t('appConfig.jobStorage.backendLabel'));
+      fireEvent.change(storeSelect, { target: { value: 'redis' } });
+
+      // Saving redis without redisAddr MUST fail client-side validation before fetch.
+      fireEvent.click(screen.getByText(t('appConfig.actions.save')));
+      await waitFor(() =>
+        expect(screen.getByText(t('appConfig.validation.redisAddrRequired'))).toBeTruthy()
+      );
+      expect(mockFetch).not.toHaveBeenCalled();
+
+      // Reject addresses that Go net.SplitHostPort would reject (spaces, unbracketed IPv6, empty brackets, +port).
+      for (const badAddr of ['redis : 6379', '::1:6379', '[]:6379', 'redis:+6379', 'redis:06379', 'redis/x:6379']) {
+        fireEvent.change(screen.getByPlaceholderText('redis:6379'), { target: { value: badAddr } });
+        fireEvent.click(screen.getByText(t('appConfig.actions.save')));
+        await waitFor(() =>
+          expect(screen.getByText(t('appConfig.validation.redisAddrRequired'))).toBeTruthy()
+        );
+      }
+      expect(mockFetch).not.toHaveBeenCalled();
+
+      // Reject >128 char redisUsername.
+      fireEvent.change(screen.getByPlaceholderText('redis:6379'), { target: { value: '[::1]:6379' } });
+      fireEvent.change(screen.getByPlaceholderText('default'), { target: { value: 'a'.repeat(129) } });
+      fireEvent.click(screen.getByText(t('appConfig.actions.save')));
+      await waitFor(() =>
+        expect(screen.getByText(t('appConfig.validation.redisUsernameTooLong'))).toBeTruthy()
+      );
+      expect(mockFetch).not.toHaveBeenCalled();
+
+      // Valid IPv6 + valid username + reset existing redisPassword + enable TLS.
+      fireEvent.change(screen.getByPlaceholderText('default'), { target: { value: 'studio' } });
+      fireEvent.click(screen.getByText('Reset Secret'));
+      fireEvent.click(screen.getByRole('checkbox'));
+
+      fireEvent.click(screen.getByText(t('appConfig.actions.save')));
+      await waitFor(() => expect(mockFetch).toHaveBeenCalledTimes(1));
+      const payload = mockFetch.mock.calls[0][0].data;
+      expect(payload.jsonData.jobStoreBackend).toBe('redis');
+      expect(payload.jsonData.redisAddr).toBe('[::1]:6379');
+      expect(payload.jsonData.redisUsername).toBe('studio');
+      expect(payload.jsonData.redisKeyPrefix).toBe('llmstudio:jobs');
+      expect(payload.jsonData.redisTls).toBe(true);
+      expect(payload.secureJsonData).toEqual({ redisPassword: '' });
+    });
+
+    test('switching redis -> memory does not reset hidden redisPassword or persist unvalidated hidden Redis edits', async () => {
+      const plugin = makePlugin(
+        {
+          allowedDatasourceUids: ['prom-main'],
+          llmMode: 'grafana-llm-app',
+          jobStoreBackend: 'redis',
+          redisAddr: 'redis.ha:6379',
+          redisDb: 2,
+        },
+        { redisPassword: true }
+      );
+
+      render(<AppConfig plugin={plugin as never} query={{}} />);
+
+      // User clicks Reset Secret on Redis password and types invalid redisDb, then switches back to memory.
+      fireEvent.click(screen.getByText('Reset Secret'));
+      const redisDbInput = screen.getByLabelText(t('appConfig.jobStorage.redisDbLabel'));
+      fireEvent.change(redisDbInput, { target: { value: '99' } });
+
+      const storeSelect = screen.getByLabelText(t('appConfig.jobStorage.backendLabel'));
+      fireEvent.change(storeSelect, { target: { value: 'memory' } });
+
+      fireEvent.click(screen.getByText(t('appConfig.actions.save')));
+      await waitFor(() => expect(mockFetch).toHaveBeenCalledTimes(1));
+      const payload = mockFetch.mock.calls[0][0].data;
+      expect(payload.jsonData.jobStoreBackend).toBe('memory');
+      expect(payload.jsonData.redisDb).toBe(2);
+      expect(payload.secureJsonData).toBeUndefined();
+    });
+
+    test('clearing a numeric input fails validation instead of silently coercing to 0', async () => {
+      const plugin = makePlugin({
+        allowedDatasourceUids: ['prom-main'],
+        llmMode: 'grafana-llm-app',
+        maxRepairAttempts: 2,
+      });
+
+      render(<AppConfig plugin={plugin as never} query={{}} />);
+
+      const repairInput = screen.getByLabelText(t('appConfig.limits.maxRepairAttempts'));
+      fireEvent.change(repairInput, { target: { value: '' } });
+
+      fireEvent.click(screen.getByText(t('appConfig.actions.save')));
+      await waitFor(() =>
+        expect(
+          screen.getByText(
+            t('appConfig.validation.numberRange', {
+              label: t('appConfig.validation.fields.maxRepairAttempts'),
+              min: 0,
+              max: 2,
+            })
+          )
+        ).toBeTruthy()
+      );
+      expect(mockFetch).not.toHaveBeenCalled();
+    });
   }
 );
 

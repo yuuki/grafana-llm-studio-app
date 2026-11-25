@@ -146,6 +146,9 @@
       "allowMockRequired": "Explicitly enable allowMockInDev to save llmMode=mock.",
       "numberRange": "{{label}} must be a number between {{min}} and {{max}}.",
       "reasoningEffort": "Reasoning Effort must be blank or one of: low, medium, high.",
+      "redisAddrRequired": "Redis address must be a valid host:port (or [ipv6]:port) without URL scheme, whitespace, or embedded credentials when jobStoreBackend=redis.",
+      "redisKeyPrefixInvalid": "Redis key prefix must be 1..64 characters of [a-zA-Z0-9:_-].",
+      "redisUsernameTooLong": "Redis ACL username must be 128 characters or fewer.",
       "fields": {
         "maxPanels": "Max panels",
         "maxRepairAttempts": "Max auto-repair attempts",
@@ -154,7 +157,9 @@
         "jobDeadlineSeconds": "Job deadline (seconds)",
         "maxConcurrentJobs": "Max concurrent LLM jobs",
         "validationTimeoutSeconds": "Validation query timeout (seconds)",
-        "maxConcurrentQueries": "Max concurrent datasource queries"
+        "maxConcurrentQueries": "Max concurrent datasource queries",
+        "jobTtlMinutes": "Job TTL (minutes)",
+        "redisDb": "Redis DB index"
       }
     },
     "datasource": {
@@ -207,6 +212,24 @@
       "maxConcurrentJobs": "Max concurrent LLM jobs (1..16)",
       "validationTimeoutSeconds": "Validation query timeout (seconds, 2..30)",
       "maxConcurrentQueries": "Max concurrent datasource queries (1..4)"
+    },
+    "jobStorage": {
+      "fieldset": "Job Storage (Single-Process / HA Multi-Replica)",
+      "backendLabel": "Job Store Backend",
+      "backendDescription": "Use memory (zero dependencies) for single-instance Grafana, or redis for persistent multi-replica HA deployments.",
+      "backendMemory": "memory (Default — single-process in-memory)",
+      "backendRedis": "redis (Persistent — HA multi-replica shared store)",
+      "jobTtlMinutesLabel": "Job TTL (minutes, 1..1440)",
+      "redisAddrLabel": "Redis Address (host:port)",
+      "redisAddrDescription": "Single-endpoint host:port or [ipv6]:port of your Redis/Valkey server or cluster proxy (e.g., redis:6379). Never embed passwords in the address.",
+      "redisDbLabel": "Redis DB Index (0..15)",
+      "redisKeyPrefixLabel": "Redis Key Prefix",
+      "redisKeyPrefixDescription": "Namespace prefix wrapped in a hash tag ({prefix}); use redisDb=0 when connecting through a Redis Cluster proxy.",
+      "redisUsernameLabel": "Redis ACL Username (Optional)",
+      "redisPasswordLabel": "Redis Password (secureJsonData, Optional)",
+      "redisPasswordDescription": "Stored encrypted in secureJsonData and never returned to the browser (reset and save blank to clear).",
+      "redisTlsLabel": "Enable TLS for Redis connection",
+      "redisTlsCheckbox": "Use TLS (minimum TLS 1.2, system root CA trust store)"
     },
     "actions": {
       "saving": "Saving...",

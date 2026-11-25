@@ -146,6 +146,9 @@
       "allowMockRequired": "llmMode=mock を保存するには allowMockInDev を明示的に有効化してください。",
       "numberRange": "{{label}} は {{min}}〜{{max}} の数値で指定してください。",
       "reasoningEffort": "Reasoning Effort は空欄または low / medium / high のいずれかを指定してください。",
+      "redisAddrRequired": "jobStoreBackend=redis の場合、Redis アドレスは URL スキーム・空白・認証情報を含まない host:port（または [ipv6]:port）形式で指定してください。",
+      "redisKeyPrefixInvalid": "Redis キープレフィックスは [a-zA-Z0-9:_-] の 1〜64 文字で指定してください。",
+      "redisUsernameTooLong": "Redis ACL ユーザー名は 128 文字以下で指定してください。",
       "fields": {
         "maxPanels": "最大パネル数",
         "maxRepairAttempts": "自動構文修復の最大回数",
@@ -154,7 +157,9 @@
         "jobDeadlineSeconds": "ジョブ全体期限(秒)",
         "maxConcurrentJobs": "LLM 同時実行ジョブ上限",
         "validationTimeoutSeconds": "検証クエリタイムアウト(秒)",
-        "maxConcurrentQueries": "データソース並列クエリ上限"
+        "maxConcurrentQueries": "データソース並列クエリ上限",
+        "jobTtlMinutes": "ジョブ保持期限 (TTL・分)",
+        "redisDb": "Redis DB インデックス"
       }
     },
     "datasource": {
@@ -207,6 +212,24 @@
       "maxConcurrentJobs": "LLM 同時実行ジョブ上限 (1..16)",
       "validationTimeoutSeconds": "検証クエリタイムアウト (秒, 2..30)",
       "maxConcurrentQueries": "データソース並列クエリ上限 (1..4)"
+    },
+    "jobStorage": {
+      "fieldset": "ジョブストレージ（単一プロセス / HA マルチレプリカ）",
+      "backendLabel": "ジョブストアバックエンド",
+      "backendDescription": "単一 Grafana インスタンスでは依存なしの memory、HA マルチレプリカ構成では永続共有できる redis を選択してください。",
+      "backendMemory": "memory（既定・単一プロセス内メモリ）",
+      "backendRedis": "redis（永続・HA マルチレプリカ共有ストア）",
+      "jobTtlMinutesLabel": "ジョブ保持期限 (TTL・分, 1..1440)",
+      "redisAddrLabel": "Redis アドレス (host:port)",
+      "redisAddrDescription": "Redis / Valkey サーバーまたはクラスタプロキシの単一エンドポイント host:port（または [ipv6]:port、例: redis:6379）。パスワードは埋め込まないでください。",
+      "redisDbLabel": "Redis DB インデックス (0..15)",
+      "redisKeyPrefixLabel": "Redis キープレフィックス",
+      "redisKeyPrefixDescription": "ハッシュタグ ({prefix}) でラップされる名前空間プレフィックスです（Redis Cluster プロキシ経由時は redisDb=0 を指定）。",
+      "redisUsernameLabel": "Redis ACL ユーザー名（任意）",
+      "redisPasswordLabel": "Redis パスワード (secureJsonData・任意)",
+      "redisPasswordDescription": "secureJsonData として暗号化保存されブラウザには返却されません（リセットして空欄保存すると削除します）。",
+      "redisTlsLabel": "Redis 接続で TLS を有効化",
+      "redisTlsCheckbox": "TLS を使用する（最小 TLS 1.2・システム CA トラストストアを使用）"
     },
     "actions": {
       "saving": "保存中...",
