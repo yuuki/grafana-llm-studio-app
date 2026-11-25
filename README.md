@@ -1,5 +1,13 @@
 # LLM Dashboard Studio (`yuuki-llmstudio-app`)
 
+[![AI Generated](https://img.shields.io/badge/AI%20Generated-Claude-orange?logo=anthropic)](https://claude.ai/claude-code)
+[![CI](https://github.com/yuuki/grafana-llm-studio-app/actions/workflows/ci.yml/badge.svg)](https://github.com/yuuki/grafana-llm-studio-app/actions/workflows/ci.yml)
+[![Security](https://github.com/yuuki/grafana-llm-studio-app/actions/workflows/security.yml/badge.svg)](https://github.com/yuuki/grafana-llm-studio-app/actions/workflows/security.yml)
+[![Release](https://img.shields.io/github/v/release/yuuki/grafana-llm-studio-app)](https://github.com/yuuki/grafana-llm-studio-app/releases)
+[![License](https://img.shields.io/github/license/yuuki/grafana-llm-studio-app)](LICENSE)
+[![Grafana](https://img.shields.io/badge/Grafana-%3E%3D12.4%20%3C14-orange?logo=grafana)](https://grafana.com)
+[![Go version](https://img.shields.io/github/go-mod/go-version/yuuki/grafana-llm-studio-app)](go.mod)
+
 An open-source Grafana App Plugin for generating, iteratively refining, previewing, and saving Prometheus/VictoriaMetrics dashboards using OpenAI-compatible APIs or self-hosted local LLMs (vLLM) via [`grafana-llm-app`](https://github.com/grafana/grafana-llm-app) — without requiring Grafana Cloud or Grafana Assistant.
 
 > **Status:** MVP (`0.1.0`) — Supports **Grafana OSS `13.3.1` (React 19)** and **Grafana OSS `12.4.15` (React 18)** (`grafanaDependency: ">=12.4.0 <14.0.0"`).
