@@ -60,6 +60,8 @@ type JSONSettings struct {
 	MaxConcurrentJobs     int               `json:"maxConcurrentJobs"`
 	ValidationTimeoutSec  int               `json:"validationTimeoutSeconds"`
 	MaxConcurrentQueries  int               `json:"maxConcurrentQueries"`
+	EnableSSEProgress     bool              `json:"enableSseProgress,omitempty"`
+	MockDelayMs           int               `json:"mockDelayMs,omitempty"`
 	JobStoreBackend       string            `json:"jobStoreBackend,omitempty"`
 	JobTTLMinutes         int               `json:"jobTtlMinutes,omitempty"`
 	RedisAddr             string            `json:"redisAddr,omitempty"`
@@ -92,6 +94,7 @@ type PublicConfig struct {
 	MaxRepairAttempts        int               `json:"maxRepairAttempts"`
 	ValidationTimeoutSeconds int               `json:"validationTimeoutSeconds"`
 	MaxConcurrentQueries     int               `json:"maxConcurrentQueries"`
+	EnableSSEProgress        bool              `json:"enableSseProgress"`
 	MockBanner               bool              `json:"mockBanner"`
 }
 
@@ -122,6 +125,7 @@ func (s Settings) Public() PublicConfig {
 		MaxRepairAttempts:        s.EffectiveMaxRepairs,
 		ValidationTimeoutSeconds: s.ValidationTimeoutSec,
 		MaxConcurrentQueries:     s.MaxConcurrentQueries,
+		EnableSSEProgress:        s.EnableSSEProgress,
 		MockBanner:               s.LLMMode == LLMModeMock,
 	}
 }
@@ -257,6 +261,11 @@ func LoadSettings(appSettings backend.AppInstanceSettings, trustedGrafanaAppURL 
 	}
 	if js.LLMMode == LLMModeMock && !js.AllowMockInDev {
 		return Settings{}, errors.New("llmMode=mock requires explicit allowMockInDev=true (dev/test only)")
+	}
+	if js.LLMMode != LLMModeMock || !js.AllowMockInDev || js.MockDelayMs < 0 {
+		js.MockDelayMs = 0
+	} else if js.MockDelayMs > 10000 {
+		js.MockDelayMs = 10000
 	}
 
 	js.JobStoreBackend = strings.TrimSpace(strings.ToLower(js.JobStoreBackend))

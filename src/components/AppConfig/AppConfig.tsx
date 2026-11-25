@@ -34,6 +34,7 @@ export interface StudioJsonData {
   maxConcurrentJobs?: number;
   validationTimeoutSeconds?: number;
   maxConcurrentQueries?: number;
+  enableSseProgress?: boolean;
   jobStoreBackend?: 'memory' | 'redis';
   jobTtlMinutes?: number;
   redisAddr?: string;
@@ -148,6 +149,7 @@ export const AppConfig: React.FC<PluginConfigPageProps<AppPluginMeta<StudioJsonD
   const [maxConcurrentQueries, setMaxConcurrentQueries] = useState(
     jsonData?.maxConcurrentQueries ?? 2
   );
+  const [enableSseProgress, setEnableSseProgress] = useState(Boolean(jsonData?.enableSseProgress));
 
   const [jobStoreBackend, setJobStoreBackend] = useState<'memory' | 'redis'>(
     jsonData?.jobStoreBackend === 'redis' ? 'redis' : 'memory'
@@ -248,11 +250,14 @@ export const AppConfig: React.FC<PluginConfigPageProps<AppPluginMeta<StudioJsonD
         }
       }
 
-      // Preserve any existing jsonData fields (H-11) and normalize allowMockInDev=false outside mock mode (M-13).
+      // Preserve any existing jsonData fields (H-11), strip dev-only mockDelayMs (L-1), and normalize allowMockInDev=false outside mock mode (M-13).
       // Only write Redis-specific jsonData/secureJsonData fields when jobStoreBackend === 'redis' so switching
       // back to memory never overwrites saved settings with unvalidated hidden fields or resets redisPassword.
+      const { mockDelayMs: _stripMockDelayMs, ...preservedJsonData } = (jsonData ?? {}) as StudioJsonData & {
+        mockDelayMs?: unknown;
+      };
       const nextJsonData: StudioJsonData = {
-        ...(jsonData ?? {}),
+        ...preservedJsonData,
         allowedDatasourceUids,
         datasourceDialects: cleanedDialects,
         llmMode,
@@ -270,6 +275,7 @@ export const AppConfig: React.FC<PluginConfigPageProps<AppPluginMeta<StudioJsonD
         maxConcurrentJobs,
         validationTimeoutSeconds,
         maxConcurrentQueries,
+        enableSseProgress,
         jobStoreBackend,
         jobTtlMinutes,
         ...(jobStoreBackend === 'redis'
@@ -515,6 +521,17 @@ export const AppConfig: React.FC<PluginConfigPageProps<AppPluginMeta<StudioJsonD
               setLlmServiceAccountToken('');
             }}
             placeholder="glsa_..."
+          />
+        </Field>
+
+        <Field
+          label={t('appConfig.llm.sseProgressLabel')}
+          description={t('appConfig.llm.sseProgressDescription')}
+        >
+          <Checkbox
+            value={enableSseProgress}
+            onChange={(e) => setEnableSseProgress(e.currentTarget.checked)}
+            label={t('appConfig.llm.sseProgressCheckbox')}
           />
         </Field>
       </FieldSet>

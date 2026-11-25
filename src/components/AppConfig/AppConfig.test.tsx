@@ -177,7 +177,7 @@ describe.each(SUPPORTED_LOCALES)(
 
       // Enable allowMockInDev, then switch back to grafana-llm-app -> saved payload MUST normalize allowMockInDev: false.
       // Selects: [0]=dialect(prom-main), [1]=llmMode, [2]=modelTier, [3]=structuredOutputMode, [4]=tokenLimitField, [5]=reasoningEffort
-      fireEvent.click(screen.getByRole('checkbox'));
+      fireEvent.click(screen.getByLabelText(t('appConfig.llm.allowMockCheckbox')));
       const modeSelect = screen.getAllByRole('combobox')[1];
       fireEvent.change(modeSelect, { target: { value: 'grafana-llm-app' } });
 
@@ -285,7 +285,7 @@ describe.each(SUPPORTED_LOCALES)(
       // Valid IPv6 + valid username + reset existing redisPassword + enable TLS.
       fireEvent.change(screen.getByPlaceholderText('default'), { target: { value: 'studio' } });
       fireEvent.click(screen.getByText('Reset Secret'));
-      fireEvent.click(screen.getByRole('checkbox'));
+      fireEvent.click(screen.getByLabelText(t('appConfig.jobStorage.redisTlsCheckbox')));
 
       fireEvent.click(screen.getByText(t('appConfig.actions.save')));
       await waitFor(() => expect(mockFetch).toHaveBeenCalledTimes(1));
@@ -384,5 +384,30 @@ describe('AppConfig reactive locale switching', () => {
 
     expect(screen.getByText('権限とセキュリティ方針')).toBeTruthy();
     expect(screen.getByText('設定を保存')).toBeTruthy();
+  });
+
+  test('defaults enableSseProgress to false, persists true when enabled, and strips hidden mockDelayMs (L-1)', async () => {
+    mockFetch.mockReset();
+    mockFetch.mockReturnValue(of({ data: {} }));
+
+    const plugin = makePlugin({
+      allowedDatasourceUids: ['prom-main'],
+      llmMode: 'grafana-llm-app',
+      mockDelayMs: 5000,
+    });
+
+    render(<AppConfig plugin={plugin as never} query={{}} />);
+    const sseCheckbox = screen.getByLabelText(t('appConfig.llm.sseProgressCheckbox')) as HTMLInputElement;
+    expect(sseCheckbox.checked).toBe(false);
+
+    fireEvent.click(sseCheckbox);
+    expect(sseCheckbox.checked).toBe(true);
+
+    fireEvent.click(screen.getByText(t('appConfig.actions.save')));
+    await waitFor(() => expect(mockFetch).toHaveBeenCalledTimes(1));
+
+    const payload = mockFetch.mock.calls[0][0].data;
+    expect(payload.jsonData.enableSseProgress).toBe(true);
+    expect('mockDelayMs' in payload.jsonData).toBe(false);
   });
 });

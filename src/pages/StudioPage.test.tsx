@@ -25,6 +25,17 @@ jest.mock('../spec/toScene', () => ({
   buildPreviewScene: (...args: unknown[]) => mockBuildPreviewScene(...args),
 }));
 
+const mockFetchPublicConfig = jest.fn(async (..._args: unknown[]) => ({
+  allowedDatasourceUids: ['prom-main'],
+  llmMode: 'mock',
+  modelTier: 'base',
+  maxPanels: 6,
+  maxRepairAttempts: 2,
+  validationTimeoutSeconds: 10,
+  maxConcurrentQueries: 2,
+  enableSseProgress: false,
+  mockBanner: true,
+}));
 const mockGenerateDraft = jest.fn();
 const mockImportDraft = jest.fn();
 const mockPatchDraft = jest.fn();
@@ -33,16 +44,7 @@ const mockUndoDraft = jest.fn();
 const mockCancelDraftJob = jest.fn();
 
 jest.mock('../api/studioClient', () => ({
-  fetchPublicConfig: jest.fn(async () => ({
-    allowedDatasourceUids: ['prom-main'],
-    llmMode: 'mock',
-    modelTier: 'base',
-    maxPanels: 6,
-    maxRepairAttempts: 2,
-    validationTimeoutSeconds: 10,
-    maxConcurrentQueries: 2,
-    mockBanner: true,
-  })),
+  fetchPublicConfig: (...args: unknown[]) => mockFetchPublicConfig(...args),
   generateDraft: (...args: unknown[]) => mockGenerateDraft(...args),
   importDraft: (...args: unknown[]) => mockImportDraft(...args),
   patchDraft: (...args: unknown[]) => mockPatchDraft(...args),
@@ -626,6 +628,147 @@ describe('StudioPage v1.1 safe import & variable cache invalidation', () => {
       2,
       expect.anything(),
       expect.objectContaining({ onlyPanelIds: ['panel-req'] })
+    );
+  });
+
+  test('renders decoupled SSE stage progress without mounting Scenes, guards prototype stage keys, and locks UI while cancel settles (H-3, M-3, L-4)', async () => {
+    mockFetchPublicConfig.mockResolvedValueOnce({
+      allowedDatasourceUids: ['prom-main'],
+      llmMode: 'mock',
+      modelTier: 'base',
+      maxPanels: 6,
+      maxRepairAttempts: 2,
+      validationTimeoutSeconds: 10,
+      maxConcurrentQueries: 2,
+      enableSseProgress: true,
+      mockBanner: true,
+    });
+
+    let resolveGenerate!: (value: unknown) => void;
+    let capturedOpts:
+      | {
+          enableSse?: boolean;
+          onStage?: (ev: { jobId?: string; operation: string; stage: string; timestamp: string }) => void;
+          onFallback?: (reason: string) => void;
+        }
+      | undefined;
+
+    mockGenerateDraft.mockImplementationOnce(
+      (_req: unknown, _signal: AbortSignal, opts: typeof capturedOpts) => {
+        capturedOpts = opts;
+        return new Promise((resolve) => {
+          resolveGenerate = resolve;
+        });
+      }
+    );
+
+    render(<StudioPage />);
+    await waitFor(() => expect(screen.getByText('Development/Testing Mock LLM Mode')).toBeTruthy());
+    fireEvent.change(screen.getByPlaceholderText('checkout-api'), { target: { value: 'checkout-api' } });
+    fireEvent.click(screen.getByText('Fetch Scoped Metrics'));
+    await waitFor(() => expect(screen.getByTestId('studio-catalog-count').textContent).toBe('2'));
+
+    fireEvent.click(screen.getByText('Generate Dashboard Draft'));
+    await waitFor(() => expect(mockGenerateDraft).toHaveBeenCalledTimes(1));
+    expect(capturedOpts?.enableSse).toBe(true);
+
+    // Simulate incremental stage updates while LLM is running (including adversarial prototype key M-3).
+    await act(async () => {
+      capturedOpts?.onStage?.({
+        jobId: 'job-sse-live',
+        operation: 'generate',
+        stage: 'toString',
+        timestamp: '2026-11-24T00:00:00Z',
+      });
+    });
+    expect(screen.getByTestId('studio-sse-progress').textContent).toContain('toString');
+
+    await act(async () => {
+      capturedOpts?.onStage?.({
+        jobId: 'job-sse-live',
+        operation: 'generate',
+        stage: 'generating',
+        timestamp: '2026-11-24T00:00:00Z',
+      });
+    });
+    expect(screen.getByTestId('studio-sse-progress').textContent).toContain('generating');
+    expect(mockBuildPreviewScene).not.toHaveBeenCalled();
+
+    await act(async () => {
+      capturedOpts?.onFallback?.('sse_not_acceptable');
+    });
+    expect(screen.getByTestId('studio-sse-fallback-notice')).toBeTruthy();
+
+    await act(async () => {
+      capturedOpts?.onStage?.({
+        jobId: 'job-sse-live',
+        operation: 'generate',
+        stage: 'validating_ir',
+        timestamp: '2026-11-24T00:00:01Z',
+      });
+    });
+    expect(screen.getByTestId('studio-sse-progress').textContent).toContain('validating_ir');
+    expect(mockBuildPreviewScene).not.toHaveBeenCalled();
+
+    // Complete generation -> progress indicator clears and validated job appears.
+    await act(async () => {
+      resolveGenerate(makeTwoPanelJob('job-sse-live', 1, ERR_EXPR_V1));
+    });
+    await waitFor(() => expect(screen.getByTestId('studio-job-revision').textContent).toBe('rev 1'));
+    expect(screen.queryByTestId('studio-sse-progress')).toBeNull();
+    expect(mockBuildPreviewScene).not.toHaveBeenCalled();
+
+    // Start a second generation (new draft), emit generating with jobId, then click Cancel ->
+    // UI MUST remain disabled (busyState='cancelling') until cancelDraftJob resolves (H-3).
+    const editSelect = screen.getByLabelText('Edit Mode / Target Panel');
+    fireEvent.change(editSelect, { target: { value: '__new__' } });
+
+    let capturedOpts2: typeof capturedOpts;
+    mockGenerateDraft.mockImplementationOnce(
+      (_req: unknown, signal: AbortSignal, opts: typeof capturedOpts) => {
+        capturedOpts2 = opts;
+        return new Promise((_resolve, reject) => {
+          signal.addEventListener('abort', () => reject(new DOMException('Request aborted', 'AbortError')));
+        });
+      }
+    );
+    let resolveCancel!: (value: unknown) => void;
+    mockCancelDraftJob.mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          resolveCancel = resolve;
+        })
+    );
+
+    fireEvent.click(screen.getByText('Generate Dashboard Draft'));
+    await waitFor(() => expect(mockGenerateDraft).toHaveBeenCalledTimes(2));
+
+    await act(async () => {
+      capturedOpts2?.onStage?.({
+        jobId: 'job-sse-cancel',
+        operation: 'generate',
+        stage: 'generating',
+        timestamp: '2026-11-24T00:00:02Z',
+      });
+    });
+
+    fireEvent.click(screen.getByText('Cancel'));
+    await waitFor(() =>
+      expect(mockCancelDraftJob).toHaveBeenCalledWith('job-sse-cancel', expect.any(AbortSignal))
+    );
+    expect(screen.queryByTestId('studio-sse-progress')).toBeNull();
+    // Generate button stays disabled while cancelDraftJob is still in flight (H-3).
+    expect((screen.getByText('Generate Dashboard Draft') as HTMLButtonElement).disabled).toBe(true);
+
+    await act(async () => {
+      resolveCancel({
+        ...makeTwoPanelJob('job-sse-cancel', 1, ERR_EXPR_V1),
+        status: 'cancelled',
+        currentIR: undefined,
+      });
+    });
+    await waitFor(() =>
+      expect((screen.getByText('Generate Dashboard Draft') as HTMLButtonElement).disabled).toBe(false)
     );
   });
 });

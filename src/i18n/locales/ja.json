@@ -79,6 +79,20 @@
       "diffTitle": "変更内容 (Diff):",
       "repairBudget": "修復予算: {{used}} / {{max}} 回使用"
     },
+    "progress": {
+      "label": "進捗:",
+      "fallbackNotice": "SSE 進捗ストリーミングを利用できなかったため、非ストリーミングリクエストへ自動フォールバックしました。",
+      "stage": {
+        "generating": "構造化 IR 生成のため LLM を呼び出し中...",
+        "repairing": "構文エラー修復のため LLM を呼び出し中...",
+        "validating_ir": "IR スキーマとクエリ安全性を検証中...",
+        "awaiting_preview": "ドラフト検証完了・プレビュー可能",
+        "ready": "完了",
+        "insufficient_metrics": "選択スコープに十分なメトリクスがありません",
+        "cancelled": "処理をキャンセルしました",
+        "failed": "処理に失敗しました"
+      }
+    },
     "validation": {
       "heading": "検証結果（Dry-Run: 直近5m / maxDataPoints=10）",
       "repairing": "修復中...",
@@ -200,7 +214,10 @@
       "reasoningEffortMedium": "medium（推論モデル向け・標準）",
       "reasoningEffortHigh": "high（推論モデル向け・最大）",
       "saTokenLabel": "LLM 専用サービスアカウントトークン (secureJsonData)",
-      "saTokenDescription": "Grafana OSS では最小基本ロール Viewer を割り当て、llmclient 専用とします（リセットして空欄保存すると既存トークンを削除します）。"
+      "saTokenDescription": "Grafana OSS では最小基本ロール Viewer を割り当て、llmclient 専用とします（リセットして空欄保存すると既存トークンを削除します）。",
+      "sseProgressLabel": "SSE ステージ進捗ストリーミング（任意）",
+      "sseProgressDescription": "生の LLM トークンや未検証 JSON は一切流さず、アプリケーション層のステージ進捗（generating → validating_ir → awaiting_preview）のみを CallResource SSE で通知します。リバースプロキシでは proxy_buffering off と HTTP/1.1 の設定が必要で、利用不可時は非ストリーミングへ自動フォールバックします。",
+      "sseProgressCheckbox": "任意の SSE ステージ進捗通知を有効化"
     },
     "limits": {
       "fieldset": "予算・クエリ上限（初期仮設定・環境に応じて調整）",
