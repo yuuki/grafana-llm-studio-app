@@ -514,6 +514,10 @@ describe('StudioPage v1.1 safe import & variable cache invalidation', () => {
         targetUid: 'existing-dash-1',
         expectedResourceVersion: '27',
         previewedRevision: 1,
+        currentIR: expect.objectContaining({ revision: 1 }),
+        patchContext: expect.objectContaining({
+          originalSpec: expect.objectContaining({ title: 'Existing Dash' }),
+        }),
       })
     );
     // Opt-in checkbox resets to false after save so next save defaults safely to create-as-copy.

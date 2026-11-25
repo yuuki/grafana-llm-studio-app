@@ -68,29 +68,48 @@ func (m *MockClient) GenerateIR(ctx context.Context, req GenerateRequest) ([]byt
 	wantMultiQuery := containsAny(lowerIntent, "multi", "p50", "p99", "マルチクエリ", "比較")
 
 	var variables []ir.VariableIR
-	if wantVariable &&
-		req.Scope != nil &&
-		validMockLabelName.MatchString(req.Scope.LabelName) &&
-		!ir.IsReservedVariableName(req.Scope.LabelName) &&
-		len(req.Scope.LabelName) <= ir.MaxVariableNameLen &&
-		strings.TrimSpace(req.Scope.LabelValue) != "" {
+	if wantVariable {
 		metricHint := ""
+		secondaryLabel := ""
 		if hasReq {
 			metricHint = reqMetric.Name
+			for _, lbl := range reqMetric.Labels {
+				if (req.Scope == nil || lbl != req.Scope.LabelName) && validMockLabelName.MatchString(lbl) && !ir.IsReservedVariableName(lbl) && len(lbl) <= ir.MaxVariableNameLen {
+					secondaryLabel = lbl
+					break
+				}
+			}
 		} else if len(req.Catalog) > 0 {
 			metricHint = req.Catalog[0].Name
+			for _, lbl := range req.Catalog[0].Labels {
+				if (req.Scope == nil || lbl != req.Scope.LabelName) && validMockLabelName.MatchString(lbl) && !ir.IsReservedVariableName(lbl) && len(lbl) <= ir.MaxVariableNameLen {
+					secondaryLabel = lbl
+					break
+				}
+			}
 		}
-		if metricHint != "" {
+		if metricHint != "" && secondaryLabel != "" {
+			defaultVal := "200"
+			if secondaryLabel != "status" {
+				defaultVal = "default"
+			}
 			variables = append(variables, ir.VariableIR{
-				Name:          req.Scope.LabelName,
-				Label:         strings.ToUpper(req.Scope.LabelName[:1]) + req.Scope.LabelName[1:],
+				Name:          secondaryLabel,
+				Label:         strings.ToUpper(secondaryLabel[:1]) + secondaryLabel[1:],
 				Type:          "query",
 				DatasourceRef: ir.SelectedDatasourceRef,
-				LabelName:     req.Scope.LabelName,
+				LabelName:     secondaryLabel,
 				MetricName:    metricHint,
-				DefaultValue:  req.Scope.LabelValue,
+				DefaultValue:  defaultVal,
 			})
-			selector = fmt.Sprintf(`{%s="$%s"}`, req.Scope.LabelName, req.Scope.LabelName)
+		} else {
+			variables = append(variables, ir.VariableIR{
+				Name:         "status_class",
+				Label:        "Error Status Regex",
+				Type:         "custom",
+				Options:      []string{"5..", "4..|5.."},
+				DefaultValue: "5..",
+			})
 		}
 	}
 
@@ -174,9 +193,6 @@ func (m *MockClient) GenerateIR(ctx context.Context, req GenerateRequest) ([]byt
 	}
 	if hasReq && wantError && len(panels) < maxPanels {
 		errSelector := buildScopeMatcherWithExtra(req.Scope, `status=~"5.."`)
-		if len(variables) > 0 && req.Scope != nil {
-			errSelector = fmt.Sprintf(`{%s="$%s",status=~"5.."}`, req.Scope.LabelName, req.Scope.LabelName)
-		}
 		expr := fmt.Sprintf(
 			"sum(rate(%s%s[5m])) / clamp_min(sum(rate(%s%s[5m])), 1e-9)",
 			reqMetric.Name, errSelector, reqMetric.Name, selector,

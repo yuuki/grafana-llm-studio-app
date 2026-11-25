@@ -100,17 +100,9 @@ func TestValidateExpr_ValidMetricsQL(t *testing.T) {
 			expr: "# WITH (a=1) ru(1,2)\nsum(rate(with_total{service=\"checkout\"}[5m])) + sum(rate(ru_total{service=\"checkout\"}[5m]))",
 		},
 		{
-			name: "anchored scope variable and regex query variable in double quotes",
-			expr: `sum(rate(http_requests_total{service="$service", instance=~"${instance:regex}"}[5m]))`,
+			name: "literal required scope with regex query variable in double quotes",
+			expr: `sum(rate(http_requests_total{service="checkout", instance=~"${instance:regex}"}[5m]))`,
 			vars: []ir.VariableIR{
-				{
-					Name:          "service",
-					Type:          "query",
-					DatasourceRef: ir.SelectedDatasourceRef,
-					LabelName:     "service",
-					MetricName:    "http_requests_total",
-					DefaultValue:  "checkout",
-				},
 				{
 					Name:          "instance",
 					Type:          "query",
@@ -379,6 +371,11 @@ func TestValidateExpr_AdversarialSecurityRejections(t *testing.T) {
 			name:    "H-3 mixed __name__= and __name__=~ in same selector rejected",
 			expr:    `{__name__="http_requests_total", __name__=~"http.*", service="checkout"}`,
 			wantErr: ErrPolicyViolation,
+		},
+		{
+			name:    "single-select query variable cannot satisfy required scope (must be literal)",
+			expr:    `sum(rate(http_requests_total{service="$service"}[5m]))`,
+			wantErr: ErrScopeFilterMissing,
 		},
 		{
 			name:    "H-3 unknown metric in catalog rejected",

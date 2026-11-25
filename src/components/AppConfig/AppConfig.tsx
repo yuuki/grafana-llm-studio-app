@@ -48,6 +48,8 @@ const REDIS_KEY_PREFIX_RE = /^[a-zA-Z0-9:_-]{1,64}$/;
 const REDIS_PORT_RE = /^[1-9]\d{0,4}$/;
 const REDIS_HOSTNAME_RE = /^[a-zA-Z0-9](?:[a-zA-Z0-9.-]*[a-zA-Z0-9])?$/;
 const REDIS_IPV6_HOST_RE = /^[0-9a-fA-F:]+$/;
+export const BOUND_REDIS_PASSWORD_PREFIX = 'llmstudio-redis-bound-v1:';
+export const BOUND_GRAFANA_TOKEN_PREFIX = 'llmstudio-grafana-bound-v1:';
 
 function parseNumberInput(raw: string): number {
   const trimmed = raw.trim();
@@ -59,6 +61,63 @@ function parseNumberInput(raw: string): number {
 
 function formatNumberValue(val: number): string | number {
   return Number.isNaN(val) ? '' : val;
+}
+
+function canonicalRedisAddrForCompare(raw: string): string {
+  const trimmed = raw.trim();
+  if (!trimmed) {
+    return '';
+  }
+  if (trimmed.startsWith('[')) {
+    const closeIdx = trimmed.indexOf(']');
+    if (closeIdx > 1 && trimmed[closeIdx + 1] === ':') {
+      const host = trimmed.slice(1, closeIdx).toLowerCase();
+      const port = trimmed.slice(closeIdx + 2);
+      return `[${host}]:${port}`;
+    }
+  }
+  const lastColon = trimmed.lastIndexOf(':');
+  if (lastColon > 0) {
+    return `${trimmed.slice(0, lastColon).toLowerCase()}:${trimmed.slice(lastColon + 1)}`;
+  }
+  return trimmed.toLowerCase();
+}
+
+function canonicalGrafanaUrlForCompare(raw: string): string {
+  const trimmed = raw.trim();
+  if (!trimmed) {
+    return '';
+  }
+  try {
+    const u = new URL(trimmed);
+    const scheme = u.protocol.toLowerCase();
+    const port = u.port || (scheme === 'https:' ? '443' : scheme === 'http:' ? '80' : '');
+    const path = u.pathname.replace(/\/+$/, '');
+    return `${scheme}//${u.hostname.toLowerCase()}:${port}${path}${u.search}${u.hash}`;
+  } catch {
+    return trimmed.replace(/\/+$/, '').toLowerCase();
+  }
+}
+
+export function encodeBoundRedisPassword(addr: string, tls: boolean, password: string): string {
+  return (
+    BOUND_REDIS_PASSWORD_PREFIX +
+    JSON.stringify({
+      addr: addr.trim(),
+      tls,
+      password,
+    })
+  );
+}
+
+export function encodeBoundGrafanaToken(grafanaUrl: string, token: string): string {
+  return (
+    BOUND_GRAFANA_TOKEN_PREFIX +
+    JSON.stringify({
+      url: grafanaUrl.trim(),
+      token: token.trim(),
+    })
+  );
 }
 
 export function isValidRedisHostPort(raw: string): boolean {
@@ -128,7 +187,9 @@ export const AppConfig: React.FC<PluginConfigPageProps<AppPluginMeta<StudioJsonD
   });
   const [llmMode, setLlmMode] = useState<'grafana-llm-app' | 'mock'>(jsonData?.llmMode ?? 'grafana-llm-app');
   const [allowMockInDev, setAllowMockInDev] = useState(Boolean(jsonData?.allowMockInDev));
-  const [grafanaUrl, setGrafanaUrl] = useState(jsonData?.grafanaUrl ?? 'http://localhost:3000');
+  // Default empty so the Go backend uses Grafana's trusted AppURL automatically without hardcoding localhost:3000.
+  const [grafanaUrl, setGrafanaUrl] = useState(jsonData?.grafanaUrl ?? '');
+  const [savedGrafanaUrl, setSavedGrafanaUrl] = useState((jsonData?.grafanaUrl ?? '').trim());
   const [modelTier, setModelTier] = useState<'base' | 'large'>(jsonData?.modelTier ?? 'base');
   const [structuredOutputMode, setStructuredOutputMode] = useState<'json_schema' | 'json_object'>(
     jsonData?.structuredOutputMode ?? 'json_schema'
@@ -156,9 +217,11 @@ export const AppConfig: React.FC<PluginConfigPageProps<AppPluginMeta<StudioJsonD
   );
   const [jobTtlMinutes, setJobTtlMinutes] = useState(jsonData?.jobTtlMinutes ?? 30);
   const [redisAddr, setRedisAddr] = useState(jsonData?.redisAddr ?? '');
+  const [savedRedisAddr, setSavedRedisAddr] = useState((jsonData?.redisAddr ?? '').trim());
   const [redisDb, setRedisDb] = useState(jsonData?.redisDb ?? 0);
   const [redisKeyPrefix, setRedisKeyPrefix] = useState(jsonData?.redisKeyPrefix ?? 'llmstudio:jobs');
   const [redisTls, setRedisTls] = useState(Boolean(jsonData?.redisTls));
+  const [savedRedisTls, setSavedRedisTls] = useState(Boolean(jsonData?.redisTls));
   const [redisUsername, setRedisUsername] = useState(jsonData?.redisUsername ?? '');
 
   const [isTokenConfigured, setIsTokenConfigured] = useState(
@@ -190,6 +253,12 @@ export const AppConfig: React.FC<PluginConfigPageProps<AppPluginMeta<StudioJsonD
   const validateBeforeSave = (): string | null => {
     if (llmMode === 'mock' && !allowMockInDev) {
       return t('appConfig.validation.allowMockRequired');
+    }
+    if (
+      isTokenConfigured &&
+      canonicalGrafanaUrlForCompare(grafanaUrl) !== canonicalGrafanaUrlForCompare(savedGrafanaUrl)
+    ) {
+      return t('appConfig.validation.saTokenReentryRequired');
     }
     const checks: Array<[string, number, number, number]> = [
       [t('appConfig.validation.fields.maxPanels'), maxPanels, 1, 6],
@@ -225,6 +294,13 @@ export const AppConfig: React.FC<PluginConfigPageProps<AppPluginMeta<StudioJsonD
       if (redisUsername.trim().length > 128) {
         return t('appConfig.validation.redisUsernameTooLong');
       }
+      if (
+        isRedisPasswordConfigured &&
+        (canonicalRedisAddrForCompare(redisAddr) !== canonicalRedisAddrForCompare(savedRedisAddr) ||
+          redisTls !== savedRedisTls)
+      ) {
+        return t('appConfig.validation.redisPasswordReentryRequired');
+      }
     }
     return null;
   };
@@ -256,13 +332,15 @@ export const AppConfig: React.FC<PluginConfigPageProps<AppPluginMeta<StudioJsonD
       const { mockDelayMs: _stripMockDelayMs, ...preservedJsonData } = (jsonData ?? {}) as StudioJsonData & {
         mockDelayMs?: unknown;
       };
+      const trimmedGrafanaUrl = grafanaUrl.trim();
+      const trimmedRedisAddr = redisAddr.trim();
       const nextJsonData: StudioJsonData = {
         ...preservedJsonData,
         allowedDatasourceUids,
         datasourceDialects: cleanedDialects,
         llmMode,
         allowMockInDev: llmMode === 'mock' ? allowMockInDev : false,
-        grafanaUrl: grafanaUrl.trim(),
+        grafanaUrl: trimmedGrafanaUrl,
         modelTier,
         structuredOutputMode,
         tokenLimitField,
@@ -280,7 +358,7 @@ export const AppConfig: React.FC<PluginConfigPageProps<AppPluginMeta<StudioJsonD
         jobTtlMinutes,
         ...(jobStoreBackend === 'redis'
           ? {
-              redisAddr: redisAddr.trim(),
+              redisAddr: trimmedRedisAddr,
               redisDb,
               redisKeyPrefix: redisKeyPrefix.trim() || 'llmstudio:jobs',
               redisTls,
@@ -290,15 +368,24 @@ export const AppConfig: React.FC<PluginConfigPageProps<AppPluginMeta<StudioJsonD
       };
 
       // Explicitly send empty string on reset so Grafana clears the stored encrypted secret (H-11).
+      // Bind newly saved credentials to their destination inside the encrypted secret value so changing
+      // the target endpoint via UI or direct API cannot redirect an existing secret to another server.
       const secureJsonData: Record<string, string> = {};
       if (llmServiceAccountToken.trim().length > 0) {
-        secureJsonData.llmServiceAccountToken = llmServiceAccountToken.trim();
+        secureJsonData.llmServiceAccountToken = encodeBoundGrafanaToken(
+          trimmedGrafanaUrl,
+          llmServiceAccountToken.trim()
+        );
       } else if (wasTokenReset) {
         secureJsonData.llmServiceAccountToken = '';
       }
       if (jobStoreBackend === 'redis') {
         if (redisPassword.length > 0) {
-          secureJsonData.redisPassword = redisPassword;
+          secureJsonData.redisPassword = encodeBoundRedisPassword(
+            trimmedRedisAddr,
+            redisTls,
+            redisPassword
+          );
         } else if (wasRedisPasswordReset) {
           secureJsonData.redisPassword = '';
         }
@@ -319,6 +406,7 @@ export const AppConfig: React.FC<PluginConfigPageProps<AppPluginMeta<StudioJsonD
         })
       );
 
+      setSavedGrafanaUrl(trimmedGrafanaUrl);
       if (llmServiceAccountToken.trim().length > 0) {
         setIsTokenConfigured(true);
         setWasTokenReset(false);
@@ -328,6 +416,8 @@ export const AppConfig: React.FC<PluginConfigPageProps<AppPluginMeta<StudioJsonD
         setWasTokenReset(false);
       }
       if (jobStoreBackend === 'redis') {
+        setSavedRedisAddr(trimmedRedisAddr);
+        setSavedRedisTls(redisTls);
         if (redisPassword.length > 0) {
           setIsRedisPasswordConfigured(true);
           setWasRedisPasswordReset(false);

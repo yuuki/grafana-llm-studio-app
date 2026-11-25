@@ -64,6 +64,20 @@ export function buildFoundationDashboard(
   return builder.build();
 }
 
+export function buildFoundationVariableObject(v: NormalizedVariableSpec): Record<string, unknown> {
+  return buildFoundationVariable(v).build() as unknown as Record<string, unknown>;
+}
+
+export function buildFoundationTargetObject(
+  target: NormalizedPanelSpec['targets'][number]
+): Record<string, unknown> {
+  return buildFoundationTarget(target).build() as unknown as Record<string, unknown>;
+}
+
+export function buildFoundationPanelObject(panel: NormalizedPanelSpec): Record<string, unknown> {
+  return buildFoundationPanel(panel).build() as unknown as Record<string, unknown>;
+}
+
 function buildFoundationVariable(v: NormalizedVariableSpec) {
   const currentVal = v.multi ? [v.defaultValue] : v.defaultValue;
 

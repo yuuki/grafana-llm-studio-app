@@ -328,6 +328,94 @@ describe.each(SUPPORTED_LOCALES)(
       expect(payload.secureJsonData).toBeUndefined();
     });
 
+    test('blocks changing redisAddr or disabling redisTls while redisPassword is configured until reset/re-entered, and binds new secrets to endpoint+TLS', async () => {
+      const plugin = makePlugin(
+        {
+          allowedDatasourceUids: ['prom-main'],
+          llmMode: 'grafana-llm-app',
+          jobStoreBackend: 'redis',
+          redisAddr: 'redis.ha:6379',
+          redisTls: true,
+        },
+        { redisPassword: true }
+      );
+
+      render(<AppConfig plugin={plugin as never} query={{}} />);
+
+      // Changing redisAddr without resetting/re-entering redisPassword MUST be blocked before fetch.
+      const addrInput = screen.getByPlaceholderText('redis:6379');
+      fireEvent.change(addrInput, { target: { value: 'attacker.invalid:6379' } });
+      fireEvent.click(screen.getByText(t('appConfig.actions.save')));
+      await waitFor(() =>
+        expect(screen.getByText(t('appConfig.validation.redisPasswordReentryRequired'))).toBeTruthy()
+      );
+      expect(mockFetch).not.toHaveBeenCalled();
+
+      // Restoring redisAddr but disabling redisTls without resetting redisPassword MUST also be blocked.
+      fireEvent.change(addrInput, { target: { value: 'redis.ha:6379' } });
+      fireEvent.click(screen.getByLabelText(t('appConfig.jobStorage.redisTlsCheckbox')));
+      fireEvent.click(screen.getByText(t('appConfig.actions.save')));
+      await waitFor(() =>
+        expect(screen.getByText(t('appConfig.validation.redisPasswordReentryRequired'))).toBeTruthy()
+      );
+      expect(mockFetch).not.toHaveBeenCalled();
+
+      // Re-enable TLS, change addr to new legitimate Redis, reset & re-enter password -> saves destination-bound secret.
+      fireEvent.click(screen.getByLabelText(t('appConfig.jobStorage.redisTlsCheckbox')));
+      fireEvent.change(addrInput, { target: { value: 'redis2.ha:6379' } });
+      fireEvent.click(screen.getByText('Reset Secret'));
+      fireEvent.change(screen.getByPlaceholderText('redis-password'), {
+        target: { value: 'new-redis-secret' },
+      });
+      fireEvent.click(screen.getByText(t('appConfig.actions.save')));
+      await waitFor(() => expect(mockFetch).toHaveBeenCalledTimes(1));
+
+      const savedSecret = mockFetch.mock.calls[0][0].data.secureJsonData.redisPassword as string;
+      expect(savedSecret.startsWith('llmstudio-redis-bound-v1:')).toBe(true);
+      expect(JSON.parse(savedSecret.slice('llmstudio-redis-bound-v1:'.length))).toEqual({
+        addr: 'redis2.ha:6379',
+        tls: true,
+        password: 'new-redis-secret',
+      });
+    });
+
+    test('blocks changing grafanaUrl while SA token is configured until reset/re-entered, and binds new SA token to grafanaUrl', async () => {
+      const plugin = makePlugin(
+        {
+          allowedDatasourceUids: ['prom-main'],
+          llmMode: 'grafana-llm-app',
+          grafanaUrl: 'https://grafana.internal',
+        },
+        { llmServiceAccountToken: true }
+      );
+
+      render(<AppConfig plugin={plugin as never} query={{}} />);
+
+      const urlInput = screen.getByPlaceholderText('http://localhost:3000');
+      fireEvent.change(urlInput, { target: { value: 'http://127.0.0.1:9999' } });
+      fireEvent.click(screen.getByText(t('appConfig.actions.save')));
+      await waitFor(() =>
+        expect(screen.getByText(t('appConfig.validation.saTokenReentryRequired'))).toBeTruthy()
+      );
+      expect(mockFetch).not.toHaveBeenCalled();
+
+      // Reset & re-enter token for new URL -> saves destination-bound token envelope.
+      fireEvent.click(screen.getByText('Reset Secret'));
+      fireEvent.change(screen.getByPlaceholderText('glsa_...'), {
+        target: { value: 'glsa_new_bound_token' },
+      });
+      fireEvent.click(screen.getByText(t('appConfig.actions.save')));
+      await waitFor(() => expect(mockFetch).toHaveBeenCalledTimes(1));
+
+      const savedToken = mockFetch.mock.calls[0][0].data.secureJsonData
+        .llmServiceAccountToken as string;
+      expect(savedToken.startsWith('llmstudio-grafana-bound-v1:')).toBe(true);
+      expect(JSON.parse(savedToken.slice('llmstudio-grafana-bound-v1:'.length))).toEqual({
+        url: 'http://127.0.0.1:9999',
+        token: 'glsa_new_bound_token',
+      });
+    });
+
     test('clearing a numeric input fails validation instead of silently coercing to 0', async () => {
       const plugin = makePlugin({
         allowedDatasourceUids: ['prom-main'],

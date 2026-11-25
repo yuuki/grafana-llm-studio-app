@@ -1,8 +1,11 @@
 import { config, getBackendSrv } from '@grafana/runtime';
 import { lastValueFrom } from 'rxjs';
 import { t } from '../i18n';
+import type { ImportPatchContext } from '../import/importDashboard';
+import type { DashboardIR } from '../ir/types';
 import { NormalizedDashboardSpec } from '../spec/normalize';
 import { buildFoundationDashboard } from '../spec/toFoundation';
+import { buildPatchedDashboardSpec } from './patchDashboardSpec';
 
 export interface GrafanaFolderOption {
   uid: string;
@@ -21,6 +24,16 @@ export interface SaveDashboardRequest {
 
 export interface UpdateDashboardRequest {
   spec: NormalizedDashboardSpec;
+  /**
+   * Current DashboardIR corresponding to `spec`, diffed against `patchContext.initialDraft`
+   * so only modified fields/panels/variables are patched into the existing dashboard.
+   */
+  currentIR: DashboardIR;
+  /**
+   * Required lossless import provenance (original fetched spec + panel/variable bindings).
+   * Missing patchContext is rejected fail-closed so existing dashboards are never destructively overwritten.
+   */
+  patchContext: ImportPatchContext;
   previewedRevision: number;
   targetUid: string;
   /**
@@ -54,6 +67,7 @@ export class SaveDashboardError extends Error {
     public readonly code:
       | 'REVISION_MISMATCH'
       | 'MISSING_RESOURCE_VERSION'
+      | 'MISSING_ORIGINAL_SPEC'
       | 'REVISION_CONFLICT'
       | 'IN_FLIGHT'
       | 'PERMISSION_DENIED'
@@ -290,10 +304,21 @@ export class DashboardSaver {
         'MISSING_RESOURCE_VERSION'
       );
     }
+    if (!req.currentIR || !req.patchContext || !req.patchContext.originalSpec) {
+      throw new SaveDashboardError(
+        t('save.errors.missingOriginalSpec'),
+        'MISSING_ORIGINAL_SPEC'
+      );
+    }
 
     this.inFlight = true;
     try {
-      const foundationSpec = buildFoundationDashboard(req.spec, { uid: targetUid });
+      const patchedSpec = buildPatchedDashboardSpec({
+        targetUid,
+        currentIR: req.currentIR,
+        currentSpec: req.spec,
+        patchContext: req.patchContext,
+      });
       const namespace = getOrgNamespace();
 
       const annotations: Record<string, string> = {};
@@ -326,7 +351,7 @@ export class DashboardSaver {
         apiVersion: 'dashboard.grafana.app/v1beta1',
         kind: 'Dashboard',
         metadata,
-        spec: foundationSpec,
+        spec: patchedSpec,
       };
 
       const url = `/apis/dashboard.grafana.app/v1beta1/namespaces/${encodeURIComponent(namespace)}/dashboards/${encodeURIComponent(targetUid)}`;
