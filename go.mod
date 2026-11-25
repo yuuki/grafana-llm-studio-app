@@ -7,6 +7,7 @@ require (
 	github.com/alicebob/miniredis/v2 v2.34.0
 	github.com/grafana/grafana-llm-app/llmclient v0.20.0
 	github.com/grafana/grafana-plugin-sdk-go v0.278.0
+	github.com/prometheus/common v0.67.5
 	github.com/prometheus/prometheus v0.311.3
 	github.com/redis/go-redis/v9 v9.7.3
 	github.com/sashabaranov/go-openai v1.41.1
@@ -67,7 +68,6 @@ require (
 	github.com/pierrec/lz4/v4 v4.1.22 // indirect
 	github.com/prometheus/client_golang v1.23.2 // indirect
 	github.com/prometheus/client_model v0.6.2 // indirect
-	github.com/prometheus/common v0.67.5 // indirect
 	github.com/prometheus/procfs v0.16.1 // indirect
 	github.com/rivo/uniseg v0.4.4 // indirect
 	github.com/russross/blackfriday/v2 v2.1.0 // indirect

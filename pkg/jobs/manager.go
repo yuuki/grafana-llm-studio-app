@@ -13,8 +13,8 @@ import (
 	"github.com/yuuki/grafana-llm-studio-app/pkg/ir"
 	"github.com/yuuki/grafana-llm-studio-app/pkg/llm"
 	"github.com/yuuki/grafana-llm-studio-app/pkg/metricsql"
-	"github.com/yuuki/grafana-llm-studio-app/pkg/promql"
 	"github.com/yuuki/grafana-llm-studio-app/pkg/prompt"
+	"github.com/yuuki/grafana-llm-studio-app/pkg/promql"
 	"github.com/yuuki/grafana-llm-studio-app/pkg/query"
 )
 
@@ -164,20 +164,20 @@ type localCancelEntry struct {
 // Notice: metric catalogs are NEVER stored in a cross-user shared index; only job-private
 // metric type guards (knownGauges) stay scoped to the single job owner and expire with the job.
 type Manager struct {
-	cfg          Config
-	client       llm.Client
-	registry     *query.Registry
-	store        JobStore
-	ownsStore    bool
-	customNow    func() time.Time
-	localMu      sync.Mutex
-	localCancels map[string]localCancelEntry
-	latestFenced map[string]uint64
-	opWG         sync.WaitGroup
-	bgWG         sync.WaitGroup
-	stopCh       chan struct{}
+	cfg           Config
+	client        llm.Client
+	registry      *query.Registry
+	store         JobStore
+	ownsStore     bool
+	customNow     func() time.Time
+	localMu       sync.Mutex
+	localCancels  map[string]localCancelEntry
+	latestFenced  map[string]uint64
+	opWG          sync.WaitGroup
+	bgWG          sync.WaitGroup
+	stopCh        chan struct{}
 	stopCancelSub func()
-	closeOnce    sync.Once
+	closeOnce     sync.Once
 }
 
 // NewManager creates a new bounded job manager.
