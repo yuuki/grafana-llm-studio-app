@@ -326,6 +326,9 @@ export const StudioPage: React.FC = () => {
       active = false;
       initController.abort();
     };
+    // `t` is left out on purpose: with an i18n instance override (tests) it is a new
+    // function on every render, which would refetch the folders on every render.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [currentOrgId]);
 
   const selectedDatasource = useMemo(
@@ -350,6 +353,8 @@ export const StudioPage: React.FC = () => {
       });
     }
     return opts;
+    // `t` keeps its identity when the language changes; `locale` recomputes the labels.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [folders, selectedFolderUid, t, locale]);
 
   const currentScopeKey = makeScopeKey(selectedDsUid, scopeLabelName, scopeLabelValue);
@@ -1055,21 +1060,19 @@ export const StudioPage: React.FC = () => {
     }
   };
 
+  const currentIR = job?.currentIR;
+  const maxPanels = publicCfg?.maxPanels ?? 6;
   const foundationJsonPreview = useMemo(() => {
-    if (!job?.currentIR || !selectedDatasource) {
+    if (!currentIR || !selectedDatasource) {
       return '';
     }
     try {
-      const spec = normalizeDashboardIR(
-        job.currentIR,
-        selectedDatasource,
-        publicCfg?.maxPanels ?? 6
-      );
+      const spec = normalizeDashboardIR(currentIR, selectedDatasource, maxPanels);
       return buildExportableDashboardJson(spec);
     } catch {
       return '';
     }
-  }, [job?.currentIR, selectedDatasource, publicCfg?.maxPanels]);
+  }, [currentIR, selectedDatasource, maxPanels]);
 
   const canSave =
     Boolean(previewSpec) &&
