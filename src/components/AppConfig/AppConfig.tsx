@@ -34,6 +34,7 @@ export interface StudioJsonData {
   maxConcurrentJobs?: number;
   validationTimeoutSeconds?: number;
   maxConcurrentQueries?: number;
+  enableSseProgress?: boolean;
   jobStoreBackend?: 'memory' | 'redis';
   jobTtlMinutes?: number;
   redisAddr?: string;
@@ -148,6 +149,7 @@ export const AppConfig: React.FC<PluginConfigPageProps<AppPluginMeta<StudioJsonD
   const [maxConcurrentQueries, setMaxConcurrentQueries] = useState(
     jsonData?.maxConcurrentQueries ?? 2
   );
+  const [enableSseProgress, setEnableSseProgress] = useState(Boolean(jsonData?.enableSseProgress));
 
   const [jobStoreBackend, setJobStoreBackend] = useState<'memory' | 'redis'>(
     jsonData?.jobStoreBackend === 'redis' ? 'redis' : 'memory'
@@ -270,6 +272,7 @@ export const AppConfig: React.FC<PluginConfigPageProps<AppPluginMeta<StudioJsonD
         maxConcurrentJobs,
         validationTimeoutSeconds,
         maxConcurrentQueries,
+        enableSseProgress,
         jobStoreBackend,
         jobTtlMinutes,
         ...(jobStoreBackend === 'redis'
@@ -515,6 +518,17 @@ export const AppConfig: React.FC<PluginConfigPageProps<AppPluginMeta<StudioJsonD
               setLlmServiceAccountToken('');
             }}
             placeholder="glsa_..."
+          />
+        </Field>
+
+        <Field
+          label={t('appConfig.llm.sseProgressLabel')}
+          description={t('appConfig.llm.sseProgressDescription')}
+        >
+          <Checkbox
+            value={enableSseProgress}
+            onChange={(e) => setEnableSseProgress(e.currentTarget.checked)}
+            label={t('appConfig.llm.sseProgressCheckbox')}
           />
         </Field>
       </FieldSet>

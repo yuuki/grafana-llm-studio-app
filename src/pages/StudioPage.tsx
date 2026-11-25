@@ -35,6 +35,8 @@ import {
 import {
   computePanelQueryHash,
   JobSnapshot,
+  JobStageEvent,
+  JobStatus,
   MetricCatalogItem,
   PanelValidationResult,
   PublicConfig,
@@ -91,6 +93,17 @@ const VALIDATION_LABEL_KEYS: Record<ValidationCategory, TranslationKey> = {
   permission_error: 'studio.validation.category.permission_error',
   timeout: 'studio.validation.category.timeout',
   datasource_error: 'studio.validation.category.datasource_error',
+};
+
+const STAGE_LABEL_KEYS: Record<JobStatus, TranslationKey> = {
+  generating: 'studio.progress.stage.generating',
+  repairing: 'studio.progress.stage.repairing',
+  validating_ir: 'studio.progress.stage.validating_ir',
+  awaiting_preview: 'studio.progress.stage.awaiting_preview',
+  ready: 'studio.progress.stage.ready',
+  insufficient_metrics: 'studio.progress.stage.insufficient_metrics',
+  cancelled: 'studio.progress.stage.cancelled',
+  failed: 'studio.progress.stage.failed',
 };
 
 const BLOCKING_CATEGORIES = new Set<ValidationCategory>([
@@ -165,6 +178,8 @@ export const StudioPage: React.FC = () => {
   const [busyState, setBusyState] = useState<
     'idle' | 'generating' | 'importing' | 'patching' | 'validating' | 'repairing' | 'undoing' | 'saving'
   >('idle');
+  const [liveStage, setLiveStage] = useState<JobStageEvent | null>(null);
+  const [sseFallbackNotice, setSseFallbackNotice] = useState(false);
   const [uiError, setUiError] = useState<string | null>(null);
 
   // Optional safe import state.
@@ -190,6 +205,7 @@ export const StudioPage: React.FC = () => {
 
   const abortRef = useRef<AbortController | null>(null);
   const metadataAbortRef = useRef<AbortController | null>(null);
+  const inFlightJobIdRef = useRef<string | null>(null);
   const contextSeqRef = useRef<number>(0);
   const jobOpSeqRef = useRef<number>(0);
   const validatedFingerprintsRef = useRef<Map<string, ValidatedPanelCacheEntry>>(new Map());
@@ -222,6 +238,7 @@ export const StudioPage: React.FC = () => {
     abortRef.current = null;
     metadataAbortRef.current?.abort();
     metadataAbortRef.current = null;
+    inFlightJobIdRef.current = null;
     validatedFingerprintsRef.current.clear();
     latestImportMetaRef.current.clear();
     setCatalog([]);
@@ -231,6 +248,8 @@ export const StudioPage: React.FC = () => {
     setScopeLabelValues([]);
     setScopeLabelValue('');
     setJob(null);
+    setLiveStage(null);
+    setSseFallbackNotice(false);
     setShowImportPanel(false);
     setImportUid('');
     setExistingDashboards([]);
@@ -435,7 +454,10 @@ export const StudioPage: React.FC = () => {
     jobOpSeqRef.current += 1;
 
     const isPatch = Boolean(job?.currentIR && editPanelId !== '__new__');
+    inFlightJobIdRef.current = isPatch && job?.jobId ? job.jobId : null;
     setBusyState(isPatch ? 'patching' : 'generating');
+    setLiveStage(null);
+    setSseFallbackNotice(false);
     setUiError(null);
     setSavedResult(null);
 
@@ -458,6 +480,24 @@ export const StudioPage: React.FC = () => {
       labelName: scopeLabelName,
       labelValue: scopeLabelValue.trim(),
     };
+    const streamOptions = {
+      enableSse: Boolean(publicCfg?.enableSseProgress),
+      onStage: (ev: JobStageEvent) => {
+        if (controller.signal.aborted || seq !== contextSeqRef.current) {
+          return;
+        }
+        if (ev.jobId) {
+          inFlightJobIdRef.current = ev.jobId;
+        }
+        setLiveStage(ev);
+      },
+      onFallback: () => {
+        if (controller.signal.aborted || seq !== contextSeqRef.current) {
+          return;
+        }
+        setSseFallbackNotice(true);
+      },
+    };
 
     try {
       const nextJob =
@@ -470,7 +510,8 @@ export const StudioPage: React.FC = () => {
                 editIntent: promptText,
                 catalog: narrowedCatalog,
               },
-              controller.signal
+              controller.signal,
+              streamOptions
             )
           : await generateDraft(
               {
@@ -480,7 +521,8 @@ export const StudioPage: React.FC = () => {
                 userIntent: promptText,
                 catalog: narrowedCatalog,
               },
-              controller.signal
+              controller.signal,
+              streamOptions
             );
 
       if (controller.signal.aborted || seq !== contextSeqRef.current) {
@@ -501,6 +543,8 @@ export const StudioPage: React.FC = () => {
       setUiError(extractApiError(err));
     } finally {
       if (abortRef.current === controller && seq === contextSeqRef.current) {
+        inFlightJobIdRef.current = null;
+        setLiveStage(null);
         setBusyState('idle');
       }
     }
@@ -613,18 +657,24 @@ export const StudioPage: React.FC = () => {
     if (activeState === 'idle' || activeState === 'saving') {
       return;
     }
+    const cancelTargetJobId =
+      activeState === 'generating'
+        ? inFlightJobIdRef.current
+        : activeState === 'patching' || activeState === 'repairing'
+        ? inFlightJobIdRef.current || job?.jobId || null
+        : null;
+
     abortRef.current?.abort();
+    inFlightJobIdRef.current = null;
+    setLiveStage(null);
     setBusyState('idle');
 
-    // Only notify Backend cancel when an LLM backend operation on an existing job was in-flight (M-11).
-    if (
-      (activeState === 'patching' || activeState === 'repairing') &&
-      job?.jobId
-    ) {
+    // Notify Backend cancel when an LLM backend job ID is known (patching, repairing, or SSE-started generating).
+    if (cancelTargetJobId) {
       const seq = contextSeqRef.current;
       const opSeq = ++jobOpSeqRef.current;
       try {
-        const updated = await cancelDraftJob(job.jobId);
+        const updated = await cancelDraftJob(cancelTargetJobId);
         if (seq === contextSeqRef.current && opSeq === jobOpSeqRef.current) {
           applyJobSnapshot(updated);
         }
@@ -810,7 +860,10 @@ export const StudioPage: React.FC = () => {
     const seq = contextSeqRef.current;
     jobOpSeqRef.current += 1;
 
+    inFlightJobIdRef.current = job.jobId;
     setBusyState('repairing');
+    setLiveStage(null);
+    setSseFallbackNotice(false);
     setUiError(null);
 
     try {
@@ -825,7 +878,25 @@ export const StudioPage: React.FC = () => {
           results: syntaxErrors,
           catalog: narrowedCatalog,
         },
-        controller.signal
+        controller.signal,
+        {
+          enableSse: Boolean(publicCfg?.enableSseProgress),
+          onStage: (ev: JobStageEvent) => {
+            if (controller.signal.aborted || seq !== contextSeqRef.current) {
+              return;
+            }
+            if (ev.jobId) {
+              inFlightJobIdRef.current = ev.jobId;
+            }
+            setLiveStage(ev);
+          },
+          onFallback: () => {
+            if (controller.signal.aborted || seq !== contextSeqRef.current) {
+              return;
+            }
+            setSseFallbackNotice(true);
+          },
+        }
       );
       if (!controller.signal.aborted && seq === contextSeqRef.current) {
         applyJobSnapshot(updated);
@@ -845,6 +916,8 @@ export const StudioPage: React.FC = () => {
       }
     } finally {
       if (abortRef.current === controller && seq === contextSeqRef.current) {
+        inFlightJobIdRef.current = null;
+        setLiveStage(null);
         setBusyState('idle');
       }
     }
@@ -1253,6 +1326,34 @@ export const StudioPage: React.FC = () => {
               </Button>
             )}
           </div>
+
+          {liveStage && (busyState === 'generating' || busyState === 'patching' || busyState === 'repairing') && (
+            <div
+              data-testid="studio-sse-progress"
+              style={{
+                display: 'flex',
+                alignItems: 'center',
+                gap: 8,
+                fontSize: 12,
+                padding: '6px 8px',
+                border: '1px solid #2c3235',
+                borderRadius: 4,
+              }}
+            >
+              <Spinner inline />
+              <span>{t('studio.progress.label')}</span>
+              <Badge text={liveStage.stage} color="blue" />
+              <span style={{ color: '#9fa7b3' }}>
+                {STAGE_LABEL_KEYS[liveStage.stage] ? t(STAGE_LABEL_KEYS[liveStage.stage]) : liveStage.stage}
+              </span>
+            </div>
+          )}
+
+          {sseFallbackNotice && (
+            <div data-testid="studio-sse-fallback-notice" style={{ fontSize: 11, color: '#9fa7b3' }}>
+              {t('studio.progress.fallbackNotice')}
+            </div>
+          )}
 
           {job && (
             <div

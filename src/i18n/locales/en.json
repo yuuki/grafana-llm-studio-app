@@ -79,6 +79,20 @@
       "diffTitle": "Changes (Diff):",
       "repairBudget": "Repair budget: {{used}} / {{max}} used"
     },
+    "progress": {
+      "label": "Progress:",
+      "fallbackNotice": "SSE progress unavailable — automatically fell back to non-streaming request.",
+      "stage": {
+        "generating": "Calling LLM for structured IR...",
+        "repairing": "Calling LLM for syntax-only repair...",
+        "validating_ir": "Validating IR schema & query safety...",
+        "awaiting_preview": "Draft validated — ready for preview",
+        "ready": "Ready",
+        "insufficient_metrics": "Insufficient metrics in selected scope",
+        "cancelled": "Operation cancelled",
+        "failed": "Operation failed"
+      }
+    },
     "validation": {
       "heading": "Validation Results (Dry-Run: last 5m / maxDataPoints=10)",
       "repairing": "Repairing...",
@@ -200,7 +214,10 @@
       "reasoningEffortMedium": "medium (Reasoning models — balanced)",
       "reasoningEffortHigh": "high (Reasoning models — maximum)",
       "saTokenLabel": "Dedicated LLM Service Account Token (secureJsonData)",
-      "saTokenDescription": "Assign the minimum basic role Viewer in Grafana OSS and dedicate it solely to llmclient (reset and save blank to delete an existing token)."
+      "saTokenDescription": "Assign the minimum basic role Viewer in Grafana OSS and dedicate it solely to llmclient (reset and save blank to delete an existing token).",
+      "sseProgressLabel": "SSE Stage-Progress Streaming (Optional)",
+      "sseProgressDescription": "Streams application-level lifecycle stages (generating -> validating_ir -> awaiting_preview) over CallResource without streaming raw LLM tokens or unvalidated JSON. Reverse proxies must set proxy_buffering off and HTTP/1.1; falls back gracefully to non-streaming requests if unavailable.",
+      "sseProgressCheckbox": "Enable optional SSE stage-progress updates"
     },
     "limits": {
       "fieldset": "Budgets & Query Limits (Initial Defaults — Tune for Your Environment)",

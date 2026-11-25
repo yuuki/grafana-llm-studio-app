@@ -211,6 +211,15 @@ export interface JobSnapshot {
   updatedAt: string;
 }
 
+export type JobOperation = 'generate' | 'patch' | 'repair';
+
+export interface JobStageEvent {
+  jobId?: string;
+  operation: JobOperation;
+  stage: JobStatus;
+  timestamp: string;
+}
+
 export interface PublicConfig {
   allowedDatasourceUids: string[];
   datasourceDialects?: Record<string, QueryKind>;
@@ -220,6 +229,7 @@ export interface PublicConfig {
   maxRepairAttempts: number;
   validationTimeoutSeconds: number;
   maxConcurrentQueries: number;
+  enableSseProgress?: boolean;
   mockBanner: boolean;
 }
 

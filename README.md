@@ -136,6 +136,7 @@ Configured via **Administration → Plugins → LLM Dashboard Studio** (`jsonDat
 | `maxConcurrentJobs` | `jsonData` | `4` | `1..16` | Global concurrent LLM job cap per Grafana organization (per-user cap is `1`) |
 | `validationTimeoutSeconds` | `jsonData` | `10` | `2..30` | Per-panel dry-run query timeout |
 | `maxConcurrentQueries` | `jsonData` | `2` | `1..4` | Concurrent dry-run query cap in the browser |
+| `enableSseProgress` | `jsonData` | `false` | `boolean` | Opt-in decoupled SSE stage-progress streaming over `CallResource` (`generating` -> `validating_ir` -> `awaiting_preview`, never raw LLM tokens); requires reverse-proxy `proxy_buffering off` and HTTP/1.1, with graceful non-streaming fallback |
 | `jobStoreBackend` | `jsonData` | `"memory"` | `"memory"`, `"redis"` | Job storage backend (`"memory"` zero-dependency default; `"redis"` for HA multi-replica persistence) |
 | `jobTtlMinutes` | `jsonData` | `30` | `1..1440` | Automatic expiration TTL (minutes) for idle draft jobs |
 | `redisAddr` | `jsonData` | *(unset)* | `host:port` or `[ipv6]:port` | Single-endpoint Redis/Valkey server or cluster proxy address (required when `jobStoreBackend="redis"`; no URL scheme, whitespace, or credentials) |
@@ -205,22 +206,22 @@ GitHub Actions (`.github/workflows/ci.yml`) runs all verification checks plus th
 
 ## Known Limitations (MVP Scope)
 
-- **Scope:** Single Grafana organization, Prometheus-compatible datasources only, `timeseries` and `stat` panels only, fixed grid layout, auto-refresh disabled, non-streaming LLM requests. (Loki, Tempo, ClickHouse, template variables, repeat panels, existing dashboard import, GitOps sync, and MCP/tool execution are out of scope for MVP.)
+- **Scope:** Single Grafana organization, Prometheus-compatible datasources (PromQL & VictoriaMetrics MetricsQL), auto-refresh disabled, non-streaming structured LLM outputs (with optional decoupled SSE stage-progress notifications via `enableSseProgress: true`). (Loki, Tempo, ClickHouse, repeat panels, GitOps sync, and MCP/tool execution are out of scope for MVP.)
 - **Job State Persistence:** Defaults to process-local in-memory storage (`jobStoreBackend: "memory"`). For multi-replica HA Grafana deployments or restart persistence, enable `jobStoreBackend: "redis"` (see `deploy/docker-compose.redis.yml` for a local overlay).
 - **`grafana-llm-app` JSON Schema Proxy Behavior:** `grafana-llm-app` (`v1.0.8` / `v1.2.0`) unmarshals `response_format.json_schema.schema` into `go-openai/jsonschema.Definition`, which strips numeric/length/regex keywords and `extra_body`. Structure, `additionalProperties: false`, and string enums are enforced via structured outputs (or system-prompt schema in `json_object` mode), while bounds, regexes, PromQL AST rules, and catalog membership are deterministically re-enforced in the Go backend.
-- **Verification Coverage:** Automated unit tests, Scenes/Foundation parity tests, bundle externalization checks (`verify:bundle`), `grafana-llm-app` HTTP contract tests, and live Playwright / `@grafana/plugin-e2e` tests against running Grafana `13.3.1` (React 19) and `12.4.15` (React 18) containers (in mock mode with live Prometheus) run in GitHub Actions CI. Live LLM inference backends (vLLM or OpenAI-compatible APIs via `grafana-llm-app`) should still be validated in your target environment before production rollout.
+- **Verification Coverage:** Automated unit tests, Scenes/Foundation parity tests, bundle externalization checks (`verify:bundle`), `grafana-llm-app` HTTP contract tests, live `CallResource` SSE flush & client-disconnect verification (`scripts/verify-sse-callresource.mjs`), and live Playwright / `@grafana/plugin-e2e` tests against running Grafana `13.3.1` (React 19) and `12.4.15` (React 18) containers (in mock mode with live Prometheus) run in GitHub Actions CI. Live LLM inference backends (vLLM or OpenAI-compatible APIs via `grafana-llm-app`) should still be validated in your target environment before production rollout.
 
 ## Documentation & ADRs
 
 - [Architecture, Auth Boundaries & MVP Scope](docs/architecture.md)
 - [Version Compatibility Matrix & Model Verification](docs/compatibility.md)
 - [Internet OpenAI & OpenAI-Compatible APIs Guide](docs/openai-compatible-apis.md)
-- [Air-Gapped Deployment & Upstream Guardrails Guide](docs/airgapped-deployment.md)
+- [Air-Gapped Deployment, Reverse-Proxy SSE & Upstream Guardrails Guide](docs/airgapped-deployment.md)
 - Architecture Decision Records:
   - [ADR-001: Unified LLM Routing via `grafana-llm-app` & Structured Output Constraints](docs/adr/ADR-001-llm-routing-via-grafana-llm-app.md)
   - [ADR-002: Auth Boundaries & Grafana OSS RBAC Scope](docs/adr/ADR-002-auth-boundaries-and-oss-rbac.md)
   - [ADR-003: Lightweight IR, Dual Adapters & Create-Only Save API](docs/adr/ADR-003-ir-and-dual-adapters.md)
-  - [ADR-004: Non-Streaming MVP & SSE Deferral](docs/adr/ADR-004-non-streaming-mvp-and-sse-deferral.md)
+  - [ADR-004: Non-Streaming Structured Output & Optional SSE Stage-Progress Streaming](docs/adr/ADR-004-non-streaming-mvp-and-sse-deferral.md)
 - Canonical Schemas:
   - [`schemas/dashboard-ir.schema.json`](schemas/dashboard-ir.schema.json)
   - [`schemas/dashboard-patch.schema.json`](schemas/dashboard-patch.schema.json)

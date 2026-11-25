@@ -628,4 +628,99 @@ describe('StudioPage v1.1 safe import & variable cache invalidation', () => {
       expect.objectContaining({ onlyPanelIds: ['panel-req'] })
     );
   });
+
+  test('renders decoupled SSE stage progress without mounting Scenes and cancels SSE-reported jobId', async () => {
+    let resolveGenerate!: (value: unknown) => void;
+    let capturedOpts:
+      | {
+          enableSse?: boolean;
+          onStage?: (ev: { jobId?: string; operation: string; stage: string; timestamp: string }) => void;
+          onFallback?: (reason: string) => void;
+        }
+      | undefined;
+
+    mockGenerateDraft.mockImplementationOnce(
+      (_req: unknown, _signal: AbortSignal, opts: typeof capturedOpts) => {
+        capturedOpts = opts;
+        return new Promise((resolve) => {
+          resolveGenerate = resolve;
+        });
+      }
+    );
+
+    render(<StudioPage />);
+    await waitFor(() => expect(screen.getByText('Development/Testing Mock LLM Mode')).toBeTruthy());
+    fireEvent.change(screen.getByPlaceholderText('checkout-api'), { target: { value: 'checkout-api' } });
+    fireEvent.click(screen.getByText('Fetch Scoped Metrics'));
+    await waitFor(() => expect(screen.getByTestId('studio-catalog-count').textContent).toBe('2'));
+
+    fireEvent.click(screen.getByText('Generate Dashboard Draft'));
+    await waitFor(() => expect(mockGenerateDraft).toHaveBeenCalledTimes(1));
+
+    // Simulate incremental stage updates while LLM is running.
+    await act(async () => {
+      capturedOpts?.onStage?.({
+        jobId: 'job-sse-live',
+        operation: 'generate',
+        stage: 'generating',
+        timestamp: '2026-11-24T00:00:00Z',
+      });
+    });
+    expect(screen.getByTestId('studio-sse-progress').textContent).toContain('generating');
+    expect(mockBuildPreviewScene).not.toHaveBeenCalled();
+
+    await act(async () => {
+      capturedOpts?.onStage?.({
+        jobId: 'job-sse-live',
+        operation: 'generate',
+        stage: 'validating_ir',
+        timestamp: '2026-11-24T00:00:01Z',
+      });
+    });
+    expect(screen.getByTestId('studio-sse-progress').textContent).toContain('validating_ir');
+    expect(mockBuildPreviewScene).not.toHaveBeenCalled();
+
+    // Complete generation -> progress indicator clears and validated job appears.
+    await act(async () => {
+      resolveGenerate(makeTwoPanelJob('job-sse-live', 1, ERR_EXPR_V1));
+    });
+    await waitFor(() => expect(screen.getByTestId('studio-job-revision').textContent).toBe('rev 1'));
+    expect(screen.queryByTestId('studio-sse-progress')).toBeNull();
+    expect(mockBuildPreviewScene).not.toHaveBeenCalled();
+
+    // Now start a second generation (new draft), emit generating with jobId, then click Cancel -> cancelDraftJob must be called!
+    const editSelect = screen.getByLabelText('Edit Mode / Target Panel');
+    fireEvent.change(editSelect, { target: { value: '__new__' } });
+
+    let capturedOpts2: typeof capturedOpts;
+    mockGenerateDraft.mockImplementationOnce(
+      (_req: unknown, signal: AbortSignal, opts: typeof capturedOpts) => {
+        capturedOpts2 = opts;
+        return new Promise((_resolve, reject) => {
+          signal.addEventListener('abort', () => reject(new DOMException('Request aborted', 'AbortError')));
+        });
+      }
+    );
+    mockCancelDraftJob.mockResolvedValueOnce({
+      ...makeTwoPanelJob('job-sse-cancel', 1, ERR_EXPR_V1),
+      status: 'cancelled',
+      currentIR: undefined,
+    });
+
+    fireEvent.click(screen.getByText('Generate Dashboard Draft'));
+    await waitFor(() => expect(mockGenerateDraft).toHaveBeenCalledTimes(2));
+
+    await act(async () => {
+      capturedOpts2?.onStage?.({
+        jobId: 'job-sse-cancel',
+        operation: 'generate',
+        stage: 'generating',
+        timestamp: '2026-11-24T00:00:02Z',
+      });
+    });
+
+    fireEvent.click(screen.getByText('Cancel'));
+    await waitFor(() => expect(mockCancelDraftJob).toHaveBeenCalledWith('job-sse-cancel'));
+    expect(screen.queryByTestId('studio-sse-progress')).toBeNull();
+  });
 });

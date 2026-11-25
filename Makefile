@@ -1,4 +1,4 @@
-.PHONY: verify build build-backend build-frontend build-bench test test-go test-ts test-e2e verify-schemas verify-bundle verify-llm-protocol clean
+.PHONY: verify build build-backend build-frontend build-bench test test-go test-ts test-e2e verify-schemas verify-bundle verify-llm-protocol verify-sse clean
 
 verify: verify-schemas test build
 
@@ -41,6 +41,9 @@ verify-llm-protocol: build-bench
 	status=$$?; \
 	docker compose -f deploy/docker-compose.yml -f deploy/docker-compose.bench-verify.yml down -v; \
 	exit $$status
+
+verify-sse:
+	node scripts/verify-sse-callresource.mjs
 
 clean:
 	rm -rf dist bin

@@ -7,6 +7,7 @@ import (
 	"regexp"
 	"strings"
 	"sync/atomic"
+	"time"
 
 	"github.com/yuuki/grafana-llm-studio-app/pkg/ir"
 )
@@ -18,7 +19,27 @@ var validMockLabelName = regexp.MustCompile(`^[a-zA-Z_][a-zA-Z0-9_]*$`)
 type MockClient struct {
 	// InjectSyntaxErrorOnFirstGenerate can be enabled in tests to exercise repair flows.
 	InjectSyntaxErrorOnFirstGenerate bool
-	generateCount                    atomic.Int64
+	// Delay optionally simulates LLM inference latency in dev/test environments while honoring
+	// ctx.Done() immediately so SSE chunk flushing and client-disconnect cancellation can be verified live.
+	Delay         time.Duration
+	generateCount atomic.Int64
+}
+
+func (m *MockClient) waitDelay(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if m.Delay <= 0 {
+		return nil
+	}
+	timer := time.NewTimer(m.Delay)
+	defer timer.Stop()
+	select {
+	case <-timer.C:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
 func (m *MockClient) Enabled(_ context.Context) (bool, error) {
@@ -26,7 +47,7 @@ func (m *MockClient) Enabled(_ context.Context) (bool, error) {
 }
 
 func (m *MockClient) GenerateIR(ctx context.Context, req GenerateRequest) ([]byte, CompletionMeta, error) {
-	if err := ctx.Err(); err != nil {
+	if err := m.waitDelay(ctx); err != nil {
 		return nil, CompletionMeta{ProviderMode: "mock"}, err
 	}
 	count := m.generateCount.Add(1)
@@ -268,7 +289,7 @@ func (m *MockClient) GenerateIR(ctx context.Context, req GenerateRequest) ([]byt
 }
 
 func (m *MockClient) GeneratePatch(ctx context.Context, req PatchRequest) ([]byte, CompletionMeta, error) {
-	if err := ctx.Err(); err != nil {
+	if err := m.waitDelay(ctx); err != nil {
 		return nil, CompletionMeta{ProviderMode: "mock"}, err
 	}
 	lower := strings.ToLower(req.EditIntent)
@@ -375,7 +396,7 @@ func (m *MockClient) GeneratePatch(ctx context.Context, req PatchRequest) ([]byt
 }
 
 func (m *MockClient) RepairPanels(ctx context.Context, req RepairRequest) ([]byte, CompletionMeta, error) {
-	if err := ctx.Err(); err != nil {
+	if err := m.waitDelay(ctx); err != nil {
 		return nil, CompletionMeta{ProviderMode: "mock"}, err
 	}
 	selector := buildScopeMatcher(req.Scope)
