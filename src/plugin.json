@@ -27,8 +27,8 @@
         "url": "https://github.com/yuuki/grafana-llm-studio-app/blob/main/LICENSE"
       }
     ],
-    "version": "0.1.0",
-    "updated": "2026-11-25"
+    "version": "0.1.0-rc.1",
+    "updated": "2026-11-26"
   },
   "includes": [
     {
