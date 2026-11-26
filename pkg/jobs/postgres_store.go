@@ -402,7 +402,7 @@ func buildPostgresPoolConfig(cfg PostgresConfig) (*pgxpool.Config, error) {
 	case PostgresSSLModePrefer:
 		cc.TLSConfig = &tls.Config{
 			ServerName:         sniHost,
-			InsecureSkipVerify: true, // matches libpq sslmode=prefer (encrypt if available without CA check)
+			InsecureSkipVerify: true, //nolint:gosec // G402: matches libpq sslmode=prefer (encrypt if available without CA check)
 			MinVersion:         tls.VersionTLS12,
 		}
 		cc.Fallbacks = []*pgconn.FallbackConfig{
@@ -415,33 +415,25 @@ func buildPostgresPoolConfig(cfg PostgresConfig) (*pgxpool.Config, error) {
 	case PostgresSSLModeRequire:
 		cc.TLSConfig = &tls.Config{
 			ServerName:         sniHost,
-			InsecureSkipVerify: true, // matches libpq sslmode=require (require TLS 1.2+ transport encryption)
+			InsecureSkipVerify: true, //nolint:gosec // G402: matches libpq sslmode=require (require TLS 1.2+ transport encryption)
 			MinVersion:         tls.VersionTLS12,
 		}
 	case PostgresSSLModeVerifyCA:
 		cc.TLSConfig = &tls.Config{
 			ServerName:         sniHost,
-			InsecureSkipVerify: true, // hostname skipped intentionally; CA chain verified in VerifyPeerCertificate
+			InsecureSkipVerify: true, //nolint:gosec // G402: libpq sslmode=verify-ca skips hostname check intentionally; CA chain verified in VerifyConnection
 			MinVersion:         tls.VersionTLS12,
-			VerifyPeerCertificate: func(certificates [][]byte, _ [][]*x509.Certificate) error {
-				if len(certificates) == 0 {
+			VerifyConnection: func(cs tls.ConnectionState) error {
+				if len(cs.PeerCertificates) == 0 {
 					return errors.New("server presented no TLS certificates")
-				}
-				certs := make([]*x509.Certificate, len(certificates))
-				for i, asn1Data := range certificates {
-					cert, parseErr := x509.ParseCertificate(asn1Data)
-					if parseErr != nil {
-						return fmt.Errorf("parse server certificate: %w", parseErr)
-					}
-					certs[i] = cert
 				}
 				opts := x509.VerifyOptions{
 					Intermediates: x509.NewCertPool(),
 				}
-				for _, cert := range certs[1:] {
+				for _, cert := range cs.PeerCertificates[1:] {
 					opts.Intermediates.AddCert(cert)
 				}
-				_, verifyErr := certs[0].Verify(opts)
+				_, verifyErr := cs.PeerCertificates[0].Verify(opts)
 				return verifyErr
 			},
 		}
@@ -462,7 +454,7 @@ func postgresCancelChannelName(schema, tablePrefix string) string {
 
 func (s *PostgresStore) advisoryLockKey(scope string) int64 {
 	sum := sha256.Sum256([]byte("lock\x00" + s.schema + "\x00" + s.tablePrefix + "\x00" + scope))
-	return int64(binary.BigEndian.Uint64(sum[:8]))
+	return int64(binary.BigEndian.Uint64(sum[:8])) //nolint:gosec // G115: intentional SHA-256 bit-pattern reinterpretation as signed 64-bit PostgreSQL advisory lock key
 }
 
 func (s *PostgresStore) orgLockKey(orgID int64) int64 {
@@ -1108,6 +1100,13 @@ func nextOpToken(cur uint64) (uint64, error) {
 	return cur + 1, nil
 }
 
+func opTokenToInt64(token uint64) int64 {
+	if token > math.MaxInt64 {
+		return math.MaxInt64
+	}
+	return int64(token)
+}
+
 func (r *pgJobRow) toSnapshot(opName string) (JobSnapshot, error) {
 	var scope *ir.ScopeFilter
 	if r.scopeJSON != "" {
@@ -1433,7 +1432,7 @@ func (s *PostgresStore) BeginPatch(ctx context.Context, params BeginPatchParams)
 		SET active_op_token = $1, active_op_until_ms = $2, status = $3,
 		    known_gauges_json = $4, updated_at_ms = $5, expires_at_ms = $6
 		WHERE job_id = $7`, s.jobsTable),
-		int64(newToken), leaseUntilMs, string(StatusGenerating), gaugesJSON, nowMs, expiresAtMs, params.JobID)
+		opTokenToInt64(newToken), leaseUntilMs, string(StatusGenerating), gaugesJSON, nowMs, expiresAtMs, params.JobID)
 	if err != nil {
 		return BeginOpResult{}, wrapPostgresErr("BeginPatch", err)
 	}
@@ -1562,7 +1561,7 @@ func (s *PostgresStore) BeginRepair(ctx context.Context, params BeginRepairParam
 		    active_op_token = $1, active_op_until_ms = $2, status = $3,
 		    known_gauges_json = $4, updated_at_ms = $5, expires_at_ms = $6
 		WHERE job_id = $7`, s.jobsTable),
-		int64(newToken), leaseUntilMs, string(StatusRepairing), gaugesJSON, nowMs, expiresAtMs, params.JobID)
+		opTokenToInt64(newToken), leaseUntilMs, string(StatusRepairing), gaugesJSON, nowMs, expiresAtMs, params.JobID)
 	if err != nil {
 		return BeginOpResult{}, wrapPostgresErr("BeginRepair", err)
 	}
@@ -1724,7 +1723,7 @@ func (s *PostgresStore) FinishJob(ctx context.Context, params FinishJobParams) (
 		    summary = $6, warnings_json = $7, error_message = $8,
 		    llm_meta_json = $9, updated_at_ms = $10, expires_at_ms = $11
 		WHERE job_id = $12`, s.jobsTable),
-		int64(newToken), row.status,
+		opTokenToInt64(newToken), row.status,
 		row.currentIRJSON, row.currentRev, row.lastDiffJSON,
 		row.summary, row.warningsJSON, row.errorMessage,
 		row.llmMetaJSON, row.updatedAtMs, row.expiresAtMs, params.JobID)
@@ -1807,7 +1806,7 @@ func (s *PostgresStore) CommitRevision(ctx context.Context, params CommitRevisio
 			return JobSnapshot{}, wrapPostgresErr("CommitRevision", tokErr)
 		}
 		_, updErr := tx.Exec(ctx, fmt.Sprintf(`UPDATE %s SET active_op_token = $1, active_op_until_ms = 0 WHERE job_id = $2`, s.jobsTable),
-			int64(newToken), params.JobID)
+			opTokenToInt64(newToken), params.JobID)
 		if updErr != nil {
 			return JobSnapshot{}, wrapPostgresErr("CommitRevision", updErr)
 		}
@@ -1871,7 +1870,7 @@ func (s *PostgresStore) CommitRevision(ctx context.Context, params CommitRevisio
 		    last_diff_json = $7, summary = $8, warnings_json = $9, error_message = '',
 		    llm_meta_json = $10, updated_at_ms = $11, expires_at_ms = $12
 		WHERE job_id = $13`, s.jobsTable),
-		int64(newToken), row.status,
+		opTokenToInt64(newToken), row.status,
 		row.currentIRJSON, row.currentRev, row.historyJSON, row.historyLen,
 		row.lastDiffJSON, row.summary, row.warningsJSON,
 		row.llmMetaJSON, row.updatedAtMs, row.expiresAtMs, params.JobID)
@@ -1950,7 +1949,7 @@ func (s *PostgresStore) RecordEditFailure(ctx context.Context, params RecordEdit
 		SET active_op_token = $1, active_op_until_ms = 0, status = $2,
 		    error_message = $3, llm_meta_json = $4, updated_at_ms = $5, expires_at_ms = $6
 		WHERE job_id = $7`, s.jobsTable),
-		int64(newToken), row.status, row.errorMessage, row.llmMetaJSON, row.updatedAtMs, row.expiresAtMs, params.JobID)
+		opTokenToInt64(newToken), row.status, row.errorMessage, row.llmMetaJSON, row.updatedAtMs, row.expiresAtMs, params.JobID)
 	if err != nil {
 		return JobSnapshot{}, wrapPostgresErr("RecordEditFailure", err)
 	}
@@ -2009,7 +2008,7 @@ func (s *PostgresStore) RevertOnCancel(ctx context.Context, owner Owner, jobID s
 			SET active_op_token = $1, active_op_until_ms = 0, status = $2,
 			    summary = $3, updated_at_ms = $4, expires_at_ms = $5
 			WHERE job_id = $6`, s.jobsTable),
-			int64(newToken), row.status, row.summary, row.updatedAtMs, row.expiresAtMs, jobID)
+			opTokenToInt64(newToken), row.status, row.summary, row.updatedAtMs, row.expiresAtMs, jobID)
 		if err != nil {
 			return JobSnapshot{}, wrapPostgresErr("RevertOnCancel", err)
 		}
@@ -2117,7 +2116,7 @@ func (s *PostgresStore) Undo(ctx context.Context, owner Owner, jobID string, now
 		    last_diff_json = $7, summary = $8, error_message = '',
 		    updated_at_ms = $9, expires_at_ms = $10
 		WHERE job_id = $11`, s.jobsTable),
-		int64(newToken), row.status,
+		opTokenToInt64(newToken), row.status,
 		row.currentIRJSON, row.currentRev, row.historyJSON, row.historyLen,
 		row.lastDiffJSON, row.summary,
 		row.updatedAtMs, row.expiresAtMs, jobID)
@@ -2186,7 +2185,7 @@ func (s *PostgresStore) Cancel(ctx context.Context, owner Owner, jobID string, n
 		SET active_op_token = $1, active_op_until_ms = 0, status = $2,
 		    summary = $3, updated_at_ms = $4, expires_at_ms = $5
 		WHERE job_id = $6`, s.jobsTable),
-		int64(newToken), row.status, row.summary, row.updatedAtMs, row.expiresAtMs, jobID)
+		opTokenToInt64(newToken), row.status, row.summary, row.updatedAtMs, row.expiresAtMs, jobID)
 	if err != nil {
 		return MutationResult{}, wrapPostgresErr("Cancel", err)
 	}
@@ -2421,7 +2420,7 @@ func (s *PostgresStore) ensureImportCapacityTx(ctx context.Context, tx pgx.Tx, c
 		orgCount++
 		if oKey == callerKey {
 			userCount++
-			if !(activeUntil > 0 && nowMs < activeUntil) {
+			if activeUntil <= 0 || nowMs >= activeUntil {
 				callerInactive = append(callerInactive, jID)
 			}
 		}

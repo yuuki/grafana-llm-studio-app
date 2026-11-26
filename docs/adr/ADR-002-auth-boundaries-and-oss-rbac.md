@@ -12,7 +12,7 @@ Grafana does not forward browser session cookies to App Plugin backends (`CallRe
 3. **Strict Isolation of the `llmclient` Service Account:**
    - `plugin.json` `iam.permissions` requests only `{"action":"plugins.app:access","scope":"plugins:grafana-llm-app"}`.
    - Service accounts created manually in Grafana OSS are assigned the minimum basic role `Viewer` (verified in `pkg/services/pluginsintegration/pluginaccesscontrol/accesscontrol.go`).
-   - Because Grafana OSS's `Viewer` basic role also includes organization-wide read/query access, the Go backend structurally guarantees this token is never passed anywhere outside `llmclient`, restricts `grafanaUrl` to loopback or the Grafana instance's own `AppURL` origin, and disables HTTP redirects.
+   - Because Grafana OSS's `Viewer` basic role also includes organization-wide read/query access, the Go backend structurally guarantees this token is never passed anywhere outside `llmclient`, strictly pins `grafanaUrl` to Grafana's trusted `AppURL` base URL (or operator-pinned `LLMSTUDIO_GRAFANA_URL`, falling back to loopback only when neither is present), binds stored UI secrets to their destination, and disables HTTP redirects.
 4. **Metadata & Draft Isolation:**
    - Metric names, `HELP` strings, and label names/values are treated as protected data. In the MVP they remain strictly in browser memory and single-request scope and are never registered in a shared persistent index.
    - Switching organizations, changing datasources, or unmounting the page immediately aborts in-flight requests and discards in-memory drafts and metric catalogs.

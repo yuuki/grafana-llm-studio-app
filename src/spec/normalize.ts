@@ -5,6 +5,7 @@ import {
   getPanelQueries,
   PanelType,
   QueryRefId,
+  ScopeFilter,
   SELECTED_DATASOURCE_REF,
   ThresholdColor,
   validateIRClient,
@@ -118,7 +119,8 @@ const PANEL_ROW_HEIGHT: Record<PanelType, number> = {
 export function normalizeDashboardIR(
   doc: DashboardIR,
   datasource: ResolvedDatasource,
-  maxPanels = 6
+  maxPanels = 6,
+  scope?: ScopeFilter
 ): NormalizedDashboardSpec {
   if (!datasource.uid || datasource.uid.trim() === '') {
     throw new Error('Resolved datasource UID is required');
@@ -134,7 +136,7 @@ export function normalizeDashboardIR(
   };
 
   const normalizedVariables: NormalizedVariableSpec[] = (doc.variables ?? []).map((v) =>
-    normalizeVariable(v, dsRef)
+    normalizeVariable(v, dsRef, scope)
   );
 
   const sorted = [...doc.panels].sort((a, b) => {
@@ -210,9 +212,30 @@ export function normalizeDashboardIR(
   };
 }
 
+const VALID_SCOPE_LABEL_NAME = /^[a-zA-Z_][a-zA-Z0-9_]{0,63}$/;
+
+function buildScopeMatcherExpr(scope?: ScopeFilter): string {
+  if (!scope) {
+    return '';
+  }
+  const labelName = (scope.labelName ?? '').trim();
+  const labelValue = (scope.labelValue ?? '').trim();
+  if (!labelName || !labelValue || labelName === '__name__' || !VALID_SCOPE_LABEL_NAME.test(labelName)) {
+    return '';
+  }
+  for (let i = 0; i < labelValue.length; i++) {
+    const code = labelValue.charCodeAt(i);
+    if (code < 0x20 || (code >= 0x7f && code <= 0x9f)) {
+      return '';
+    }
+  }
+  return `{${labelName}="${escapePromQLString(labelValue)}"}`;
+}
+
 function normalizeVariable(
   v: VariableIR,
-  dsRef: { type: string; uid: string }
+  dsRef: { type: string; uid: string },
+  scope?: ScopeFilter
 ): NormalizedVariableSpec {
   const label = (v.label && v.label.trim()) || v.name;
   const multi = Boolean(v.multi);
@@ -222,8 +245,11 @@ function normalizeVariable(
     if (v.datasourceRef !== SELECTED_DATASOURCE_REF) {
       throw new Error(`Variable ${v.name} has unauthorized datasourceRef: ${v.datasourceRef}`);
     }
+    const scopeMatcher = buildScopeMatcherExpr(scope);
     const query = v.metricName
-      ? `label_values(${v.metricName}, ${v.labelName})`
+      ? `label_values(${v.metricName}${scopeMatcher}, ${v.labelName})`
+      : scopeMatcher
+      ? `label_values(${scopeMatcher}, ${v.labelName})`
       : `label_values(${v.labelName})`;
     return {
       name: v.name,

@@ -79,6 +79,20 @@
       "diffTitle": "変更内容 (Diff):",
       "repairBudget": "修復予算: {{used}} / {{max}} 回使用"
     },
+    "progress": {
+      "label": "進捗:",
+      "fallbackNotice": "SSE 進捗ストリーミングを利用できなかったため、非ストリーミングリクエストへ自動フォールバックしました。",
+      "stage": {
+        "generating": "構造化 IR 生成のため LLM を呼び出し中...",
+        "repairing": "構文エラー修復のため LLM を呼び出し中...",
+        "validating_ir": "IR スキーマとクエリ安全性を検証中...",
+        "awaiting_preview": "ドラフト検証完了・プレビュー可能",
+        "ready": "完了",
+        "insufficient_metrics": "選択スコープに十分なメトリクスがありません",
+        "cancelled": "処理をキャンセルしました",
+        "failed": "処理に失敗しました"
+      }
+    },
     "validation": {
       "heading": "検証結果（Dry-Run: 直近5m / maxDataPoints=10）",
       "repairing": "修復中...",
@@ -146,10 +160,13 @@
       "allowMockRequired": "llmMode=mock を保存するには allowMockInDev を明示的に有効化してください。",
       "numberRange": "{{label}} は {{min}}〜{{max}} の数値で指定してください。",
       "reasoningEffort": "Reasoning Effort は空欄または low / medium / high のいずれかを指定してください。",
+      "saTokenReentryRequired": "Grafana 内部 URL を変更する場合は、保存済みサービスアカウントトークンが別ホストへ送信されないようリセットして再入力（または空欄保存で削除）してください。",
       "redisAddrRequired": "jobStoreBackend=redis の場合、Redis アドレスは URL スキーム・空白・認証情報を含まない host:port（または [ipv6]:port）形式で指定してください。",
+      "redisPasswordReentryRequired": "Redis アドレスまたは TLS 設定を変更する場合は、保存済みパスワードが別サーバーへ送信されないようリセットして再入力（または空欄保存で削除）してください。",
       "redisKeyPrefixInvalid": "Redis キープレフィックスは [a-zA-Z0-9:_-] の 1〜64 文字で指定してください。",
       "redisUsernameTooLong": "Redis ACL ユーザー名は 128 UTF-8 バイト以下で指定してください。",
       "postgresAddrRequired": "jobStoreBackend=postgres の場合、PostgreSQL アドレスは URL スキーム・空白・認証情報を含まない host:port（または [ipv6]:port）形式で指定してください。",
+      "postgresPasswordReentryRequired": "PostgreSQL アドレスまたは SSL モードを変更する場合は、保存済みパスワードが別サーバーへ送信されないようリセットして再入力（または空欄保存で削除）してください。",
       "postgresDatabaseRequired": "jobStoreBackend=postgres の場合、PostgreSQL データベース名（空白・制御文字・BOM を含まない 1〜63 UTF-8 バイト）を指定してください。",
       "postgresUsernameRequired": "jobStoreBackend=postgres の場合、PostgreSQL ユーザー名（制御文字・BOM を含まない 1〜128 UTF-8 バイト）を指定してください。",
       "postgresSchemaInvalid": "PostgreSQL スキーマは [a-z_][a-z0-9_]* の小文字 1〜63 文字で指定してください（pg_* および information_schema は不可）。",
@@ -187,7 +204,7 @@
       "allowMockDescription": "本番運用では必ず無効にしてください。実 LLM 障害時にモックへ自動フォールバックすることはありません。",
       "allowMockCheckbox": "allowMockInDev を有効化",
       "grafanaUrlLabel": "Grafana 内部 URL",
-      "grafanaUrlDescription": "Go Backend の llmclient が /api/plugins/grafana-llm-app/resources/llm/v1 へ接続する URL です（loopback または Grafana AppURL 同一オリジンのみ許可）。",
+      "grafanaUrlDescription": "Go Backend の llmclient が /api/plugins/grafana-llm-app/resources/llm/v1 へ接続する URL です。空欄時は Grafana の信頼済み AppURL を自動使用します（AppURL または LLMSTUDIO_GRAFANA_URL が設定されている場合はそのベース URL に厳格固定されます）。",
       "modelTierLabel": "grafana-llm-app モデル抽象化名",
       "modelTierBase": "base（高速・高スループット）",
       "modelTierLarge": "large（高精度）",
@@ -206,7 +223,10 @@
       "reasoningEffortMedium": "medium（推論モデル向け・標準）",
       "reasoningEffortHigh": "high（推論モデル向け・最大）",
       "saTokenLabel": "LLM 専用サービスアカウントトークン (secureJsonData)",
-      "saTokenDescription": "Grafana OSS では最小基本ロール Viewer を割り当て、llmclient 専用とします（リセットして空欄保存すると既存トークンを削除します）。"
+      "saTokenDescription": "Grafana OSS では最小基本ロール Viewer を割り当て、llmclient 専用とします。設定された Grafana URL に紐づけられるため、URL 変更時はリセットして再入力してください（空欄保存で削除）。",
+      "sseProgressLabel": "SSE ステージ進捗ストリーミング（任意）",
+      "sseProgressDescription": "生の LLM トークンや未検証 JSON は一切流さず、アプリケーション層のステージ進捗（generating → validating_ir → awaiting_preview）のみを CallResource SSE で通知します。リバースプロキシでは proxy_buffering off と HTTP/1.1 の設定が必要で、利用不可時は非ストリーミングへ自動フォールバックします。",
+      "sseProgressCheckbox": "任意の SSE ステージ進捗通知を有効化"
     },
     "limits": {
       "fieldset": "予算・クエリ上限（初期仮設定・環境に応じて調整）",
@@ -234,7 +254,7 @@
       "redisKeyPrefixDescription": "ハッシュタグ ({prefix}) でラップされる名前空間プレフィックスです（Redis Cluster プロキシ経由時は redisDb=0 を指定）。",
       "redisUsernameLabel": "Redis ACL ユーザー名（任意）",
       "redisPasswordLabel": "Redis パスワード (secureJsonData・任意)",
-      "redisPasswordDescription": "secureJsonData として暗号化保存されブラウザには返却されません（リセットして空欄保存すると削除します）。",
+      "redisPasswordDescription": "secureJsonData として暗号化保存され、設定された Redis アドレスおよび TLS 設定に紐づけられます。接続先や TLS を変更する場合はリセットして再入力してください（空欄保存で削除）。",
       "redisTlsLabel": "Redis 接続で TLS を有効化",
       "redisTlsCheckbox": "TLS を使用する（最小 TLS 1.2・システム CA トラストストアを使用）",
       "postgresAddrLabel": "PostgreSQL アドレス (host:port)",
@@ -247,7 +267,7 @@
       "postgresTablePrefixDescription": "プラグイン専用テーブルの小文字プレフィックス（既定: llm_studio_。llm_studio_jobs と llm_studio_slots を作成します）。",
       "postgresUsernameLabel": "PostgreSQL ユーザー名",
       "postgresPasswordLabel": "PostgreSQL パスワード (secureJsonData・任意)",
-      "postgresPasswordDescription": "secureJsonData として暗号化保存されブラウザには返却されません（リセットして空欄保存すると削除します）。",
+      "postgresPasswordDescription": "secureJsonData として暗号化保存され、設定された PostgreSQL アドレスおよび SSL モードに紐づけられます。接続先や SSL モードを変更する場合はリセットして再入力してください（空欄保存で削除）。",
       "postgresSslModeLabel": "PostgreSQL SSL モード",
       "postgresSslModeDescription": "PostgreSQL 接続の TLS モード（最小 TLS 1.2）。verify-ca / verify-full はコンテナ/ホストのシステム CA トラストストアで証明書を検証します。本番運用では require / verify-ca / verify-full を推奨します。",
       "postgresSslModeDisable": "disable（TLS なし・ローカル開発専用）",
@@ -269,6 +289,7 @@
       "inFlight": "保存処理がすでに進行中です。完了までお待ちください。",
       "revisionMismatch": "保存対象リビジョン (rev {{targetRevision}}) が確認済みプレビュー (rev {{previewedRevision}}) と一致しません。先に検証・プレビューを実行してください。",
       "missingResourceVersion": "既存ダッシュボードの更新には対象 UID とインポート時の resourceVersion が必須です。コピーとして新規保存してください。",
+      "missingOriginalSpec": "インポート元のダッシュボード spec が現在のセッションに存在しないため、未編集パネルや設定の消失を防ぐため既存更新を中止しました。再インポートするか新規コピーとして保存してください。",
       "defaultMessage": "ダッシュボードの新規保存に失敗しました",
       "updateDefaultMessage": "既存ダッシュボードの更新に失敗しました",
       "permissionDenied": "選択したフォルダへの保存権限がありません (HTTP {{status}}): {{message}}",

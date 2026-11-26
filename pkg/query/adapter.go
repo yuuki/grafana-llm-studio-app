@@ -135,6 +135,19 @@ func ValidateDashboardIR(
 
 	var warnings []string
 
+	if err := ValidateScopeFilter(scope); err != nil {
+		return nil, err
+	}
+	normalizedScope := NormalizeScope(scope)
+
+	if normalizedScope != nil && len(doc.Variables) > 0 {
+		for _, v := range doc.Variables {
+			if v.Type == "query" && v.LabelName == normalizedScope.LabelName {
+				return nil, fmt.Errorf("variable %q: %w: query variable cannot target locked scope label %q", v.Name, ErrPolicyViolation, normalizedScope.LabelName)
+			}
+		}
+	}
+
 	if opts.RequireCatalogMatch && len(doc.Variables) > 0 {
 		catalogByName := IndexCatalogFirstWins(catalog)
 		for _, v := range doc.Variables {

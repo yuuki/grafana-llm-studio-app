@@ -177,7 +177,7 @@ describe.each(SUPPORTED_LOCALES)(
 
       // Enable allowMockInDev, then switch back to grafana-llm-app -> saved payload MUST normalize allowMockInDev: false.
       // Selects: [0]=dialect(prom-main), [1]=llmMode, [2]=modelTier, [3]=structuredOutputMode, [4]=tokenLimitField, [5]=reasoningEffort
-      fireEvent.click(screen.getByRole('checkbox'));
+      fireEvent.click(screen.getByLabelText(t('appConfig.llm.allowMockCheckbox')));
       const modeSelect = screen.getAllByRole('combobox')[1];
       fireEvent.change(modeSelect, { target: { value: 'grafana-llm-app' } });
 
@@ -285,7 +285,7 @@ describe.each(SUPPORTED_LOCALES)(
       // Valid IPv6 + valid username + reset existing redisPassword + enable TLS.
       fireEvent.change(screen.getByPlaceholderText('default'), { target: { value: 'studio' } });
       fireEvent.click(screen.getByText('Reset Secret'));
-      fireEvent.click(screen.getByRole('checkbox'));
+      fireEvent.click(screen.getByLabelText(t('appConfig.jobStorage.redisTlsCheckbox')));
 
       fireEvent.click(screen.getByText(t('appConfig.actions.save')));
       await waitFor(() => expect(mockFetch).toHaveBeenCalledTimes(1));
@@ -326,6 +326,94 @@ describe.each(SUPPORTED_LOCALES)(
       expect(payload.jsonData.jobStoreBackend).toBe('memory');
       expect(payload.jsonData.redisDb).toBe(2);
       expect(payload.secureJsonData).toBeUndefined();
+    });
+
+    test('blocks changing redisAddr or disabling redisTls while redisPassword is configured until reset/re-entered, and binds new secrets to endpoint+TLS', async () => {
+      const plugin = makePlugin(
+        {
+          allowedDatasourceUids: ['prom-main'],
+          llmMode: 'grafana-llm-app',
+          jobStoreBackend: 'redis',
+          redisAddr: 'redis.ha:6379',
+          redisTls: true,
+        },
+        { redisPassword: true }
+      );
+
+      render(<AppConfig plugin={plugin as never} query={{}} />);
+
+      // Changing redisAddr without resetting/re-entering redisPassword MUST be blocked before fetch.
+      const addrInput = screen.getByPlaceholderText('redis:6379');
+      fireEvent.change(addrInput, { target: { value: 'attacker.invalid:6379' } });
+      fireEvent.click(screen.getByText(t('appConfig.actions.save')));
+      await waitFor(() =>
+        expect(screen.getByText(t('appConfig.validation.redisPasswordReentryRequired'))).toBeTruthy()
+      );
+      expect(mockFetch).not.toHaveBeenCalled();
+
+      // Restoring redisAddr but disabling redisTls without resetting redisPassword MUST also be blocked.
+      fireEvent.change(addrInput, { target: { value: 'redis.ha:6379' } });
+      fireEvent.click(screen.getByLabelText(t('appConfig.jobStorage.redisTlsCheckbox')));
+      fireEvent.click(screen.getByText(t('appConfig.actions.save')));
+      await waitFor(() =>
+        expect(screen.getByText(t('appConfig.validation.redisPasswordReentryRequired'))).toBeTruthy()
+      );
+      expect(mockFetch).not.toHaveBeenCalled();
+
+      // Re-enable TLS, change addr to new legitimate Redis, reset & re-enter password -> saves destination-bound secret.
+      fireEvent.click(screen.getByLabelText(t('appConfig.jobStorage.redisTlsCheckbox')));
+      fireEvent.change(addrInput, { target: { value: 'redis2.ha:6379' } });
+      fireEvent.click(screen.getByText('Reset Secret'));
+      fireEvent.change(screen.getByPlaceholderText('redis-password'), {
+        target: { value: 'new-redis-secret' },
+      });
+      fireEvent.click(screen.getByText(t('appConfig.actions.save')));
+      await waitFor(() => expect(mockFetch).toHaveBeenCalledTimes(1));
+
+      const savedSecret = mockFetch.mock.calls[0][0].data.secureJsonData.redisPassword as string;
+      expect(savedSecret.startsWith('llmstudio-redis-bound-v1:')).toBe(true);
+      expect(JSON.parse(savedSecret.slice('llmstudio-redis-bound-v1:'.length))).toEqual({
+        addr: 'redis2.ha:6379',
+        tls: true,
+        password: 'new-redis-secret',
+      });
+    });
+
+    test('blocks changing grafanaUrl while SA token is configured until reset/re-entered, and binds new SA token to grafanaUrl', async () => {
+      const plugin = makePlugin(
+        {
+          allowedDatasourceUids: ['prom-main'],
+          llmMode: 'grafana-llm-app',
+          grafanaUrl: 'https://grafana.internal',
+        },
+        { llmServiceAccountToken: true }
+      );
+
+      render(<AppConfig plugin={plugin as never} query={{}} />);
+
+      const urlInput = screen.getByPlaceholderText('http://localhost:3000');
+      fireEvent.change(urlInput, { target: { value: 'http://127.0.0.1:9999' } });
+      fireEvent.click(screen.getByText(t('appConfig.actions.save')));
+      await waitFor(() =>
+        expect(screen.getByText(t('appConfig.validation.saTokenReentryRequired'))).toBeTruthy()
+      );
+      expect(mockFetch).not.toHaveBeenCalled();
+
+      // Reset & re-enter token for new URL -> saves destination-bound token envelope.
+      fireEvent.click(screen.getByText('Reset Secret'));
+      fireEvent.change(screen.getByPlaceholderText('glsa_...'), {
+        target: { value: 'glsa_new_bound_token' },
+      });
+      fireEvent.click(screen.getByText(t('appConfig.actions.save')));
+      await waitFor(() => expect(mockFetch).toHaveBeenCalledTimes(1));
+
+      const savedToken = mockFetch.mock.calls[0][0].data.secureJsonData
+        .llmServiceAccountToken as string;
+      expect(savedToken.startsWith('llmstudio-grafana-bound-v1:')).toBe(true);
+      expect(JSON.parse(savedToken.slice('llmstudio-grafana-bound-v1:'.length))).toEqual({
+        url: 'http://127.0.0.1:9999',
+        token: 'glsa_new_bound_token',
+      });
     });
 
     test('validates PostgreSQL fields, saves HA Postgres job store settings, and supports resetting postgresPassword secret', async () => {
@@ -415,6 +503,60 @@ describe.each(SUPPORTED_LOCALES)(
       expect(payload.secureJsonData).toEqual({ postgresPassword: '' });
     });
 
+    test('blocks changing postgresAddr or postgresSslMode while postgresPassword is configured until reset/re-entered, and binds new secrets to endpoint+SSL', async () => {
+      const plugin = makePlugin(
+        {
+          allowedDatasourceUids: ['prom-main'],
+          llmMode: 'grafana-llm-app',
+          jobStoreBackend: 'postgres',
+          postgresAddr: 'postgres.ha:5432',
+          postgresDatabase: 'grafana',
+          postgresUsername: 'grafana',
+          postgresSslMode: 'require',
+        },
+        { postgresPassword: true }
+      );
+
+      render(<AppConfig plugin={plugin as never} query={{}} />);
+
+      // Changing postgresAddr without resetting/re-entering postgresPassword MUST be blocked before fetch.
+      const addrInput = screen.getByPlaceholderText('postgres:5432');
+      fireEvent.change(addrInput, { target: { value: 'attacker.invalid:5432' } });
+      fireEvent.click(screen.getByText(t('appConfig.actions.save')));
+      await waitFor(() =>
+        expect(screen.getByText(t('appConfig.validation.postgresPasswordReentryRequired'))).toBeTruthy()
+      );
+      expect(mockFetch).not.toHaveBeenCalled();
+
+      // Restoring postgresAddr but downgrading postgresSslMode without resetting postgresPassword MUST also be blocked.
+      fireEvent.change(addrInput, { target: { value: 'postgres.ha:5432' } });
+      const sslSelect = screen.getByLabelText(t('appConfig.jobStorage.postgresSslModeLabel'));
+      fireEvent.change(sslSelect, { target: { value: 'disable' } });
+      fireEvent.click(screen.getByText(t('appConfig.actions.save')));
+      await waitFor(() =>
+        expect(screen.getByText(t('appConfig.validation.postgresPasswordReentryRequired'))).toBeTruthy()
+      );
+      expect(mockFetch).not.toHaveBeenCalled();
+
+      // Switch to verify-full + new legitimate host, reset & re-enter password -> saves destination-bound secret.
+      fireEvent.change(sslSelect, { target: { value: 'verify-full' } });
+      fireEvent.change(addrInput, { target: { value: 'postgres2.ha:5432' } });
+      fireEvent.click(screen.getByText('Reset Secret'));
+      fireEvent.change(screen.getByPlaceholderText('postgres-password'), {
+        target: { value: 'new-pg-secret' },
+      });
+      fireEvent.click(screen.getByText(t('appConfig.actions.save')));
+      await waitFor(() => expect(mockFetch).toHaveBeenCalledTimes(1));
+
+      const savedSecret = mockFetch.mock.calls[0][0].data.secureJsonData.postgresPassword as string;
+      expect(savedSecret.startsWith('llmstudio-postgres-bound-v1:')).toBe(true);
+      expect(JSON.parse(savedSecret.slice('llmstudio-postgres-bound-v1:'.length))).toEqual({
+        addr: 'postgres2.ha:5432',
+        sslMode: 'verify-full',
+        password: 'new-pg-secret',
+      });
+    });
+
     test('switching postgres -> memory does not reset hidden postgresPassword or persist unvalidated hidden Postgres edits', async () => {
       const plugin = makePlugin(
         {
@@ -482,7 +624,7 @@ describe.each(SUPPORTED_LOCALES)(
       render(<AppConfig plugin={plugin as never} query={{}} />);
       const storeSelect = screen.getByLabelText(t('appConfig.jobStorage.backendLabel'));
 
-      // Save #1: configure postgres with a new password (preserving leading/trailing space).
+      // Save #1: configure postgres with a new password (preserving leading/trailing space inside bound envelope).
       fireEvent.change(storeSelect, { target: { value: 'postgres' } });
       fireEvent.change(screen.getByPlaceholderText('postgres:5432'), {
         target: { value: '[::ffff:127.0.0.1]:5432' },
@@ -512,7 +654,13 @@ describe.each(SUPPORTED_LOCALES)(
       expect(mockFetch.mock.calls[0][0].data.jsonData.postgresAddr).toBe('[::ffff:127.0.0.1]:5432');
       expect(mockFetch.mock.calls[0][0].data.jsonData.postgresSchema).toBe('public');
       expect(mockFetch.mock.calls[0][0].data.jsonData.postgresTablePrefix).toBe('llm_studio_');
-      expect(mockFetch.mock.calls[0][0].data.secureJsonData).toEqual({ postgresPassword: ' pg-pass-1 ' });
+      const savedPgSecret = mockFetch.mock.calls[0][0].data.secureJsonData.postgresPassword as string;
+      expect(savedPgSecret.startsWith('llmstudio-postgres-bound-v1:')).toBe(true);
+      expect(JSON.parse(savedPgSecret.slice('llmstudio-postgres-bound-v1:'.length))).toEqual({
+        addr: '[::ffff:127.0.0.1]:5432',
+        sslMode: 'require',
+        password: ' pg-pass-1 ',
+      });
 
       // Click Reset Secret on postgres password, then switch to memory and Save #2 (without reload).
       fireEvent.click(screen.getByText('Reset Secret'));
@@ -645,5 +793,30 @@ describe('AppConfig reactive locale switching', () => {
 
     expect(screen.getByText('権限とセキュリティ方針')).toBeTruthy();
     expect(screen.getByText('設定を保存')).toBeTruthy();
+  });
+
+  test('defaults enableSseProgress to false, persists true when enabled, and strips hidden mockDelayMs (L-1)', async () => {
+    mockFetch.mockReset();
+    mockFetch.mockReturnValue(of({ data: {} }));
+
+    const plugin = makePlugin({
+      allowedDatasourceUids: ['prom-main'],
+      llmMode: 'grafana-llm-app',
+      mockDelayMs: 5000,
+    });
+
+    render(<AppConfig plugin={plugin as never} query={{}} />);
+    const sseCheckbox = screen.getByLabelText(t('appConfig.llm.sseProgressCheckbox')) as HTMLInputElement;
+    expect(sseCheckbox.checked).toBe(false);
+
+    fireEvent.click(sseCheckbox);
+    expect(sseCheckbox.checked).toBe(true);
+
+    fireEvent.click(screen.getByText(t('appConfig.actions.save')));
+    await waitFor(() => expect(mockFetch).toHaveBeenCalledTimes(1));
+
+    const payload = mockFetch.mock.calls[0][0].data;
+    expect(payload.jsonData.enableSseProgress).toBe(true);
+    expect('mockDelayMs' in payload.jsonData).toBe(false);
   });
 });

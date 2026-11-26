@@ -1,5 +1,13 @@
 # LLM Dashboard Studio (`yuuki-llmstudio-app`)
 
+[![AI Generated](https://img.shields.io/badge/AI%20Generated-Claude-orange?logo=anthropic)](https://claude.ai/claude-code)
+[![CI](https://github.com/yuuki/grafana-llm-studio-app/actions/workflows/ci.yml/badge.svg)](https://github.com/yuuki/grafana-llm-studio-app/actions/workflows/ci.yml)
+[![Security](https://github.com/yuuki/grafana-llm-studio-app/actions/workflows/security.yml/badge.svg)](https://github.com/yuuki/grafana-llm-studio-app/actions/workflows/security.yml)
+[![Release](https://img.shields.io/github/v/release/yuuki/grafana-llm-studio-app)](https://github.com/yuuki/grafana-llm-studio-app/releases)
+[![License](https://img.shields.io/github/license/yuuki/grafana-llm-studio-app)](LICENSE)
+[![Grafana](https://img.shields.io/badge/Grafana-%3E%3D12.4%20%3C14-orange?logo=grafana)](https://grafana.com)
+[![Go version](https://img.shields.io/github/go-mod/go-version/yuuki/grafana-llm-studio-app)](go.mod)
+
 An open-source Grafana App Plugin for generating, iteratively refining, previewing, and saving Prometheus/VictoriaMetrics dashboards using OpenAI-compatible APIs or self-hosted local LLMs (vLLM) via [`grafana-llm-app`](https://github.com/grafana/grafana-llm-app) — without requiring Grafana Cloud or Grafana Assistant.
 
 > **Status:** MVP (`0.1.0`) — Supports **Grafana OSS `13.3.1` (React 19)** and **Grafana OSS `12.4.15` (React 18)** (`grafanaDependency: ">=12.4.0 <14.0.0"`).
@@ -58,7 +66,7 @@ This plugin intentionally pins and verifies concrete target versions rather than
 | **`@grafana/grafana-foundation-sdk`** | `0.0.22` | Generates Classic Dashboard JSON (`schemaVersion: 42`) |
 | **`grafana-plugin-sdk-go`** | `v0.278.0` | `ProtocolVersion = 2` (wire-compatible with Grafana 12.4.x and 13.x) |
 | **LLM Backends (via `grafana-llm-app`)** | OpenAI / OpenAI-compatible APIs or local `vLLM >= v0.12.0` | Supports `json_schema` / `json_object` and `max_completion_tokens` / `max_tokens`; model-agnostic via `base`/`large` |
-| **Build Toolchain** | Node.js `>=22.0.0`, Go `1.24.3` | Reproducible builds (`npm ci` + `go mod vendor` supported for offline packaging) |
+| **Build Toolchain** | Node.js `26`, Go `1.27.4` (`mise.toml`) | Reproducible builds (`npm ci` + `go mod vendor` supported for offline packaging) |
 
 See [`docs/compatibility.md`](docs/compatibility.md) for the full source-verified matrix and [`docs/openai-compatible-apis.md`](docs/openai-compatible-apis.md) for provider-by-provider setup.
 
@@ -68,8 +76,8 @@ The included Docker Compose stack launches Grafana OSS, Prometheus (with query g
 
 ### Prerequisites
 
-- Node.js `>= 22.0.0` and npm
-- Go `1.24.x`
+- Node.js `26` and npm
+- Go `1.27.4` (the version in `go.mod`; `mise install` installs both)
 - Docker & Docker Compose
 
 ### 1. Install dependencies & build the plugin
@@ -100,18 +108,24 @@ To connect directly to an **OpenAI or OpenAI-compatible API** via `grafana-llm-a
 
 ## Production Deployment
 
-1. **Allowlist only this unsigned plugin ID** in `grafana.ini` (or via environment variable):
+1. **Install the multi-architecture release archive** (`yuuki-llmstudio-app-<version>.zip` or `.tar.gz`, bundling Go backend binaries for `linux/amd64`, `linux/arm64`, `darwin/amd64`, `darwin/arm64`, and `windows/amd64`) after verifying `SHA256SUMS`:
+   ```bash
+   sha256sum -c SHA256SUMS
+   unzip -q yuuki-llmstudio-app-<version>.zip -d /var/lib/grafana/plugins
+   ```
+2. **Use a signed plugin release (recommended)** so production Grafana instances do **not** require `allow_loading_unsigned_plugins` — see [`docs/plugin-signing-and-publishing.md`](docs/plugin-signing-and-publishing.md) for Private signing (`@grafana/sign-plugin --rootUrls ...`) and Community catalog signing. Only if deploying an unsigned archive, allowlist **only** this plugin ID in `grafana.ini`:
    ```ini
    [plugins]
    allow_loading_unsigned_plugins = yuuki-llmstudio-app
    ```
-2. **Install and configure `grafana-llm-app`** (`v1.2.0` for Grafana 13.x or `v1.0.8` for Grafana 12.4.x) pointing either to an OpenAI / OpenAI-compatible HTTPS API (`provider: "openai"`, `"azure"`, or `"custom"`) or your self-hosted vLLM server (`provider: "custom"`, TLS, API key), with `base` / `large` model mappings.
-3. **Create a dedicated Grafana Service Account** with the minimum OSS basic role **`Viewer`** (never `Editor` or `Admin`) and store its token in **Plugin Configuration → `llmServiceAccountToken` (`secureJsonData`)**.
-4. **Switch `llmMode` to `grafana-llm-app`** and remove development provisioning files (`deploy/grafana/provisioning/plugins/llm-studio-dev.yml`). Production mode never silently falls back to mock mode.
-5. **Enforce upstream query limits** on Prometheus (`--query.timeout`, `--query.max-concurrency`, `--query.max-samples`) or VictoriaMetrics (`-search.maxQueryDuration`, `-search.maxConcurrentRequests`, `-search.maxSeries`). Browser-side dry-run caps are UX guardrails, not a DoS boundary.
+3. **Install and configure `grafana-llm-app`** (`v1.2.0` for Grafana 13.x or `v1.0.8` for Grafana 12.4.x) pointing either to an OpenAI / OpenAI-compatible HTTPS API (`provider: "openai"`, `"azure"`, or `"custom"`) or your self-hosted vLLM server (`provider: "custom"`, TLS, API key), with `base` / `large` model mappings.
+4. **Create a dedicated Grafana Service Account** with the minimum OSS basic role **`Viewer`** (never `Editor` or `Admin`) and store its token in **Plugin Configuration → `llmServiceAccountToken` (`secureJsonData`)**.
+5. **Switch `llmMode` to `grafana-llm-app`** and remove development provisioning files (`deploy/grafana/provisioning/plugins/llm-studio-dev.yaml`). Production mode never silently falls back to mock mode.
+6. **Enforce upstream query limits** on Prometheus (`--query.timeout`, `--query.max-concurrency`, `--query.max-samples`) or VictoriaMetrics (`-search.maxQueryDuration`, `-search.maxConcurrentRequests`, `-search.maxSeries`). Browser-side dry-run caps are UX guardrails, not a DoS boundary.
 
 - **Internet-connected OpenAI / OpenAI-compatible APIs** (OpenAI, Azure OpenAI, OpenRouter, Groq, DeepSeek, Together, Fireworks, Gemini): see [`docs/openai-compatible-apis.md`](docs/openai-compatible-apis.md).
-- **Strictly offline / air-gapped environments** (offline Grafana flags, digest-pinned image/plugin/model bundling, local vLLM): see [`docs/airgapped-deployment.md`](docs/airgapped-deployment.md).
+- **Strictly offline / air-gapped environments** (offline Grafana flags, `-airgap.tar.gz` bundle, digest-pinned image/plugin/model bundling, local vLLM): see [`docs/airgapped-deployment.md`](docs/airgapped-deployment.md).
+- **Multi-architecture releases, `@grafana/sign-plugin`, and Grafana Catalog submission:** see [`docs/plugin-signing-and-publishing.md`](docs/plugin-signing-and-publishing.md).
 
 ## Configuration Reference
 
@@ -122,12 +136,12 @@ Configured via **Administration → Plugins → LLM Dashboard Studio** (`jsonDat
 | `allowedDatasourceUids` | `jsonData` | `[]` | Prometheus-compatible UIDs | Allowlist of datasources selectable in Studio; LLMs cannot choose arbitrary UIDs |
 | `llmMode` | `jsonData` | `"grafana-llm-app"` | `"grafana-llm-app"`, `"mock"` | Inference backend mode (`"mock"` requires `allowMockInDev: true`) |
 | `allowMockInDev` | `jsonData` | `false` | `boolean` | Explicit opt-in for dev/test mock mode; normalized to `false` outside mock mode |
-| `grafanaUrl` | `jsonData` | `"http://localhost:3000"` | Loopback or same-origin `AppURL` | Internal Grafana URL used by Go `llmclient` (HTTP redirects disabled) |
+| `grafanaUrl` | `jsonData` | *(uses trusted `AppURL`)* | Exact trusted `AppURL` / `LLMSTUDIO_GRAFANA_URL` (loopback fallback only if unset) | Internal Grafana URL used by Go `llmclient` (HTTP redirects disabled) |
 | `modelTier` | `jsonData` | `"base"` | `"base"`, `"large"` | Logical model tier mapped by `grafana-llm-app` |
 | `structuredOutputMode` | `jsonData` | `"json_schema"` | `"json_schema"`, `"json_object"` | `json_schema` for OpenAI/vLLM/OpenRouter/Gemini; `json_object` for providers without `json_schema` (e.g., DeepSeek API) |
 | `tokenLimitField` | `jsonData` | `"max_completion_tokens"` | `"max_completion_tokens"`, `"max_tokens"` | Output token limit field (`max_tokens` for legacy/third-party OpenAI-compatible APIs) |
 | `reasoningEffort` | `jsonData` | `""` | `""`, `"low"`, `"medium"`, `"high"` | Omit (`""`) for standard models (`gpt-4o`, `gpt-4.1`, Llama); set `"low"` for reasoning models (`o3`, `gpt-5`, `GLM-5.3`) |
-| `llmServiceAccountToken` | `secureJsonData` | *(unset)* | Grafana SA token (`glsa_...`) | Encrypted token dedicated solely to calling `grafana-llm-app` |
+| `llmServiceAccountToken` | `secureJsonData` | *(unset)* | Grafana SA token (`glsa_...`) | Encrypted token dedicated solely to calling `grafana-llm-app` (bound to `grafanaUrl`; re-entry required on URL change) |
 | `maxPanels` | `jsonData` | `6` | `1..6` | Maximum panels per generated dashboard |
 | `maxRepairAttempts` | `jsonData` | `2` | `0..2` | Maximum syntax-only auto-repair calls per job (`0` disables repair) |
 | `maxOutputTokens` | `jsonData` | `2048` | `256..8192` | Output token cap per LLM call |
@@ -136,101 +150,104 @@ Configured via **Administration → Plugins → LLM Dashboard Studio** (`jsonDat
 | `maxConcurrentJobs` | `jsonData` | `4` | `1..16` | Global concurrent LLM job cap per Grafana organization (per-user cap is `1`) |
 | `validationTimeoutSeconds` | `jsonData` | `10` | `2..30` | Per-panel dry-run query timeout |
 | `maxConcurrentQueries` | `jsonData` | `2` | `1..4` | Concurrent dry-run query cap in the browser |
+| `enableSseProgress` | `jsonData` | `false` | `boolean` | Opt-in decoupled SSE stage-progress streaming over `CallResource` (`generating` -> `validating_ir` -> `awaiting_preview`, never raw LLM tokens); requires reverse-proxy `proxy_buffering off` and HTTP/1.1, with graceful non-streaming fallback |
 | `jobStoreBackend` | `jsonData` | `"memory"` | `"memory"`, `"redis"`, `"postgres"` | Job storage backend (`"memory"` zero-dependency default; `"redis"` or `"postgres"` for HA multi-replica persistence) |
 | `jobTtlMinutes` | `jsonData` | `30` | `1..1440` | Automatic expiration TTL (minutes) for idle draft jobs |
-| `redisAddr` | `jsonData` | *(unset)* | `host:port` or `[ipv6]:port` | Single-endpoint Redis/Valkey server or cluster proxy address (required when `jobStoreBackend="redis"`; no URL scheme, whitespace, or credentials) |
+| `redisAddr` | `jsonData` | *(unset)* | `host:port` or `[ipv6]:port` | Single-endpoint Redis/Valkey server or cluster proxy address (required when `jobStoreBackend="redis"`; optionally operator-pinned via `LLMSTUDIO_REDIS_ADDR`) |
 | `redisDb` | `jsonData` | `0` | `0..15` | Redis logical database index (use `0` when connecting through a Redis Cluster proxy) |
 | `redisKeyPrefix` | `jsonData` | `"llmstudio:jobs"` | `[a-zA-Z0-9:_-]{1,64}` | Redis key namespace prefix wrapped in `{prefix}` hash tag (all Lua scripts access only declared `KEYS[]`) |
 | `redisTls` | `jsonData` | `false` | `boolean` | Enable TLS (minimum TLS 1.2) using the container/host system CA trust store |
 | `redisUsername` | `jsonData` | *(unset)* | `<= 128` UTF-8 bytes | Optional Redis 6+ ACL username |
-| `redisPassword` | `secureJsonData` | *(unset)* | Encrypted secret | Optional Redis password stored encrypted in `secureJsonData` (never exposed to browser) |
-| `postgresAddr` | `jsonData` | *(unset)* | `host:port` or `[ipv6]:port` | Single-endpoint PostgreSQL server address (required when `jobStoreBackend="postgres"`; connect directly or via session pooling — PgBouncer transaction pooling breaks `LISTEN`/`NOTIFY`; no URL scheme, whitespace, or credentials) |
+| `redisPassword` | `secureJsonData` | *(unset)* | Encrypted secret | Optional Redis password stored encrypted in `secureJsonData`, bound to `redisAddr` + `redisTls` (re-entry required on change) |
+| `postgresAddr` | `jsonData` | *(unset)* | `host:port` or `[ipv6]:port` | Single-endpoint PostgreSQL server address (required when `jobStoreBackend="postgres"`; optionally operator-pinned via `LLMSTUDIO_POSTGRES_ADDR`; connect directly or via session pooling — PgBouncer transaction pooling breaks `LISTEN`/`NOTIFY`; no URL scheme, whitespace, or credentials) |
 | `postgresDatabase` | `jsonData` | *(unset)* | `1..63` UTF-8 bytes (no whitespace/control/BOM) | Target PostgreSQL database name (required when `jobStoreBackend="postgres"`) |
 | `postgresSchema` | `jsonData` | `"public"` | `[a-z_][a-z0-9_]{0,62}` (excl. `pg_*`, `information_schema`) | Lowercase PostgreSQL schema for plugin tables (on PG 15+ or when sharing Grafana's DB, pre-create a dedicated schema such as `llm_studio`, or pre-create tables for a least-privilege DML-only role) |
 | `postgresTablePrefix` | `jsonData` | `"llm_studio_"` | `[a-z_][a-z0-9_]{0,31}` | Lowercase prefix for plugin-owned PostgreSQL tables (`<prefix>jobs`, `<prefix>slots`) |
 | `postgresUsername` | `jsonData` | *(unset)* | `1..128` UTF-8 bytes (no control/BOM) | PostgreSQL login username (required when `jobStoreBackend="postgres"`) |
-| `postgresPassword` | `secureJsonData` | *(unset)* | Encrypted secret | Optional PostgreSQL password stored encrypted in `secureJsonData` (never exposed to browser) |
+| `postgresPassword` | `secureJsonData` | *(unset)* | Encrypted secret | Optional PostgreSQL password stored encrypted in `secureJsonData`, bound to `postgresAddr` + `postgresSslMode` (re-entry required on change) |
 | `postgresSslMode` | `jsonData` | `"prefer"` | `"disable"`, `"prefer"`, `"require"`, `"verify-ca"`, `"verify-full"` | PostgreSQL TLS mode (minimum TLS 1.2; sends SNI for DNS hosts; `verify-ca`/`verify-full` validate against the container/host system root CA trust store; use `require`, `verify-ca`, or `verify-full` in production) |
 
 ## Security & Trust Boundaries
 
 - **Trusted Identity & Isolation:** Job ownership is bound to Grafana's server-supplied `PluginContext` (`OrgID` + `User.Login`). Browser-supplied IDs are never trusted for authorization.
 - **No Cross-User Metadata Cache:** Metric names, `HELP` strings, and label values are kept strictly in browser memory per session and cleared on organization or datasource switch.
-- **SSRF & Redirect Protection:** `grafanaUrl` is restricted to loopback addresses or the Grafana instance's own `AppURL` origin, and `llmclient` disables HTTP redirects.
+- **SSRF, Redirect, & Credential-Redirection Protection:** When Grafana's trusted `AppURL` (or operator-pinned `LLMSTUDIO_GRAFANA_URL`) is present, `grafanaUrl` is strictly pinned to that exact base URL (arbitrary loopback ports are rejected) and `llmclient` disables HTTP redirects. Stored UI credentials (`redisPassword`, `postgresPassword`, and `llmServiceAccountToken`) are bound to their target endpoint/TLS mode so changing the destination requires re-entering or clearing the secret; operators can also pin Redis or PostgreSQL at the deployment level via `LLMSTUDIO_REDIS_ADDR` and `LLMSTUDIO_POSTGRES_ADDR`.
 - **Prompt Injection Defense-in-Depth:** User prompts, metric metadata, LLM outputs, and datasource errors are treated as untrusted input—sanitized, length-bounded, and checked against deterministic schemas, catalog allowlists, and PromQL AST/regex safety rules. Raw URLs, HTML, JavaScript, and arbitrary datasource UIDs are disallowed in the IR.
 - **Multi-Tenancy Caveat (Grafana OSS):** Within a single Grafana OSS organization, folder permissions or UI hiding do **not** isolate Prometheus metric access. Serving users with different data-access scopes in production requires separate Grafana organizations paired with upstream credential, tenant, or authorization-proxy isolation (detailed in [`docs/architecture.md`](docs/architecture.md)).
 
 ## Development & Verification
 
 ```bash
-# Run all checks: schema sync, typecheck, Jest tests, Go vet & race tests, builds, and bundle verification
-make verify
+npm ci
+make check   # the required PR CI minus the live E2E stack
+make help    # every target, with a one-line description
 ```
 
-Individual commands:
+`make check` runs golangci-lint, the TypeScript type check, ESLint, the GitHub Actions audit (actionlint, zizmor, `actions.lock`), the JSON Schema sync check, Go tests with the race detector, Jest and the plugin build with its bundle check. `make verify`, the earlier gate, still runs the same checks without the linters. Individual targets:
 
 ```bash
-npm run verify:schemas   # Bidirectional enum & string-only schema sync (JSON Schema <-> TS <-> Go)
-npm run typecheck        # TypeScript strict type checking (src + Playwright E2E)
-npm run test:ci          # Jest unit, Scenes/Foundation parity, saver, and UI lifecycle tests
-npm run build            # Production Webpack bundle (dist/module.js)
-npm run verify:bundle    # Verify dist/module.js externalizes react/jsx-runtime and contains zero SECRET_INTERNALS
-go vet ./pkg/... ./cmd/...        # Go static analysis
-go test -race -count=1 ./pkg/... ./cmd/...  # Go unit, PromQL/MetricsQL AST, job isolation, and contract tests
+make verify-schemas    # Bidirectional enum & string-only schema sync (JSON Schema <-> TS <-> Go)
+make lint              # golangci-lint, go.mod tidiness, TypeScript type check and ESLint
+make test-race         # Go unit, PromQL/MetricsQL AST, job isolation, and grafana-llm-app contract tests
 # To include live PostgreSQL integration & race tests locally:
-LLM_STUDIO_TEST_POSTGRES_ADDR=127.0.0.1:5432 LLM_STUDIO_TEST_POSTGRES_DB=grafana LLM_STUDIO_TEST_POSTGRES_USER=grafana LLM_STUDIO_TEST_POSTGRES_PASSWORD=grafana-dev-pass LLM_STUDIO_TEST_POSTGRES_SSLMODE=disable go test -race -count=1 ./pkg/... ./cmd/...
-make build-backend       # Linux amd64 Go plugin binary (dist/gpx_yuuki_llmstudio_app_linux_amd64)
-docker compose -f deploy/docker-compose.yml config --quiet
+LLM_STUDIO_TEST_POSTGRES_ADDR=127.0.0.1:5432 LLM_STUDIO_TEST_POSTGRES_DB=grafana LLM_STUDIO_TEST_POSTGRES_USER=grafana LLM_STUDIO_TEST_POSTGRES_PASSWORD=grafana-dev-pass LLM_STUDIO_TEST_POSTGRES_SSLMODE=disable make test-race
+make test-frontend     # Jest unit, Scenes/Foundation parity, saver, and UI lifecycle tests
+make test-release      # Unit tests for multi-arch build, checksum, and MANIFEST.txt verification helpers
+make build             # dist/module.js (externals checked) and dist/gpx_yuuki_llmstudio_app_linux_amd64
+make build-backend-all # All 5 Go backend targets (linux/amd64, linux/arm64, darwin/amd64, darwin/arm64, windows/amd64)
+make package-airgap    # Package .zip, .tar.gz, .zip.sha1, -airgap.tar.gz, and SHA256SUMS + verify all archives
+make test-fuzz         # Go fuzz targets: IR decoding and patching, PromQL/MetricsQL validators, settings
+make vuln vuln-deps    # govulncheck for the Go code, osv-scanner for package-lock.json
 docker compose -f deploy/docker-compose.yml -f deploy/docker-compose.postgres.yml up -d  # Optional PostgreSQL HA overlay
 ```
 
+[CONTRIBUTING.md](CONTRIBUTING.md) describes how to propose a change, and [AGENTS.md](AGENTS.md) lists the design rules, the compatibility contracts and the checks each kind of change needs. Report vulnerabilities as [SECURITY.md](SECURITY.md) describes.
+
 ### Live E2E Tests (Playwright + `@grafana/plugin-e2e`)
 
-Run end-to-end browser tests against live Grafana `13.3.1` (React 19) or `12.4.15` (React 18) containers:
+Run end-to-end browser tests against live Grafana `13.3.1` (React 19) or `12.4.15` (React 18) containers. `make test-integration` builds the plugin, starts the Docker Compose stack, waits for it, runs the `CallResource` SSE checks and Playwright, and stops the stack:
 
 ```bash
-make build
 npx playwright install chromium
-GRAFANA_VERSION=13.3.1 docker compose -f deploy/docker-compose.yml up -d
-node scripts/wait-for-stack.mjs
-npm run test:e2e
-docker compose -f deploy/docker-compose.yml down -v
+make test-integration GRAFANA_VERSION=13.3.1
+make test-integration GRAFANA_VERSION=12.4.15
 ```
 
-GitHub Actions (`.github/workflows/ci.yml`) runs all verification checks plus the live E2E matrix on both **Grafana `13.3.1` (React 19)** and **Grafana `12.4.15` (React 18)**.
+GitHub Actions runs the same checks: `.github/workflows/ci.yml` (lint, unit tests, build, fuzzing, and the live E2E matrix on **Grafana `13.3.1` (React 19)** and **Grafana `12.4.15` (React 18)**), `security.yml` (CodeQL, govulncheck, osv-scanner) and `complexity.yml` (cccc complexity trend). Version tags (`v*`) trigger `.github/workflows/release.yml` for multi-architecture Go cross-compilation, optional `@grafana/sign-plugin` signing, archive & air-gapped bundling, `SHA256SUMS` verification, and GitHub Release publication.
 
 ### Repository Structure
 
 ```text
 .
-├── .github/workflows/      # GitHub Actions CI (verify + live Grafana 13.3.1 & 12.4.15 E2E matrix)
+├── .github/workflows/      # GitHub Actions: CI (+ Grafana 13.3.1/12.4.15 E2E), security, complexity & tag-triggered multi-arch Release workflow
 ├── pkg/                    # Go backend plugin (IR, PromQL AST validator, prompt builder, llmclient, job manager, plugin handlers)
 ├── src/                    # TypeScript/React frontend (Studio UI, AppConfig, metadata/BM25, dry-run validator, Scenes & Foundation adapters, saver)
 ├── tests/e2e/              # Live Playwright / @grafana/plugin-e2e tests
 ├── schemas/                # Canonical Dashboard IR & Patch JSON Schemas and sample payloads
-├── scripts/                # Schema sync verifier, bundle verifier, and E2E stack readiness helper
-├── deploy/                 # Local Docker Compose stack (+ optional OpenAI/Redis/Postgres overlays), Prometheus config, sample exporter, provisioning templates
-└── docs/                   # Architecture, compatibility matrix, air-gapped & OpenAI-compatible API guides, and ADRs
+├── scripts/                # Schema sync verifier, bundle verifier, multi-arch release packager/verifier, and E2E helpers
+├── deploy/                 # Local Docker Compose stack (+ optional OpenAI/Redis/Postgres/VictoriaMetrics overrides), Prometheus config, provisioning templates
+└── docs/                   # Architecture, compatibility matrix, signing & publishing, air-gapped & OpenAI-compatible API guides, and ADRs
 ```
 
 ## Known Limitations (MVP Scope)
 
-- **Scope:** Single Grafana organization, Prometheus-compatible datasources only, `timeseries` and `stat` panels only, fixed grid layout, auto-refresh disabled, non-streaming LLM requests. (Loki, Tempo, ClickHouse, template variables, repeat panels, existing dashboard import, GitOps sync, and MCP/tool execution are out of scope for MVP.)
+- **Scope:** Single Grafana organization, Prometheus-compatible datasources (PromQL & VictoriaMetrics MetricsQL), auto-refresh disabled, non-streaming structured LLM outputs (with optional decoupled SSE stage-progress notifications via `enableSseProgress: true`). (Loki, Tempo, ClickHouse, repeat panels, GitOps sync, and MCP/tool execution are out of scope for MVP.)
 - **Job State Persistence:** Defaults to process-local in-memory storage (`jobStoreBackend: "memory"`). For multi-replica HA Grafana deployments or restart persistence, enable `jobStoreBackend: "redis"` (`deploy/docker-compose.redis.yml`) or `jobStoreBackend: "postgres"` (`deploy/docker-compose.postgres.yml`, which can share Grafana's own PostgreSQL server using a dedicated schema or table prefix).
 - **`grafana-llm-app` JSON Schema Proxy Behavior:** `grafana-llm-app` (`v1.0.8` / `v1.2.0`) unmarshals `response_format.json_schema.schema` into `go-openai/jsonschema.Definition`, which strips numeric/length/regex keywords and `extra_body`. Structure, `additionalProperties: false`, and string enums are enforced via structured outputs (or system-prompt schema in `json_object` mode), while bounds, regexes, PromQL AST rules, and catalog membership are deterministically re-enforced in the Go backend.
-- **Verification Coverage:** Automated unit tests, Scenes/Foundation parity tests, bundle externalization checks (`verify:bundle`), `grafana-llm-app` HTTP contract tests, and live Playwright / `@grafana/plugin-e2e` tests against running Grafana `13.3.1` (React 19) and `12.4.15` (React 18) containers (in mock mode with live Prometheus) run in GitHub Actions CI. Live LLM inference backends (vLLM or OpenAI-compatible APIs via `grafana-llm-app`) should still be validated in your target environment before production rollout.
+- **Verification Coverage:** Automated unit tests, Scenes/Foundation parity tests, bundle externalization checks (`verify:bundle`), `grafana-llm-app` HTTP contract tests, live `CallResource` SSE flush & client-disconnect verification (`scripts/verify-sse-callresource.mjs`), and live Playwright / `@grafana/plugin-e2e` tests against running Grafana `13.3.1` (React 19) and `12.4.15` (React 18) containers (in mock mode with live Prometheus) run in GitHub Actions CI. Live LLM inference backends (vLLM or OpenAI-compatible APIs via `grafana-llm-app`) should still be validated in your target environment before production rollout.
 
 ## Documentation & ADRs
 
 - [Architecture, Auth Boundaries & MVP Scope](docs/architecture.md)
 - [Version Compatibility Matrix & Model Verification](docs/compatibility.md)
+- [Multi-Architecture Releases, Plugin Signing & Catalog Submission Guide](docs/plugin-signing-and-publishing.md)
 - [Internet OpenAI & OpenAI-Compatible APIs Guide](docs/openai-compatible-apis.md)
-- [Air-Gapped Deployment & Upstream Guardrails Guide](docs/airgapped-deployment.md)
+- [Air-Gapped Deployment, Reverse-Proxy SSE & Upstream Guardrails Guide](docs/airgapped-deployment.md)
 - Architecture Decision Records:
   - [ADR-001: Unified LLM Routing via `grafana-llm-app` & Structured Output Constraints](docs/adr/ADR-001-llm-routing-via-grafana-llm-app.md)
   - [ADR-002: Auth Boundaries & Grafana OSS RBAC Scope](docs/adr/ADR-002-auth-boundaries-and-oss-rbac.md)
   - [ADR-003: Lightweight IR, Dual Adapters & Create-Only Save API](docs/adr/ADR-003-ir-and-dual-adapters.md)
-  - [ADR-004: Non-Streaming MVP & SSE Deferral](docs/adr/ADR-004-non-streaming-mvp-and-sse-deferral.md)
+  - [ADR-004: Non-Streaming Structured Output & Optional SSE Stage-Progress Streaming](docs/adr/ADR-004-non-streaming-mvp-and-sse-deferral.md)
 - Canonical Schemas:
   - [`schemas/dashboard-ir.schema.json`](schemas/dashboard-ir.schema.json)
   - [`schemas/dashboard-patch.schema.json`](schemas/dashboard-patch.schema.json)

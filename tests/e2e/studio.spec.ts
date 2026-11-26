@@ -295,4 +295,99 @@ test.describe('LLM Dashboard Studio live E2E', () => {
       }
     }
   });
+
+  test('optional SSE stage-progress streaming updates UI incrementally without prematurely mounting Scenes', async ({
+    page,
+    request,
+    grafanaVersion,
+  }) => {
+    const errors = attachRuntimeErrorMonitor(page);
+    const dsQueries = attachDsQueryTracker(page);
+
+    const origSettingsRes = await request.get(`/api/plugins/${PLUGIN_ID}/settings`);
+    expect(origSettingsRes.ok()).toBe(true);
+    const origSettings = await origSettingsRes.json();
+
+    try {
+      // Enable optional SSE stage progress with a short dev mock delay so the browser observes incremental stages.
+      const enableRes = await request.post(`/api/plugins/${PLUGIN_ID}/settings`, {
+        data: {
+          enabled: origSettings.enabled ?? true,
+          pinned: origSettings.pinned ?? true,
+          jsonData: {
+            ...(origSettings.jsonData ?? {}),
+            enableSseProgress: true,
+            mockDelayMs: 1200,
+          },
+        },
+      });
+      expect(enableRes.ok()).toBe(true);
+
+      await expect
+        .poll(async () => {
+          const cfgRes = await request.get(`/api/plugins/${PLUGIN_ID}/resources/config/public`);
+          if (!cfgRes.ok()) {
+            return false;
+          }
+          const cfg = await cfgRes.json();
+          return cfg.enableSseProgress === true;
+        })
+        .toBe(true);
+
+      await page.goto(`/a/${PLUGIN_ID}`, { waitUntil: 'domcontentloaded' });
+      await expect(page.getByTestId('studio-page')).toBeVisible();
+
+      await page.getByRole('button', { name: 'Fetch Values' }).click();
+      await expect(page.getByPlaceholder('checkout-api')).toHaveValue('checkout-api');
+      await page.getByRole('button', { name: 'Fetch Scoped Metrics' }).click();
+      await expect
+        .poll(async () => Number((await page.getByTestId('studio-catalog-count').textContent()) || '0'))
+        .toBeGreaterThanOrEqual(3);
+
+      const queriesBeforeGenerate = dsQueries.count();
+      await page.getByRole('button', { name: 'Generate Dashboard Draft' }).click();
+
+      // Live SSE stage progress indicator MUST appear while mock LLM is sleeping (before completion).
+      await expect(page.getByTestId('studio-sse-progress')).toBeVisible();
+      await expect(page.getByTestId('studio-sse-progress')).toContainText('generating');
+      expect(dsQueries.count(), 'SSE progress must never trigger premature datasource queries').toBe(
+        queriesBeforeGenerate
+      );
+
+      // Once generation completes, progress indicator clears and validated rev 1 draft is shown.
+      await expect(page.getByTestId('studio-job-revision')).toHaveText('rev 1', { timeout: 10000 });
+      await expect(page.getByTestId('studio-job-status')).toContainText('awaiting_preview');
+      await expect(page.getByTestId('studio-sse-progress')).toHaveCount(0);
+      expect(dsQueries.count()).toBe(queriesBeforeGenerate);
+
+      errors.assertClean(`Studio SSE E2E on Grafana ${grafanaVersion}`);
+    } finally {
+      dsQueries.dispose();
+      const restoredSse = Boolean(origSettings.jsonData?.enableSseProgress);
+      await request
+        .post(`/api/plugins/${PLUGIN_ID}/settings`, {
+          data: {
+            enabled: origSettings.enabled ?? true,
+            pinned: origSettings.pinned ?? true,
+            jsonData: {
+              ...(origSettings.jsonData ?? {}),
+              enableSseProgress: restoredSse,
+              mockDelayMs: 0,
+            },
+          },
+        })
+        .catch(() => {});
+      await expect
+        .poll(async () => {
+          const cfgRes = await request.get(`/api/plugins/${PLUGIN_ID}/resources/config/public`);
+          if (!cfgRes.ok()) {
+            return false;
+          }
+          const cfg = await cfgRes.json();
+          return Boolean(cfg.enableSseProgress) === restoredSse;
+        })
+        .toBe(true)
+        .catch(() => {});
+    }
+  });
 });

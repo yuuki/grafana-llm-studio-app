@@ -14,3 +14,9 @@ playwright/.auth/
 playwright/.cache/
 bin/
 bench-results/
+.eslintcache
+bench.txt
+osv-scanner.sarif
+.cccc.cache
+release/
+*.zip

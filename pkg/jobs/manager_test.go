@@ -584,3 +584,73 @@ func TestManager_ImportIsolationAndGaugePreservation(t *testing.T) {
 		t.Fatalf("expected repair budget untouched on empty catalog, got %d", afterEmpty.RepairAttemptsUsed)
 	}
 }
+
+func TestManager_StageObserverProgress(t *testing.T) {
+	mgr := jobs.NewManager(&llm.MockClient{}, jobs.Config{
+		AllowedDSUIDs: []string{"prom-main"},
+	})
+	defer mgr.Close()
+
+	alice := jobs.Owner{OrgID: 1, UserLogin: "alice"}
+	var genEvents []jobs.StageEvent
+	genCtx := jobs.WithStageObserver(context.Background(), func(ev jobs.StageEvent) {
+		genEvents = append(genEvents, ev)
+	})
+	snap, err := mgr.Generate(genCtx, alice, jobs.GenerateInput{
+		DatasourceUID: "prom-main",
+		Scope:         &ir.ScopeFilter{LabelName: "service", LabelValue: "checkout-api"},
+		UserIntent:    "Show request rate and error rate",
+		Catalog:       testCatalog(),
+	})
+	if err != nil {
+		t.Fatalf("Generate failed: %v", err)
+	}
+	wantGen := []jobs.JobStatus{jobs.StatusGenerating, jobs.StatusValidatingIR, jobs.StatusAwaitingPreview}
+	if len(genEvents) != len(wantGen) {
+		t.Fatalf("genEvents=%+v, want %v", genEvents, wantGen)
+	}
+	for i, want := range wantGen {
+		if genEvents[i].Stage != want || genEvents[i].Operation != jobs.OperationGenerate || genEvents[i].JobID != snap.JobID {
+			t.Fatalf("genEvents[%d]=%+v, want stage=%q op=%q jobId=%q", i, genEvents[i], want, jobs.OperationGenerate, snap.JobID)
+		}
+	}
+
+	var patchEvents []jobs.StageEvent
+	patchCtx := jobs.WithStageObserver(context.Background(), func(ev jobs.StageEvent) {
+		patchEvents = append(patchEvents, ev)
+	})
+	patched, err := mgr.Patch(patchCtx, alice, snap.JobID, jobs.PatchInput{
+		BaseRevision: 1,
+		EditIntent:   "Change error rate panel to timeseries",
+		Catalog:      testCatalog(),
+	})
+	if err != nil {
+		t.Fatalf("Patch failed: %v", err)
+	}
+	if len(patchEvents) != 3 || patchEvents[0].Stage != jobs.StatusGenerating || patchEvents[1].Stage != jobs.StatusValidatingIR || patchEvents[2].Stage != jobs.StatusAwaitingPreview {
+		t.Fatalf("unexpected patchEvents: %+v", patchEvents)
+	}
+
+	var repairEvents []jobs.StageEvent
+	repairCtx := jobs.WithStageObserver(context.Background(), func(ev jobs.StageEvent) {
+		repairEvents = append(repairEvents, ev)
+	})
+	_, err = mgr.Repair(repairCtx, alice, snap.JobID, jobs.RepairInput{
+		BaseRevision: patched.CurrentIR.Revision,
+		Results: []ir.PanelValidationResult{
+			{
+				PanelID:   patched.CurrentIR.Panels[1].ID,
+				QueryHash: ir.PanelQueryHash(patched.CurrentIR.Panels[1]),
+				Category:  ir.ValidationSyntaxError,
+				ErrorText: "parse error",
+			},
+		},
+		Catalog: testCatalog(),
+	})
+	if err != nil {
+		t.Fatalf("Repair failed: %v", err)
+	}
+	if len(repairEvents) != 3 || repairEvents[0].Stage != jobs.StatusRepairing || repairEvents[1].Stage != jobs.StatusValidatingIR || repairEvents[2].Stage != jobs.StatusAwaitingPreview {
+		t.Fatalf("unexpected repairEvents: %+v", repairEvents)
+	}
+}

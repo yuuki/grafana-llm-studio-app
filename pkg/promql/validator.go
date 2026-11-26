@@ -6,6 +6,7 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/prometheus/common/model"
 	"github.com/prometheus/prometheus/model/labels"
 	"github.com/prometheus/prometheus/promql/parser"
 	"github.com/yuuki/grafana-llm-studio-app/pkg/ir"
@@ -22,6 +23,11 @@ var (
 		"label_replace": true,
 		"label_join":    true,
 	}
+
+	// promqlParser accepts only stable PromQL: every experimental option of the
+	// Prometheus parser (functions, duration expressions, extended range
+	// selectors, fill modifiers) stays off, as the parser's former globals were.
+	promqlParser = parser.NewParser(parser.Options{})
 )
 
 // Policy configures deterministic PromQL static inspection bounds.
@@ -149,7 +155,7 @@ func ValidateExprWithVariables(
 		return ValidationResult{}, err
 	}
 
-	ast, err := parser.ParseExpr(trimmed)
+	ast, err := promqlParser.ParseExpr(trimmed)
 	if err != nil {
 		return ValidationResult{}, fmt.Errorf("PromQL syntax error: %w", err)
 	}
@@ -304,7 +310,7 @@ func ValidateExprWithVariables(
 			}
 
 			for _, m := range n.LabelMatchers {
-				if m.Name == labels.MetricName {
+				if m.Name == model.MetricNameLabel {
 					if m.Type == labels.MatchRegexp || m.Type == labels.MatchNotRegexp || m.Type == labels.MatchNotEqual {
 						setErr(fmt.Errorf("%w: non-equality matching on __name__ is disallowed", ErrPolicyViolation))
 						return nil
@@ -331,9 +337,6 @@ func ValidateExprWithVariables(
 						seenVars[v.Name] = true
 						res.ReferencedVariables = append(res.ReferencedVariables, v.Name)
 					}
-					if !scopeMatched && query.MatcherSatisfiesScopeWithVariable(qm, v, normalizedScope) {
-						scopeMatched = true
-					}
 				} else {
 					if qm.Type == query.MatchRegexp || qm.Type == query.MatchNotRegexp {
 						if err := query.ValidateRegexMatcher(qm.Name, qm.Type, qm.Value, policy.MaxRegexLength, policy.MaxRegexRepeat); err != nil {
@@ -352,7 +355,7 @@ func ValidateExprWithVariables(
 			}
 
 			if !scopeMatched {
-				setErr(fmt.Errorf("%w: selector for %q must retain %s=%q (or an anchored single-value $%s variable)", ErrScopeFilterMissing, metricName, normalizedScope.LabelName, normalizedScope.LabelValue, normalizedScope.LabelName))
+				setErr(fmt.Errorf("%w: selector for %q must retain literal %s=%q", ErrScopeFilterMissing, metricName, normalizedScope.LabelName, normalizedScope.LabelValue))
 				return nil
 			}
 		}
@@ -432,7 +435,7 @@ func resolveMetricName(vs *parser.VectorSelector) string {
 		return vs.Name
 	}
 	for _, m := range vs.LabelMatchers {
-		if m.Name == labels.MetricName && m.Type == labels.MatchEqual {
+		if m.Name == model.MetricNameLabel && m.Type == labels.MatchEqual {
 			return m.Value
 		}
 	}

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
 	"strings"
 	"time"
 
@@ -30,13 +31,14 @@ var (
 
 // App is the Grafana backend App Plugin instance for LLM Dashboard Studio.
 type App struct {
-	settings        Settings
-	llmClient       llm.Client
-	llmInitErr      error
-	jobStore        jobs.JobStore
-	storeInitErr    error
-	jobManager      *jobs.Manager
-	resourceHandler backend.CallResourceHandler
+	settings             Settings
+	llmClient            llm.Client
+	llmInitErr           error
+	jobStore             jobs.JobStore
+	storeInitErr         error
+	jobManager           *jobs.Manager
+	resourceHandler      backend.CallResourceHandler
+	sseHeartbeatInterval time.Duration
 }
 
 // NewApp creates a new App instance from Grafana's AppInstanceSettings.
@@ -51,15 +53,25 @@ func NewApp(ctx context.Context, appSettings backend.AppInstanceSettings) (insta
 			managedSecret = strings.TrimSpace(secret)
 		}
 	}
+	if envGrafanaURL := strings.TrimSpace(os.Getenv("LLMSTUDIO_GRAFANA_URL")); envGrafanaURL != "" {
+		trustedAppURL = envGrafanaURL
+	}
+	pinnedRedisAddr := strings.TrimSpace(os.Getenv("LLMSTUDIO_REDIS_ADDR"))
+	pinnedPostgresAddr := strings.TrimSpace(os.Getenv("LLMSTUDIO_POSTGRES_ADDR"))
 
-	settings, err := LoadSettings(appSettings, trustedAppURL)
+	settings, err := LoadSettingsWithOptions(appSettings, LoadOptions{
+		TrustedGrafanaAppURL: trustedAppURL,
+		PinnedRedisAddr:      pinnedRedisAddr,
+		PinnedPostgresAddr:   pinnedPostgresAddr,
+	})
 	if err != nil {
 		return nil, err
 	}
 
-	// Prefer explicit secureJsonData token; allow Grafana-managed secret only after grafanaUrl origin validation passed.
+	// Prefer explicit secureJsonData token; allow Grafana-managed secret ONLY when grafanaUrl
+	// was strictly pinned against a trusted Grafana base URL.
 	token := settings.llmServiceAccountToken
-	if token == "" && managedSecret != "" {
+	if token == "" && managedSecret != "" && trustedAppURL != "" {
 		token = managedSecret
 	}
 
@@ -70,7 +82,9 @@ func NewApp(ctx context.Context, appSettings backend.AppInstanceSettings) (insta
 	switch settings.LLMMode {
 	case LLMModeMock:
 		// Explicit dev/test-only mock client; never silently activated when LLMMode == grafana-llm-app.
-		client = &llm.MockClient{}
+		client = &llm.MockClient{
+			Delay: time.Duration(settings.MockDelayMs) * time.Millisecond,
+		}
 	case LLMModeGrafanaLLMApp:
 		client, initErr = llm.NewGrafanaLLMClient(llm.GrafanaLLMConfig{
 			GrafanaURL:           settings.GrafanaURL,
@@ -142,12 +156,13 @@ func newAppWithClientAndStore(settings Settings, client llm.Client, initErr erro
 		})
 	}
 	a := &App{
-		settings:     settings,
-		llmClient:    client,
-		llmInitErr:   initErr,
-		jobStore:     store,
-		storeInitErr: storeInitErr,
-		jobManager:   mgr,
+		settings:             settings,
+		llmClient:            client,
+		llmInitErr:           initErr,
+		jobStore:             store,
+		storeInitErr:         storeInitErr,
+		jobManager:           mgr,
+		sseHeartbeatInterval: defaultSSEHeartbeatInterval,
 	}
 	mux := http.NewServeMux()
 	a.registerRoutes(mux)
@@ -319,12 +334,9 @@ func (a *App) handleGenerate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	snap, err := a.jobManager.Generate(r.Context(), owner, in)
-	if err != nil {
-		writeJobError(w, err, snap)
-		return
-	}
-	writeJSON(w, http.StatusOK, snap)
+	a.serveJobOperation(w, r, func(ctx context.Context) (jobs.JobSnapshot, error) {
+		return a.jobManager.Generate(ctx, owner, in)
+	})
 }
 
 type importHTTPRequest struct {
@@ -419,12 +431,9 @@ func (a *App) handleJobAction(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusBadRequest, err.Error())
 			return
 		}
-		snap, err := a.jobManager.Patch(r.Context(), owner, jobID, in)
-		if err != nil {
-			writeJobError(w, err, snap)
-			return
-		}
-		writeJSON(w, http.StatusOK, snap)
+		a.serveJobOperation(w, r, func(ctx context.Context) (jobs.JobSnapshot, error) {
+			return a.jobManager.Patch(ctx, owner, jobID, in)
+		})
 
 	case action == "repair" && r.Method == http.MethodPost:
 		var in jobs.RepairInput
@@ -432,12 +441,9 @@ func (a *App) handleJobAction(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusBadRequest, err.Error())
 			return
 		}
-		snap, err := a.jobManager.Repair(r.Context(), owner, jobID, in)
-		if err != nil {
-			writeJobError(w, err, snap)
-			return
-		}
-		writeJSON(w, http.StatusOK, snap)
+		a.serveJobOperation(w, r, func(ctx context.Context) (jobs.JobSnapshot, error) {
+			return a.jobManager.Repair(ctx, owner, jobID, in)
+		})
 
 	case action == "undo" && r.Method == http.MethodPost:
 		snap, err := a.jobManager.UndoContext(r.Context(), owner, jobID)
@@ -458,6 +464,37 @@ func (a *App) handleJobAction(w http.ResponseWriter, r *http.Request) {
 	default:
 		writeError(w, http.StatusNotFound, "unknown job route or method")
 	}
+}
+
+// serveJobOperation executes a generate/patch/repair job operation, emitting decoupled
+// application-level SSE stage-progress events when both admin enableSseProgress=true
+// and the caller requests Accept: text/event-stream (with graceful JSON fallback otherwise).
+func (a *App) serveJobOperation(w http.ResponseWriter, r *http.Request, op func(ctx context.Context) (jobs.JobSnapshot, error)) {
+	if a.settings.EnableSSEProgress && wantsEventStream(r) {
+		if flusher, ok := w.(http.Flusher); ok {
+			sw := newSSEStreamWriter(r.Context(), w, flusher, a.sseHeartbeatInterval)
+			defer sw.StopHeartbeat()
+
+			opCtx := jobs.WithStageObserver(r.Context(), sw.EmitStage)
+			snap, err := op(opCtx)
+			if err != nil {
+				sw.FinishError(err, snap)
+				return
+			}
+			sw.FinishResult(snap)
+			return
+		}
+	}
+
+	if a.settings.EnableSSEProgress {
+		w.Header().Set("Vary", "Accept")
+	}
+	snap, err := op(r.Context())
+	if err != nil {
+		writeJobError(w, err, snap)
+		return
+	}
+	writeJSON(w, http.StatusOK, snap)
 }
 
 // callerOwnerFromContext derives orgId and user identity strictly from Grafana's trusted PluginContext.
@@ -496,7 +533,7 @@ func decodeBoundedJSON(body io.Reader, dst any) error {
 	return nil
 }
 
-func writeJobError(w http.ResponseWriter, err error, snap jobs.JobSnapshot) {
+func buildJobErrorPayload(err error, snap jobs.JobSnapshot) (int, map[string]any) {
 	status := http.StatusBadRequest
 	errMsg := err.Error()
 	switch {
@@ -524,6 +561,11 @@ func writeJobError(w http.ResponseWriter, err error, snap jobs.JobSnapshot) {
 	if snap.JobID != "" {
 		payload["job"] = snap
 	}
+	return status, payload
+}
+
+func writeJobError(w http.ResponseWriter, err error, snap jobs.JobSnapshot) {
+	status, payload := buildJobErrorPayload(err, snap)
 	writeJSON(w, status, payload)
 }
 

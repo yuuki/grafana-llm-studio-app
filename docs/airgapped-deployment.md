@@ -26,18 +26,26 @@ sha256sum airgap-images.tar > airgap-images.tar.sha256
 
 ### 1.2 Bundle Plugins and Offline Dependencies
 1. **Custom App Plugin (`yuuki-llmstudio-app`):**
-   ```bash
-   # Optional: create offline caches if rebuilding inside the air-gapped network
-   go mod vendor
-   npm ci --prefer-offline
+   - **Option A — Use Prebuilt Multi-Arch Release Artifacts (Recommended):**
+     Download the tagged release assets from GitHub Releases on the staging host and verify checksums before transferring offline:
+     - `yuuki-llmstudio-app-<version>-airgap.tar.gz` (self-contained offline bundle containing the multi-architecture `.tar.gz`/`.zip` plugin archives, `SHA256SUMS`, canonical IR/Patch schemas, hardened offline `grafana.ini` template, `BUNDLE-MANIFEST.json`, and `INSTALL-OFFLINE.md`), **or**
+     - `yuuki-llmstudio-app-<version>.tar.gz` / `yuuki-llmstudio-app-<version>.zip` + `SHA256SUMS` (bundles all 5 Go backend binaries: `linux/amd64`, `linux/arm64`, `darwin/amd64`, `darwin/arm64`, `windows/amd64`).
+     ```bash
+     sha256sum -c SHA256SUMS
+     # Inside the air-gapped host (creates /var/lib/grafana/plugins/yuuki-llmstudio-app/):
+     tar -xzf yuuki-llmstudio-app-<version>.tar.gz -C /var/lib/grafana/plugins
+     ```
+   - **Option B — Build & Package from Source:**
+     ```bash
+     # Optional: create offline caches if rebuilding inside the air-gapped network
+     go mod vendor
+     npm ci --prefer-offline
 
-   # Build distributable plugin bundle (dist/)
-   npm run verify:schemas
-   npm run build
-   CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -mod=vendor -o dist/gpx_yuuki_llmstudio_app_linux_amd64 ./pkg
-   tar -czf yuuki-llmstudio-app-0.1.0.tar.gz -C dist .
-   sha256sum yuuki-llmstudio-app-0.1.0.tar.gz > yuuki-llmstudio-app-0.1.0.tar.gz.sha256
-   ```
+     # Build frontend + all 5 Go backend architectures, package, and verify SHA256SUMS:
+     # (Export GRAFANA_ACCESS_POLICY_TOKEN and GRAFANA_PLUGIN_ROOT_URLS first for Private signing)
+     make package-airgap
+     ```
+     Outputs land in `release/` (`yuuki-llmstudio-app-<version>.zip`, `.tar.gz`, `-airgap.tar.gz`, and `SHA256SUMS`).
 2. **Official `grafana-llm-app` (Grafana 13.x: `v1.2.0` / Grafana 12.4.x: `v1.0.8`):**
    - Download the signed release archive for **`v1.2.0`** (`grafanaDependency: ">=13.0.0-0"`) on Grafana 13.3.1, or **`v1.0.8`** (`grafanaDependency: ">=9.5.2"`) on Grafana 12.4.15, verify its SHA-256 checksum, and transfer it offline.
    - **Never rely on runtime `GF_INSTALL_PLUGINS` downloads in air-gapped environments.**
@@ -50,11 +58,13 @@ sha256sum airgap-images.tar > airgap-images.tar.sha256
 
 ## 2. Air-Gapped Deployment Configuration
 
-### 2.1 Explicit Unsigned Plugin Allowlist & Offline Grafana Hardening
-Allow **only** `yuuki-llmstudio-app` in `grafana.ini` or environment variables (never use wildcards):
+### 2.1 Plugin Signature Verification & Offline Grafana Hardening
+- **Signed Releases (Recommended for Production):** Sign the plugin on your internet-connected staging host using `@grafana/sign-plugin` (Private signature with `--rootUrls` matching your internal Grafana `root_url`, or Community signature once approved — see [`docs/plugin-signing-and-publishing.md`](plugin-signing-and-publishing.md)). Grafana verifies `MANIFEST.txt` offline against its built-in Grafana Labs public key even with `public_key_retrieval_disabled = true`, so **`allow_loading_unsigned_plugins` is not needed**.
+- **Unsigned Builds (Fallback Only):** If deploying an unsigned archive, allow **only** `yuuki-llmstudio-app` in `grafana.ini` or environment variables (never use wildcards):
 
 ```ini
 [plugins]
+# Required ONLY when deploying an unsigned build (omit for signed releases):
 allow_loading_unsigned_plugins = yuuki-llmstudio-app
 public_key_retrieval_disabled = true
 plugin_admin_enabled = false
@@ -76,6 +86,7 @@ external_enabled = false
 
 Equivalent environment variables:
 ```bash
+# Required ONLY when deploying an unsigned build (omit for signed releases):
 GF_PLUGINS_ALLOW_LOADING_UNSIGNED_PLUGINS=yuuki-llmstudio-app
 GF_PLUGINS_PUBLIC_KEY_RETRIEVAL_DISABLED=true
 GF_PLUGINS_PLUGIN_ADMIN_ENABLED=false
@@ -108,7 +119,7 @@ GF_SNAPSHOTS_EXTERNAL_ENABLED=false
 
 ### 2.3 Dedicated LLM Service Account Permissions (Grafana OSS 12.4.15 / 13.3.1)
 1. Create a Grafana service account dedicated to `yuuki-llmstudio-app` and assign the minimum OSS basic role **`Viewer`** (the lowest built-in role containing `plugins.app:access`; never grant `Editor` or `Admin`).
-2. To prevent SSRF and token exfiltration, the Go backend restricts `grafanaUrl` in App Config to **loopback (`localhost` / `127.0.0.1` / `::1`) or the same origin as Grafana's `AppURL`**, and disables HTTP redirects.
+2. To prevent SSRF and token exfiltration, the Go backend strictly pins `grafanaUrl` in App Config to Grafana's trusted **`AppURL` base URL** (or the operator-pinned `LLMSTUDIO_GRAFANA_URL` environment variable when Grafana cannot hairpin), rejects arbitrary loopback ports whenever a trusted base URL is configured, binds UI-stored credentials (`llmServiceAccountToken` / `redisPassword`) to their target endpoint, and disables HTTP redirects.
 3. Store the token only in `secureJsonData` (`llmServiceAccountToken`); never commit it to Git or plaintext `.env` files.
 4. **Cluster-Wide LLM Rate Limiting:** In-plugin budgets (`maxConcurrentJobs`, `maxRepairAttempts`, `maxOutputTokens`) govern only requests originating from `yuuki-llmstudio-app`. If `grafana-llm-app` or vLLM is shared across multiple plugins or teams, enforce per-client rate limits, concurrency caps, and timeouts at the reverse proxy (Nginx / Envoy) or vLLM layer as well.
 
@@ -132,6 +143,43 @@ Browser-side dry-run caps (`now-5m`, `maxDataPoints=10`, concurrency `<= 2`, `10
 -search.maxUniqueTimeseries=30000
 ```
 
-### Reverse Proxy Timeout Settings (Fronting Grafana & vLLM)
-- In non-streaming MVP mode, an LLM request waits up to `llmTimeoutSeconds` (default `45s`). Configure `proxy_read_timeout` on reverse proxies fronting Grafana to at least `jobDeadlineSeconds` (default `90s`).
-- If SSE progress streaming is added in a future release, configure `proxy_buffering off;` and `proxy_http_version 1.1;`, and verify `CallResource` flush and client-disconnect behavior in your target environment first.
+### Reverse Proxy Settings (Fronting Grafana & vLLM)
+
+- **Non-Streaming Baseline (`enableSseProgress: false`, default):** An LLM request waits up to `llmTimeoutSeconds` (default `45s`) and `jobDeadlineSeconds` (default `90s`). Configure reverse-proxy read timeouts to at least `jobDeadlineSeconds` (e.g., `120s`).
+- **Optional SSE Stage-Progress Streaming (`enableSseProgress: true`):**
+  - The backend emits decoupled application-level lifecycle stage events (`generating` -> `validating_ir` -> `awaiting_preview`, or `repairing` -> `validating_ir` -> `awaiting_preview`) plus `: keepalive` comment heartbeats every `15s` over Grafana `CallResource` (`Content-Type: text/event-stream; charset=utf-8`, `X-Accel-Buffering: no`). Note that Grafana's HTTP middleware normalizes `Cache-Control` to `no-store` (dropping `no-transform`), so reverse proxies **must** explicitly set `proxy_buffering off` and `gzip off`. Raw LLM tokens and unvalidated JSON fragments are **never** streamed or rendered.
+  - Reverse proxies fronting Grafana **must** disable response buffering on the plugin resource endpoint, use HTTP/1.1 (or HTTP/2 end-to-end without buffering), and align idle/response timeouts **above** `jobDeadlineSeconds` (e.g., `jobDeadlineSeconds + 30s`, so `210s` for the `180s` maximum). If Grafana runs with `serve_from_sub_path = true`, prefix the location/route path accordingly (e.g., `/grafana/api/plugins/yuuki-llmstudio-app/resources/`).
+
+#### Example Nginx Configuration (Scoped to Studio Resource Endpoints)
+
+```nginx
+location /api/plugins/yuuki-llmstudio-app/resources/ {
+    proxy_pass http://grafana_upstream;
+    proxy_http_version 1.1;
+    proxy_set_header Host $host;
+    proxy_set_header Connection "";
+
+    # Required for incremental SSE stage-progress flushing:
+    proxy_buffering off;
+    proxy_cache off;
+    gzip off;
+
+    # Align idle/read timeouts strictly above jobDeadlineSeconds (default 90s; max 180s -> 210s):
+    proxy_read_timeout 210s;
+    proxy_send_timeout 210s;
+}
+```
+
+#### Example Envoy Route Configuration
+
+```yaml
+routes:
+  - match:
+      prefix: "/api/plugins/yuuki-llmstudio-app/resources/"
+    route:
+      cluster: grafana_upstream
+      timeout: 210s
+      idle_timeout: 210s
+```
+
+- **Graceful Fallback:** If an admin keeps `enableSseProgress: false`, the backend returns standard `application/json` even if a client sends `Accept: text/event-stream`. If `enableSseProgress: true` is enabled behind a proxy or browser that rejects SSE (`406`/`501`) or lacks streaming support before execution, the Studio frontend automatically falls back to non-streaming JSON requests; if a proxy drops an SSE connection mid-flight after a job has started, the frontend recovers the validated state via `GET /jobs/{id}` (verifying revision advancement on edits/repairs) rather than issuing a duplicate LLM request.

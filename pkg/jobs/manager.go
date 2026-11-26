@@ -13,8 +13,8 @@ import (
 	"github.com/yuuki/grafana-llm-studio-app/pkg/ir"
 	"github.com/yuuki/grafana-llm-studio-app/pkg/llm"
 	"github.com/yuuki/grafana-llm-studio-app/pkg/metricsql"
-	"github.com/yuuki/grafana-llm-studio-app/pkg/promql"
 	"github.com/yuuki/grafana-llm-studio-app/pkg/prompt"
+	"github.com/yuuki/grafana-llm-studio-app/pkg/promql"
 	"github.com/yuuki/grafana-llm-studio-app/pkg/query"
 )
 
@@ -165,20 +165,20 @@ type localCancelEntry struct {
 // Notice: metric catalogs are NEVER stored in a cross-user shared index; only job-private
 // metric type guards (knownGauges) stay scoped to the single job owner and expire with the job.
 type Manager struct {
-	cfg          Config
-	client       llm.Client
-	registry     *query.Registry
-	store        JobStore
-	ownsStore    bool
-	customNow    func() time.Time
-	localMu      sync.Mutex
-	localCancels map[string]localCancelEntry
-	latestFenced map[string]uint64
-	opWG         sync.WaitGroup
-	bgWG         sync.WaitGroup
-	stopCh       chan struct{}
+	cfg           Config
+	client        llm.Client
+	registry      *query.Registry
+	store         JobStore
+	ownsStore     bool
+	customNow     func() time.Time
+	localMu       sync.Mutex
+	localCancels  map[string]localCancelEntry
+	latestFenced  map[string]uint64
+	opWG          sync.WaitGroup
+	bgWG          sync.WaitGroup
+	stopCh        chan struct{}
 	stopCancelSub func()
-	closeOnce    sync.Once
+	closeOnce     sync.Once
 }
 
 // NewManager creates a new bounded job manager.
@@ -482,6 +482,8 @@ func (m *Manager) Generate(ctx context.Context, owner Owner, in GenerateInput) (
 	defer m.unregisterLocalCancel(jobID, opToken)
 	defer m.releaseSlot(ctx, owner, lease.SlotID)
 
+	m.emitStage(ctx, jobID, OperationGenerate, StatusGenerating)
+
 	raw, meta, err := m.client.GenerateIR(opCtx, llm.GenerateRequest{
 		UserIntent:   in.UserIntent,
 		Scope:        cloneScope(safeScope),
@@ -492,19 +494,20 @@ func (m *Manager) Generate(ctx context.Context, owner Owner, in GenerateInput) (
 	})
 	if err != nil {
 		if errors.Is(err, context.Canceled) || opCtx.Err() == context.Canceled {
-			return m.finishJob(ctx, owner, jobID, opToken, StatusCancelled, nil, nil, "", nil, "生成はキャンセルされました。", &meta)
+			return m.finishJobWithStage(ctx, owner, jobID, opToken, OperationGenerate, StatusCancelled, nil, nil, "", nil, "生成はキャンセルされました。", &meta)
 		}
 		if errors.Is(err, llm.ErrInsufficientMetrics) {
-			return m.finishJob(ctx, owner, jobID, opToken, StatusInsufficientMetrics, nil, nil, "", nil, "要求に合致するメトリクスが選択スコープ内に見つかりませんでした。", &meta)
+			return m.finishJobWithStage(ctx, owner, jobID, opToken, OperationGenerate, StatusInsufficientMetrics, nil, nil, "", nil, "要求に合致するメトリクスが選択スコープ内に見つかりませんでした。", &meta)
 		}
-		return m.finishJob(ctx, owner, jobID, opToken, StatusFailed, nil, nil, "", nil, err.Error(), &meta)
+		return m.finishJobWithStage(ctx, owner, jobID, opToken, OperationGenerate, StatusFailed, nil, nil, "", nil, err.Error(), &meta)
 	}
 
 	m.setStatusIfToken(ctx, owner, jobID, opToken, StatusValidatingIR)
+	m.emitStage(ctx, jobID, OperationGenerate, StatusValidatingIR)
 
 	doc, err := ir.DecodeStrictIR(raw)
 	if err != nil {
-		return m.finishJob(ctx, owner, jobID, opToken, StatusFailed, nil, nil, "", nil, fmt.Sprintf("IR JSON Schema 検査に失敗しました: %v", err), &meta)
+		return m.finishJobWithStage(ctx, owner, jobID, opToken, OperationGenerate, StatusFailed, nil, nil, "", nil, fmt.Sprintf("IR JSON Schema 検査に失敗しました: %v", err), &meta)
 	}
 	doc.Revision = 1
 	if qKind != query.KindPromQL {
@@ -521,12 +524,12 @@ func (m *Manager) Generate(ctx context.Context, owner Owner, in GenerateInput) (
 	)
 	if err != nil {
 		if errors.Is(err, query.ErrMetricNotInCatalog) {
-			return m.finishJob(ctx, owner, jobID, opToken, StatusInsufficientMetrics, nil, nil, "", nil, fmt.Sprintf("カタログ外のメトリクス参照を検出し拒否しました: %v", err), &meta)
+			return m.finishJobWithStage(ctx, owner, jobID, opToken, OperationGenerate, StatusInsufficientMetrics, nil, nil, "", nil, fmt.Sprintf("カタログ外のメトリクス参照を検出し拒否しました: %v", err), &meta)
 		}
-		return m.finishJob(ctx, owner, jobID, opToken, StatusFailed, nil, nil, "", nil, fmt.Sprintf("IR/%s 検査に失敗しました: %v", adapter.DisplayName(), err), &meta)
+		return m.finishJobWithStage(ctx, owner, jobID, opToken, OperationGenerate, StatusFailed, nil, nil, "", nil, fmt.Sprintf("IR/%s 検査に失敗しました: %v", adapter.DisplayName(), err), &meta)
 	}
 
-	return m.finishJob(ctx, owner, jobID, opToken, StatusAwaitingPreview, &doc, nil, "初期ドラフトを生成しました。検証・プレビューを実行して内容を確認してください。", warnings, "", &meta)
+	return m.finishJobWithStage(ctx, owner, jobID, opToken, OperationGenerate, StatusAwaitingPreview, &doc, nil, "初期ドラフトを生成しました。検証・プレビューを実行して内容を確認してください。", warnings, "", &meta)
 }
 
 // Import validates a constrained DashboardIR converted from an existing Grafana dashboard
@@ -655,13 +658,15 @@ func (m *Manager) Patch(ctx context.Context, owner Owner, jobID string, in Patch
 	defer m.unregisterLocalCancel(jobID, opToken)
 	defer m.releaseSlot(ctx, owner, op.SlotID)
 
+	m.emitStage(ctx, jobID, OperationPatch, StatusGenerating)
+
 	qKind := op.QueryKind
 	if qKind == "" {
 		qKind = query.KindPromQL
 	}
 	adapter, err := m.registry.Get(qKind)
 	if err != nil {
-		return m.recordEditFailure(ctx, owner, jobID, opToken, err, err.Error(), nil)
+		return m.recordEditFailureWithStage(ctx, owner, jobID, opToken, OperationPatch, err, err.Error(), nil)
 	}
 
 	// Preserve and monotonically expand known gauge types across revisions/replicas so clients cannot spoof gauge->counter.
@@ -678,25 +683,29 @@ func (m *Manager) Patch(ctx context.Context, owner Owner, jobID string, in Patch
 	})
 	if err != nil {
 		if errors.Is(err, context.Canceled) || opCtx.Err() == context.Canceled {
-			return m.revertToPreviousOnCancel(ctx, owner, jobID, opToken)
+			return m.revertToPreviousOnCancelWithStage(ctx, owner, jobID, opToken, OperationPatch)
 		}
-		return m.recordEditFailure(ctx, owner, jobID, opToken, err, err.Error(), &meta)
+		return m.recordEditFailureWithStage(ctx, owner, jobID, opToken, OperationPatch, err, err.Error(), &meta)
 	}
+
+	m.setStatusIfToken(ctx, owner, jobID, opToken, StatusValidatingIR)
+	m.emitStage(ctx, jobID, OperationPatch, StatusValidatingIR)
 
 	patch, err := ir.DecodeStrictPatch(raw)
 	if err != nil {
-		return m.recordEditFailure(ctx, owner, jobID, opToken, err, fmt.Sprintf("パッチ JSON 検査に失敗しました: %v", err), &meta)
+		return m.recordEditFailureWithStage(ctx, owner, jobID, opToken, OperationPatch, err, fmt.Sprintf("パッチ JSON 検査に失敗しました: %v", err), &meta)
 	}
 
 	// When user explicitly targeted a single panel, enforce that the LLM only updates that panel.
 	if targetPanelID != "" {
 		for _, pOp := range patch.Operations {
 			if pOp.Op != "update_panel" || pOp.PanelID != targetPanelID {
-				return m.recordEditFailure(
+				return m.recordEditFailureWithStage(
 					ctx,
 					owner,
 					jobID,
 					opToken,
+					OperationPatch,
 					nil,
 					fmt.Sprintf("対象パネル指定 (%s) に反するパッチ操作 (%s:%s) を拒否しました", targetPanelID, pOp.Op, pOp.PanelID),
 					&meta,
@@ -707,7 +716,7 @@ func (m *Manager) Patch(ctx context.Context, owner Owner, jobID string, in Patch
 
 	nextIR, diffs, err := ir.ApplyPatch(op.CurrentIR, patch, ir.ValidateOptions{MaxPanels: m.cfg.MaxPanels})
 	if err != nil {
-		return m.recordEditFailure(ctx, owner, jobID, opToken, err, fmt.Sprintf("パッチ適用に失敗しました: %v", err), &meta)
+		return m.recordEditFailureWithStage(ctx, owner, jobID, opToken, OperationPatch, err, fmt.Sprintf("パッチ適用に失敗しました: %v", err), &meta)
 	}
 	if qKind != query.KindPromQL {
 		nextIR.StampQueryKind(string(qKind))
@@ -722,10 +731,10 @@ func (m *Manager) Patch(ctx context.Context, owner Owner, jobID string, in Patch
 		query.ValidateOptions{RequireCatalogMatch: true},
 	)
 	if err != nil {
-		return m.recordEditFailure(ctx, owner, jobID, opToken, err, fmt.Sprintf("パッチ後の %s 検査に失敗しました: %v", adapter.DisplayName(), err), &meta)
+		return m.recordEditFailureWithStage(ctx, owner, jobID, opToken, OperationPatch, err, fmt.Sprintf("パッチ後の %s 検査に失敗しました: %v", adapter.DisplayName(), err), &meta)
 	}
 
-	return m.commitRevision(ctx, owner, jobID, opToken, op.CurrentIR.Revision, nextIR, diffs, patch.Summary, warnings, &meta)
+	return m.commitRevisionWithStage(ctx, owner, jobID, opToken, OperationPatch, op.CurrentIR.Revision, nextIR, diffs, patch.Summary, warnings, &meta)
 }
 
 // Repair attempts a bounded repair ONLY for syntax_error panels matching the current IR revision and queryHash.
@@ -853,6 +862,8 @@ func (m *Manager) Repair(ctx context.Context, owner Owner, jobID string, in Repa
 	defer m.unregisterLocalCancel(jobID, opToken)
 	defer m.releaseSlot(ctx, owner, op.SlotID)
 
+	m.emitStage(ctx, jobID, OperationRepair, StatusRepairing)
+
 	boundedCatalog = enforceKnownGaugeTypes(boundedCatalog, op.KnownGauges)
 
 	raw, meta, err := m.client.RepairPanels(opCtx, llm.RepairRequest{
@@ -865,14 +876,17 @@ func (m *Manager) Repair(ctx context.Context, owner Owner, jobID string, in Repa
 	})
 	if err != nil {
 		if errors.Is(err, context.Canceled) || opCtx.Err() == context.Canceled {
-			return m.revertToPreviousOnCancel(ctx, owner, jobID, opToken)
+			return m.revertToPreviousOnCancelWithStage(ctx, owner, jobID, opToken, OperationRepair)
 		}
-		return m.recordEditFailure(ctx, owner, jobID, opToken, err, fmt.Sprintf("自動修復に失敗しました: %v", err), &meta)
+		return m.recordEditFailureWithStage(ctx, owner, jobID, opToken, OperationRepair, err, fmt.Sprintf("自動修復に失敗しました: %v", err), &meta)
 	}
+
+	m.setStatusIfToken(ctx, owner, jobID, opToken, StatusValidatingIR)
+	m.emitStage(ctx, jobID, OperationRepair, StatusValidatingIR)
 
 	patch, err := ir.DecodeStrictPatch(raw)
 	if err != nil {
-		return m.recordEditFailure(ctx, owner, jobID, opToken, err, fmt.Sprintf("修復パッチ JSON 検査に失敗しました: %v", err), &meta)
+		return m.recordEditFailureWithStage(ctx, owner, jobID, opToken, OperationRepair, err, fmt.Sprintf("修復パッチ JSON 検査に失敗しました: %v", err), &meta)
 	}
 
 	// Enforce that repair ONLY touches Query or Queries on the failing syntax_error panels
@@ -883,22 +897,22 @@ func (m *Manager) Repair(ctx context.Context, owner Owner, jobID string, in Repa
 	}
 	for _, pOp := range patch.Operations {
 		if pOp.Op != "update_panel" || !allowedTargetIDs[pOp.PanelID] || pOp.Panel == nil || (pOp.Panel.Query == nil && pOp.Panel.Queries == nil) {
-			return m.recordEditFailure(ctx, owner, jobID, opToken, nil, fmt.Sprintf("修復パッチが対象外パネル/操作 (%s:%s) を含んでいたため拒否しました", pOp.Op, pOp.PanelID), &meta)
+			return m.recordEditFailureWithStage(ctx, owner, jobID, opToken, OperationRepair, nil, fmt.Sprintf("修復パッチが対象外パネル/操作 (%s:%s) を含んでいたため拒否しました", pOp.Op, pOp.PanelID), &meta)
 		}
 		p := pOp.Panel
 		if p.DatasourceRef != "" && p.DatasourceRef != ir.SelectedDatasourceRef {
-			return m.recordEditFailure(ctx, owner, jobID, opToken, nil, "修復パッチによるデータソース変更は禁止されています", &meta)
+			return m.recordEditFailureWithStage(ctx, owner, jobID, opToken, OperationRepair, nil, "修復パッチによるデータソース変更は禁止されています", &meta)
 		}
 		if p.Type != "" || p.Title != "" || p.Description != nil || p.Unit != "" || p.Thresholds != nil || p.Layout != nil {
-			return m.recordEditFailure(ctx, owner, jobID, opToken, nil, fmt.Sprintf("修復パッチは失敗パネルの %s クエリのみ変更可能です", adapter.DisplayName()), &meta)
+			return m.recordEditFailureWithStage(ctx, owner, jobID, opToken, OperationRepair, nil, fmt.Sprintf("修復パッチは失敗パネルの %s クエリのみ変更可能です", adapter.DisplayName()), &meta)
 		}
 		if p.Query != nil && p.Query.Kind != nil && *p.Query.Kind != "" && *p.Query.Kind != string(qKind) {
-			return m.recordEditFailure(ctx, owner, jobID, opToken, nil, fmt.Sprintf("修復パッチによるクエリ方言変更 (%q -> %q) は禁止されています", qKind, *p.Query.Kind), &meta)
+			return m.recordEditFailureWithStage(ctx, owner, jobID, opToken, OperationRepair, nil, fmt.Sprintf("修復パッチによるクエリ方言変更 (%q -> %q) は禁止されています", qKind, *p.Query.Kind), &meta)
 		}
 		if p.Queries != nil {
 			for _, q := range *p.Queries {
 				if q.Kind != "" && q.Kind != string(qKind) {
-					return m.recordEditFailure(ctx, owner, jobID, opToken, nil, fmt.Sprintf("修復パッチによるクエリ方言変更 (%q -> %q) は禁止されています", qKind, q.Kind), &meta)
+					return m.recordEditFailureWithStage(ctx, owner, jobID, opToken, OperationRepair, nil, fmt.Sprintf("修復パッチによるクエリ方言変更 (%q -> %q) は禁止されています", qKind, q.Kind), &meta)
 				}
 			}
 		}
@@ -906,7 +920,7 @@ func (m *Manager) Repair(ctx context.Context, owner Owner, jobID string, in Repa
 
 	nextIR, diffs, err := ir.ApplyPatch(op.CurrentIR, patch, ir.ValidateOptions{MaxPanels: m.cfg.MaxPanels})
 	if err != nil {
-		return m.recordEditFailure(ctx, owner, jobID, opToken, err, fmt.Sprintf("修復パッチ適用に失敗しました: %v", err), &meta)
+		return m.recordEditFailureWithStage(ctx, owner, jobID, opToken, OperationRepair, err, fmt.Sprintf("修復パッチ適用に失敗しました: %v", err), &meta)
 	}
 	if qKind != query.KindPromQL {
 		nextIR.StampQueryKind(string(qKind))
@@ -921,10 +935,10 @@ func (m *Manager) Repair(ctx context.Context, owner Owner, jobID string, in Repa
 		query.ValidateOptions{RequireCatalogMatch: true},
 	)
 	if err != nil {
-		return m.recordEditFailure(ctx, owner, jobID, opToken, err, fmt.Sprintf("修復後の %s/スコープ検査に失敗しました: %v", adapter.DisplayName(), err), &meta)
+		return m.recordEditFailureWithStage(ctx, owner, jobID, opToken, OperationRepair, err, fmt.Sprintf("修復後の %s/スコープ検査に失敗しました: %v", adapter.DisplayName(), err), &meta)
 	}
 
-	return m.commitRevision(ctx, owner, jobID, opToken, op.CurrentIR.Revision, nextIR, diffs, "構文エラーのパネルを修復しました。変更パネルを再検証してください。", warnings, &meta)
+	return m.commitRevisionWithStage(ctx, owner, jobID, opToken, OperationRepair, op.CurrentIR.Revision, nextIR, diffs, "構文エラーのパネルを修復しました。変更パネルを再検証してください。", warnings, &meta)
 }
 
 // Undo restores the immediately preceding IR revision as a new monotonic revision,
@@ -988,11 +1002,12 @@ func (m *Manager) GetContext(ctx context.Context, owner Owner, jobID string) (Jo
 	return m.store.Get(ctx, owner, jobID, m.storeNow())
 }
 
-func (m *Manager) finishJob(
+func (m *Manager) finishJobWithStage(
 	parentCtx context.Context,
 	owner Owner,
 	jobID string,
 	opToken uint64,
+	operation string,
 	status JobStatus,
 	doc *ir.DashboardIR,
 	diffs []ir.DiffEntry,
@@ -1003,7 +1018,7 @@ func (m *Manager) finishJob(
 ) (JobSnapshot, error) {
 	storeCtx, cancel := detachedStoreContext(parentCtx)
 	defer cancel()
-	return m.store.FinishJob(storeCtx, FinishJobParams{
+	snap, err := m.store.FinishJob(storeCtx, FinishJobParams{
 		Owner:        owner,
 		JobID:        jobID,
 		OpToken:      opToken,
@@ -1017,13 +1032,23 @@ func (m *Manager) finishJob(
 		Now:          m.storeNow(),
 		JobTTL:       m.cfg.JobTTL,
 	})
+	switch {
+	case err == nil && snap.Status != "":
+		m.emitStage(parentCtx, jobID, operation, snap.Status)
+	case errors.Is(err, ErrJobCancelled):
+		m.emitStage(parentCtx, jobID, operation, StatusCancelled)
+	case err != nil:
+		m.emitStage(parentCtx, jobID, operation, StatusFailed)
+	}
+	return snap, err
 }
 
-func (m *Manager) commitRevision(
+func (m *Manager) commitRevisionWithStage(
 	parentCtx context.Context,
 	owner Owner,
 	jobID string,
 	opToken uint64,
+	operation string,
 	expectedRev int,
 	nextIR ir.DashboardIR,
 	diffs []ir.DiffEntry,
@@ -1033,7 +1058,7 @@ func (m *Manager) commitRevision(
 ) (JobSnapshot, error) {
 	storeCtx, cancel := detachedStoreContext(parentCtx)
 	defer cancel()
-	return m.store.CommitRevision(storeCtx, CommitRevisionParams{
+	snap, err := m.store.CommitRevision(storeCtx, CommitRevisionParams{
 		Owner:          owner,
 		JobID:          jobID,
 		OpToken:        opToken,
@@ -1047,19 +1072,31 @@ func (m *Manager) commitRevision(
 		JobTTL:         m.cfg.JobTTL,
 		MaxUndoHistory: defaultMaxUndoHistory,
 	})
+	switch {
+	case err == nil && snap.Status != "":
+		m.emitStage(parentCtx, jobID, operation, snap.Status)
+	case errors.Is(err, ErrJobCancelled):
+		m.emitStage(parentCtx, jobID, operation, StatusCancelled)
+	case err != nil:
+		m.emitStage(parentCtx, jobID, operation, StatusFailed)
+	}
+	return snap, err
 }
 
-func (m *Manager) revertToPreviousOnCancel(parentCtx context.Context, owner Owner, jobID string, opToken uint64) (JobSnapshot, error) {
+func (m *Manager) revertToPreviousOnCancelWithStage(parentCtx context.Context, owner Owner, jobID string, opToken uint64, operation string) (JobSnapshot, error) {
 	storeCtx, cancel := detachedStoreContext(parentCtx)
 	defer cancel()
-	return m.store.RevertOnCancel(storeCtx, owner, jobID, opToken, m.storeNow(), m.cfg.JobTTL)
+	snap, err := m.store.RevertOnCancel(storeCtx, owner, jobID, opToken, m.storeNow(), m.cfg.JobTTL)
+	m.emitStage(parentCtx, jobID, operation, StatusCancelled)
+	return snap, err
 }
 
-func (m *Manager) recordEditFailure(
+func (m *Manager) recordEditFailureWithStage(
 	parentCtx context.Context,
 	owner Owner,
 	jobID string,
 	opToken uint64,
+	operation string,
 	cause error,
 	errMsg string,
 	meta *llm.CompletionMeta,
@@ -1076,8 +1113,14 @@ func (m *Manager) recordEditFailure(
 		JobTTL:       m.cfg.JobTTL,
 	})
 	if storeErr != nil {
+		if errors.Is(storeErr, ErrJobCancelled) {
+			m.emitStage(parentCtx, jobID, operation, StatusCancelled)
+		} else {
+			m.emitStage(parentCtx, jobID, operation, StatusFailed)
+		}
 		return snap, storeErr
 	}
+	m.emitStage(parentCtx, jobID, operation, StatusFailed)
 	if cause != nil {
 		if errMsg == "" || errMsg == cause.Error() {
 			return snap, cause

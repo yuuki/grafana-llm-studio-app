@@ -1,0 +1,98 @@
+name: Security
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+  schedule:
+    # Weekly: new advisories arrive without any change to this repository.
+    - cron: '41 21 * * 1'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  codeql:
+    name: codeql (${{ matrix.language }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      security-events: write # upload the CodeQL results to code scanning
+    strategy:
+      fail-fast: false
+      matrix:
+        # Workflows are audited by zizmor (ci.yml), not by CodeQL's actions language.
+        include:
+          - language: go
+            build-mode: autobuild
+          - language: javascript-typescript
+            build-mode: none
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+
+      - if: matrix.language == 'go'
+        uses: actions/setup-go@v7.1.0
+        with:
+          go-version-file: go.mod
+
+      - uses: github/codeql-action/init@v4.39.3
+        with:
+          languages: ${{ matrix.language }}
+          build-mode: ${{ matrix.build-mode }}
+
+      - uses: github/codeql-action/analyze@v4.39.3
+        with:
+          category: /language:${{ matrix.language }}
+
+  govulncheck:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-go@v7.1.0
+        with:
+          go-version-file: go.mod
+
+      - name: govulncheck
+        run: make vuln
+
+  # Findings go to code scanning instead of failing the job: the lockfile
+  # carries known vulnerabilities, mostly in packages that @grafana/* 12.4 pins
+  # and Grafana provides at runtime, and code scanning tracks those as alerts
+  # while flagging on a pull request only the ones it introduces. Scanner
+  # errors still fail the job.
+  osv-scanner:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      security-events: write # upload the osv-scanner results to code scanning
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+
+      # osv-scanner runs through `go run`.
+      - uses: actions/setup-go@v7.1.0
+        with:
+          go-version-file: go.mod
+
+      - name: osv-scanner (package-lock.json)
+        run: make vuln-deps-sarif
+
+      - name: Upload the results to code scanning
+        uses: github/codeql-action/upload-sarif@v4.39.3
+        with:
+          sarif_file: osv-scanner.sarif
+          category: osv-scanner

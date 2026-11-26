@@ -17,8 +17,8 @@ import (
 	"github.com/yuuki/grafana-llm-studio-app/pkg/ir"
 	"github.com/yuuki/grafana-llm-studio-app/pkg/llm"
 	"github.com/yuuki/grafana-llm-studio-app/pkg/metricsql"
-	"github.com/yuuki/grafana-llm-studio-app/pkg/promql"
 	"github.com/yuuki/grafana-llm-studio-app/pkg/prompt"
+	"github.com/yuuki/grafana-llm-studio-app/pkg/promql"
 	"github.com/yuuki/grafana-llm-studio-app/pkg/query"
 )
 

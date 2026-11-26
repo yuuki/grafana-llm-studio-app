@@ -495,9 +495,6 @@ func (s *walkState) validateMetricExpr(me *vmql.MetricExpr) error {
 					s.seenVars[v.Name] = true
 					s.res.ReferencedVariables = append(s.res.ReferencedVariables, v.Name)
 				}
-				if !branchScopeMatched && query.MatcherSatisfiesScopeWithVariable(qm, v, s.normalizedScope) {
-					branchScopeMatched = true
-				}
 			} else {
 				if qm.Type == query.MatchRegexp || qm.Type == query.MatchNotRegexp {
 					if err := query.ValidateRegexMatcher(qm.Name, qm.Type, qm.Value, s.policy.MaxRegexLength, s.policy.MaxRegexRepeat); err != nil {
@@ -515,7 +512,7 @@ func (s *walkState) validateMetricExpr(me *vmql.MetricExpr) error {
 		}
 
 		if !branchScopeMatched {
-			return fmt.Errorf("%w: selector for %q must retain %s=%q (or an anchored single-value $%s variable)", ErrScopeFilterMissing, branchMetricName, s.normalizedScope.LabelName, s.normalizedScope.LabelValue, s.normalizedScope.LabelName)
+			return fmt.Errorf("%w: selector for %q must retain literal %s=%q", ErrScopeFilterMissing, branchMetricName, s.normalizedScope.LabelName, s.normalizedScope.LabelValue)
 		}
 	}
 

@@ -30,11 +30,14 @@ import {
   ExistingDashboardSummary,
   fetchExistingDashboardByUid,
   ImportConversionReport,
+  ImportPatchContext,
   listExistingDashboards,
 } from '../import/importDashboard';
 import {
   computePanelQueryHash,
   JobSnapshot,
+  JobStageEvent,
+  JobStatus,
   MetricCatalogItem,
   PanelValidationResult,
   PublicConfig,
@@ -73,6 +76,7 @@ interface PreservedImportMeta {
   folderUid?: string;
   preservedAnnotations?: Record<string, string>;
   preservedLabels?: Record<string, string>;
+  patchContext?: ImportPatchContext;
 }
 
 const VALIDATION_BADGE_COLOR: Record<ValidationCategory, 'green' | 'orange' | 'red' | 'blue'> = {
@@ -91,6 +95,17 @@ const VALIDATION_LABEL_KEYS: Record<ValidationCategory, TranslationKey> = {
   permission_error: 'studio.validation.category.permission_error',
   timeout: 'studio.validation.category.timeout',
   datasource_error: 'studio.validation.category.datasource_error',
+};
+
+const STAGE_LABEL_KEYS: Record<JobStatus, TranslationKey> = {
+  generating: 'studio.progress.stage.generating',
+  repairing: 'studio.progress.stage.repairing',
+  validating_ir: 'studio.progress.stage.validating_ir',
+  awaiting_preview: 'studio.progress.stage.awaiting_preview',
+  ready: 'studio.progress.stage.ready',
+  insufficient_metrics: 'studio.progress.stage.insufficient_metrics',
+  cancelled: 'studio.progress.stage.cancelled',
+  failed: 'studio.progress.stage.failed',
 };
 
 const BLOCKING_CATEGORIES = new Set<ValidationCategory>([
@@ -163,8 +178,10 @@ export const StudioPage: React.FC = () => {
   const [editPanelId, setEditPanelId] = useState<string>('');
   const [job, setJob] = useState<JobSnapshot | null>(null);
   const [busyState, setBusyState] = useState<
-    'idle' | 'generating' | 'importing' | 'patching' | 'validating' | 'repairing' | 'undoing' | 'saving'
+    'idle' | 'generating' | 'importing' | 'patching' | 'validating' | 'repairing' | 'undoing' | 'saving' | 'cancelling'
   >('idle');
+  const [liveStage, setLiveStage] = useState<JobStageEvent | null>(null);
+  const [sseFallbackNotice, setSseFallbackNotice] = useState(false);
   const [uiError, setUiError] = useState<string | null>(null);
 
   // Optional safe import state.
@@ -186,10 +203,12 @@ export const StudioPage: React.FC = () => {
   ]);
   const [selectedFolderUid, setSelectedFolderUid] = useState<string>('');
   const [optInUpdateExisting, setOptInUpdateExisting] = useState(false);
+  const [activeImportPatchKey, setActiveImportPatchKey] = useState<string | null>(null);
   const [savedResult, setSavedResult] = useState<SaveDashboardResult | null>(null);
 
   const abortRef = useRef<AbortController | null>(null);
   const metadataAbortRef = useRef<AbortController | null>(null);
+  const inFlightJobIdRef = useRef<string | null>(null);
   const contextSeqRef = useRef<number>(0);
   const jobOpSeqRef = useRef<number>(0);
   const validatedFingerprintsRef = useRef<Map<string, ValidatedPanelCacheEntry>>(new Map());
@@ -222,6 +241,7 @@ export const StudioPage: React.FC = () => {
     abortRef.current = null;
     metadataAbortRef.current?.abort();
     metadataAbortRef.current = null;
+    inFlightJobIdRef.current = null;
     validatedFingerprintsRef.current.clear();
     latestImportMetaRef.current.clear();
     setCatalog([]);
@@ -231,12 +251,15 @@ export const StudioPage: React.FC = () => {
     setScopeLabelValues([]);
     setScopeLabelValue('');
     setJob(null);
+    setLiveStage(null);
+    setSseFallbackNotice(false);
     setShowImportPanel(false);
     setImportUid('');
     setExistingDashboards([]);
     setImportReport(null);
     setSelectedFolderUid('');
     setOptInUpdateExisting(false);
+    setActiveImportPatchKey(null);
     setValidationResults([]);
     setPreviewSpec(null);
     setPreviewScene(null);
@@ -307,6 +330,9 @@ export const StudioPage: React.FC = () => {
       active = false;
       initController.abort();
     };
+    // `t` is left out on purpose: with an i18n instance override (tests) it is a new
+    // function on every render, which would refetch the folders on every render.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [currentOrgId]);
 
   const selectedDatasource = useMemo(
@@ -331,6 +357,8 @@ export const StudioPage: React.FC = () => {
       });
     }
     return opts;
+    // `t` keeps its identity when the language changes; `locale` recomputes the labels.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [folders, selectedFolderUid, t, locale]);
 
   const currentScopeKey = makeScopeKey(selectedDsUid, scopeLabelName, scopeLabelValue);
@@ -435,7 +463,10 @@ export const StudioPage: React.FC = () => {
     jobOpSeqRef.current += 1;
 
     const isPatch = Boolean(job?.currentIR && editPanelId !== '__new__');
+    inFlightJobIdRef.current = isPatch && job?.jobId ? job.jobId : null;
     setBusyState(isPatch ? 'patching' : 'generating');
+    setLiveStage(null);
+    setSseFallbackNotice(false);
     setUiError(null);
     setSavedResult(null);
 
@@ -458,6 +489,24 @@ export const StudioPage: React.FC = () => {
       labelName: scopeLabelName,
       labelValue: scopeLabelValue.trim(),
     };
+    const streamOptions = {
+      enableSse: Boolean(publicCfg?.enableSseProgress),
+      onStage: (ev: JobStageEvent) => {
+        if (controller.signal.aborted || seq !== contextSeqRef.current) {
+          return;
+        }
+        if (ev.jobId) {
+          inFlightJobIdRef.current = ev.jobId;
+        }
+        setLiveStage(ev);
+      },
+      onFallback: () => {
+        if (controller.signal.aborted || seq !== contextSeqRef.current) {
+          return;
+        }
+        setSseFallbackNotice(true);
+      },
+    };
 
     try {
       const nextJob =
@@ -470,7 +519,8 @@ export const StudioPage: React.FC = () => {
                 editIntent: promptText,
                 catalog: narrowedCatalog,
               },
-              controller.signal
+              controller.signal,
+              streamOptions
             )
           : await generateDraft(
               {
@@ -480,7 +530,8 @@ export const StudioPage: React.FC = () => {
                 userIntent: promptText,
                 catalog: narrowedCatalog,
               },
-              controller.signal
+              controller.signal,
+              streamOptions
             );
 
       if (controller.signal.aborted || seq !== contextSeqRef.current) {
@@ -501,6 +552,8 @@ export const StudioPage: React.FC = () => {
       setUiError(extractApiError(err));
     } finally {
       if (abortRef.current === controller && seq === contextSeqRef.current) {
+        inFlightJobIdRef.current = null;
+        setLiveStage(null);
         setBusyState('idle');
       }
     }
@@ -547,16 +600,17 @@ export const StudioPage: React.FC = () => {
       if (controller.signal.aborted || seq !== contextSeqRef.current) {
         return;
       }
-      const { draft, report } = convertGrafanaDashboardToIR(fetched.rawDashboard, {
-        selectedDatasourceUid: selectedDatasource.uid,
-        selectedDatasourceName: selectedDatasource.name,
-        queryKind: activeDialect.kind,
-        maxPanels: publicCfg?.maxPanels ?? 6,
-      });
       const scope: ScopeFilter | undefined =
         isCatalogFresh && scopeLabelValue.trim()
           ? { labelName: scopeLabelName, labelValue: scopeLabelValue.trim() }
           : undefined;
+      const { draft, report, patchContext } = convertGrafanaDashboardToIR(fetched.rawDashboard, {
+        selectedDatasourceUid: selectedDatasource.uid,
+        selectedDatasourceName: selectedDatasource.name,
+        queryKind: activeDialect.kind,
+        maxPanels: publicCfg?.maxPanels ?? 6,
+        scope,
+      });
       const importedJob = await importDraft(
         {
           datasourceUid: selectedDatasource.uid,
@@ -581,15 +635,17 @@ export const StudioPage: React.FC = () => {
       setOptInUpdateExisting(false);
 
       if (importedJob.importSource?.uid) {
-        latestImportMetaRef.current.set(
-          `${importedJob.jobId}:${importedJob.importSource.uid}`,
-          {
-            resourceVersion: importedJob.importSource.resourceVersion,
-            folderUid: importedJob.importSource.folderUid ?? '',
-            preservedAnnotations: fetched.preservedAnnotations,
-            preservedLabels: fetched.preservedLabels,
-          }
-        );
+        const metaKey = `${importedJob.jobId}:${importedJob.importSource.uid}`;
+        latestImportMetaRef.current.set(metaKey, {
+          resourceVersion: importedJob.importSource.resourceVersion,
+          folderUid: importedJob.importSource.folderUid ?? '',
+          preservedAnnotations: fetched.preservedAnnotations,
+          preservedLabels: fetched.preservedLabels,
+          patchContext,
+        });
+        setActiveImportPatchKey(metaKey);
+      } else {
+        setActiveImportPatchKey(null);
       }
       applyJobSnapshot(importedJob);
       setImportReport(report);
@@ -610,28 +666,49 @@ export const StudioPage: React.FC = () => {
 
   const handleCancel = async () => {
     const activeState = busyState;
-    if (activeState === 'idle' || activeState === 'saving') {
+    if (activeState === 'idle' || activeState === 'saving' || activeState === 'cancelling') {
       return;
     }
-    abortRef.current?.abort();
-    setBusyState('idle');
+    const cancelTargetJobId =
+      activeState === 'generating'
+        ? inFlightJobIdRef.current
+        : activeState === 'patching' || activeState === 'repairing'
+        ? inFlightJobIdRef.current || job?.jobId || null
+        : null;
 
-    // Only notify Backend cancel when an LLM backend operation on an existing job was in-flight (M-11).
-    if (
-      (activeState === 'patching' || activeState === 'repairing') &&
-      job?.jobId
-    ) {
+    abortRef.current?.abort();
+    inFlightJobIdRef.current = null;
+    setLiveStage(null);
+
+    // Notify Backend cancel when an LLM backend job ID is known (patching, repairing, or SSE-started generating).
+    // Keep busyState='cancelling' until cancel settles so a new Patch/Repair cannot be killed by a delayed Cancel (H-3).
+    if (cancelTargetJobId) {
       const seq = contextSeqRef.current;
       const opSeq = ++jobOpSeqRef.current;
+      const cancelController = new AbortController();
+      abortRef.current = cancelController;
+      const timer = setTimeout(() => cancelController.abort(), 5000);
+      setBusyState('cancelling');
       try {
-        const updated = await cancelDraftJob(job.jobId);
+        const updated = await cancelDraftJob(cancelTargetJobId, cancelController.signal);
         if (seq === contextSeqRef.current && opSeq === jobOpSeqRef.current) {
           applyJobSnapshot(updated);
         }
       } catch {
         // Ignore cancel race errors if job already completed.
+      } finally {
+        clearTimeout(timer);
+        if (
+          abortRef.current === cancelController &&
+          seq === contextSeqRef.current &&
+          opSeq === jobOpSeqRef.current
+        ) {
+          setBusyState('idle');
+        }
       }
+      return;
     }
+    setBusyState('idle');
   };
 
   const handleUndo = async () => {
@@ -685,6 +762,7 @@ export const StudioPage: React.FC = () => {
     const controller = new AbortController();
     abortRef.current = controller;
     const seq = contextSeqRef.current;
+    jobOpSeqRef.current += 1;
     const targetJobId = job.jobId;
     const targetRevision = job.currentIR.revision;
 
@@ -695,7 +773,8 @@ export const StudioPage: React.FC = () => {
       const normalized = normalizeDashboardIR(
         job.currentIR,
         selectedDatasource,
-        publicCfg?.maxPanels ?? 6
+        publicCfg?.maxPanels ?? 6,
+        job.scope
       );
       const varsFingerprint = computeVariablesFingerprint(normalized);
 
@@ -810,7 +889,10 @@ export const StudioPage: React.FC = () => {
     const seq = contextSeqRef.current;
     jobOpSeqRef.current += 1;
 
+    inFlightJobIdRef.current = job.jobId;
     setBusyState('repairing');
+    setLiveStage(null);
+    setSseFallbackNotice(false);
     setUiError(null);
 
     try {
@@ -825,7 +907,25 @@ export const StudioPage: React.FC = () => {
           results: syntaxErrors,
           catalog: narrowedCatalog,
         },
-        controller.signal
+        controller.signal,
+        {
+          enableSse: Boolean(publicCfg?.enableSseProgress),
+          onStage: (ev: JobStageEvent) => {
+            if (controller.signal.aborted || seq !== contextSeqRef.current) {
+              return;
+            }
+            if (ev.jobId) {
+              inFlightJobIdRef.current = ev.jobId;
+            }
+            setLiveStage(ev);
+          },
+          onFallback: () => {
+            if (controller.signal.aborted || seq !== contextSeqRef.current) {
+              return;
+            }
+            setSseFallbackNotice(true);
+          },
+        }
       );
       if (!controller.signal.aborted && seq === contextSeqRef.current) {
         applyJobSnapshot(updated);
@@ -845,13 +945,22 @@ export const StudioPage: React.FC = () => {
       }
     } finally {
       if (abortRef.current === controller && seq === contextSeqRef.current) {
+        inFlightJobIdRef.current = null;
+        setLiveStage(null);
         setBusyState('idle');
       }
     }
   };
 
+  const activeImportKey = job?.importSource?.uid
+    ? `${job.jobId}:${job.importSource.uid}`
+    : '';
+
   const canOptInUpdate = Boolean(
-    job?.importSource?.uid && job?.importSource?.resourceVersion
+    job?.importSource?.uid &&
+      job?.importSource?.resourceVersion &&
+      activeImportPatchKey !== null &&
+      activeImportPatchKey === activeImportKey
   );
 
   const handleSaveDashboard = async () => {
@@ -869,6 +978,7 @@ export const StudioPage: React.FC = () => {
     }
 
     const seq = contextSeqRef.current;
+    jobOpSeqRef.current += 1;
     setBusyState('saving');
     setUiError(null);
     setSavedResult(null);
@@ -877,24 +987,28 @@ export const StudioPage: React.FC = () => {
       const currentSpec = normalizeDashboardIR(
         job.currentIR,
         selectedDatasource,
-        publicCfg?.maxPanels ?? 6
+        publicCfg?.maxPanels ?? 6,
+        job.scope
       );
-      const useUpdate =
-        optInUpdateExisting &&
-        Boolean(job.importSource?.uid) &&
-        Boolean(job.importSource?.resourceVersion);
-
       const importMetaKey = job.importSource?.uid
         ? `${job.jobId}:${job.importSource.uid}`
         : '';
       const preservedMeta = importMetaKey
         ? latestImportMetaRef.current.get(importMetaKey)
         : undefined;
+      const useUpdate =
+        optInUpdateExisting &&
+        Boolean(job.importSource?.uid) &&
+        Boolean(job.importSource?.resourceVersion) &&
+        Boolean(preservedMeta?.patchContext);
+
       const updateFolderUid = job.importSource?.folderUid ?? preservedMeta?.folderUid ?? '';
 
       const res = useUpdate
         ? await saverRef.current.updateExistingDashboard({
             spec: currentSpec,
+            currentIR: job.currentIR,
+            patchContext: preservedMeta!.patchContext!,
             previewedRevision: previewMeta.revision,
             targetUid: job.importSource!.uid,
             expectedResourceVersion:
@@ -950,7 +1064,8 @@ export const StudioPage: React.FC = () => {
       const spec = normalizeDashboardIR(
         job.currentIR,
         selectedDatasource,
-        publicCfg?.maxPanels ?? 6
+        publicCfg?.maxPanels ?? 6,
+        job.scope
       );
       const json = buildExportableDashboardJson(spec);
       const blob = new Blob([json], { type: 'application/json' });
@@ -965,21 +1080,20 @@ export const StudioPage: React.FC = () => {
     }
   };
 
+  const currentIR = job?.currentIR;
+  const jobScope = job?.scope;
+  const maxPanels = publicCfg?.maxPanels ?? 6;
   const foundationJsonPreview = useMemo(() => {
-    if (!job?.currentIR || !selectedDatasource) {
+    if (!currentIR || !selectedDatasource) {
       return '';
     }
     try {
-      const spec = normalizeDashboardIR(
-        job.currentIR,
-        selectedDatasource,
-        publicCfg?.maxPanels ?? 6
-      );
+      const spec = normalizeDashboardIR(currentIR, selectedDatasource, maxPanels, jobScope);
       return buildExportableDashboardJson(spec);
     } catch {
       return '';
     }
-  }, [job?.currentIR, selectedDatasource, publicCfg?.maxPanels]);
+  }, [currentIR, jobScope, selectedDatasource, maxPanels]);
 
   const canSave =
     Boolean(previewSpec) &&
@@ -1253,6 +1367,36 @@ export const StudioPage: React.FC = () => {
               </Button>
             )}
           </div>
+
+          {liveStage && (busyState === 'generating' || busyState === 'patching' || busyState === 'repairing') && (
+            <div
+              data-testid="studio-sse-progress"
+              style={{
+                display: 'flex',
+                alignItems: 'center',
+                gap: 8,
+                fontSize: 12,
+                padding: '6px 8px',
+                border: '1px solid #2c3235',
+                borderRadius: 4,
+              }}
+            >
+              <Spinner inline />
+              <span>{t('studio.progress.label')}</span>
+              <Badge text={liveStage.stage} color="blue" />
+              <span style={{ color: '#9fa7b3' }}>
+                {Object.prototype.hasOwnProperty.call(STAGE_LABEL_KEYS, liveStage.stage)
+                  ? t(STAGE_LABEL_KEYS[liveStage.stage])
+                  : liveStage.stage}
+              </span>
+            </div>
+          )}
+
+          {sseFallbackNotice && (
+            <div data-testid="studio-sse-fallback-notice" style={{ fontSize: 11, color: '#9fa7b3' }}>
+              {t('studio.progress.fallbackNotice')}
+            </div>
+          )}
 
           {job && (
             <div

@@ -1,0 +1,29 @@
+# Configuration for cccc, the Cognitive / Cyclomatic Complexity analyzer.
+# https://github.com/moznion/cccc
+#
+# Local run (the target paths are command-line only):
+#   cccc --table src pkg cmd
+#   cccc --top-cognitive 20 --table src pkg cmd
+#
+# CI runs the same command through moznion/cccc-action
+# (.github/workflows/complexity.yml) and picks this file up automatically.
+
+# Measure production code only; tests and test scaffolding are left out.
+exclude = [
+  "*.test.ts",
+  "*.test.tsx",
+  "*_test.go",
+  "**/__mocks__/**",
+]
+
+# No max-cognitive / max-cyclomatic limits yet: complexity is tracked as a
+# trend first. The Complexity workflow reports cccc's summary per component to
+# octocov (.octocov.complexity.yml), which comments the before/after values on
+# pull requests and keeps a report per push to main. Once the first report on
+# main shows today's worst functions, set both limits to those values, so that
+# they stop only new extreme outliers:
+#
+#   max-cognitive  = <worst cognitive today>
+#   max-cyclomatic = <worst cyclomatic today>
+#
+# Change them deliberately afterwards, not as part of an unrelated refactor.
