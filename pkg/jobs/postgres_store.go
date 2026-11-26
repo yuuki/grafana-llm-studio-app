@@ -340,12 +340,31 @@ func buildPostgresPoolConfig(cfg PostgresConfig) (*pgxpool.Config, error) {
 		sslMode = DefaultPostgresSSLMode
 	}
 
+	// Select sslmode from a closed switch of constant literals so no caller-controlled string
+	// is ever interpolated into the DSN passed to pgxpool.ParseConfig.
+	var sslModeParam string
+	switch sslMode {
+	case PostgresSSLModeDisable:
+		sslModeParam = "disable"
+	case PostgresSSLModePrefer:
+		sslModeParam = "prefer"
+	case PostgresSSLModeRequire:
+		sslModeParam = "require"
+	case PostgresSSLModeVerifyCA:
+		sslModeParam = "verify-ca"
+	case PostgresSSLModeVerifyFull:
+		sslModeParam = "verify-full"
+	default:
+		return nil, fmt.Errorf("unsupported postgresSslMode %q", sslMode)
+	}
+
 	// Pass explicit neutral values for every env-backed key parsed by pgconn.parseEnvSettings()
-	// so ambient PGHOST/PGPORT/PGSSLMODE/PGSSLROOTCERT/PGTARGETSESSIONATTRS/PGCONNECT_TIMEOUT/etc.
+	// so ambient PGHOST/PGPORT/PGSSLMODE/PGSSLROOTCERT/PGSSLCERTMODE/PGTARGETSESSIONATTRS/etc.
 	// can never fail startup or hijack plugin connections.
-	const neutralBaseDSN = "host=127.0.0.1 port=5432 user=x password=x dbname=x " +
-		"sslmode=disable sslcert='' sslkey='' sslrootcert='' sslpassword='' sslsni=1 " +
-		"sslnegotiation=postgres connect_timeout=5 target_session_attrs=any passfile=/dev/null"
+	neutralBaseDSN := "host=127.0.0.1 port=5432 user=x password=x dbname=x " +
+		"sslmode=" + sslModeParam + " sslcert='' sslkey='' sslrootcert='' sslcertmode=disable " +
+		"sslpassword='' sslsni=1 sslnegotiation=postgres connect_timeout=5 " +
+		"target_session_attrs=any passfile=/dev/null"
 	poolCfg, err := pgxpool.ParseConfig(neutralBaseDSN)
 	if err != nil {
 		return nil, err
@@ -385,45 +404,26 @@ func buildPostgresPoolConfig(cfg PostgresConfig) (*pgxpool.Config, error) {
 		"application_name": "yuuki-llmstudio-app",
 		"lock_timeout":     "5000",
 	}
-	cc.TLSConfig = nil
-	cc.Fallbacks = nil
 
 	// Send TLS SNI when connecting by DNS hostname (required by managed Postgres / SNI proxies
-	// such as Neon, RDS Proxy, Azure Flexible Server, and HAProxy). Setting ServerName with
-	// InsecureSkipVerify=true emits SNI without enabling hostname verification.
+	// such as Neon, RDS Proxy, Azure Flexible Server, and HAProxy).
 	sniHost := ""
 	if net.ParseIP(host) == nil {
 		sniHost = host
 	}
 
-	switch sslMode {
-	case PostgresSSLModeDisable:
-		cc.TLSConfig = nil
-	case PostgresSSLModePrefer:
-		cc.TLSConfig = &tls.Config{
-			ServerName:         sniHost,
-			InsecureSkipVerify: true, //nolint:gosec // G402: matches libpq sslmode=prefer (encrypt if available without CA check)
-			MinVersion:         tls.VersionTLS12,
+	if cc.TLSConfig != nil {
+		cc.TLSConfig.MinVersion = tls.VersionTLS12
+		if sslMode == PostgresSSLModeVerifyFull {
+			cc.TLSConfig.ServerName = host
+		} else {
+			cc.TLSConfig.ServerName = sniHost
 		}
-		cc.Fallbacks = []*pgconn.FallbackConfig{
-			{
-				Host:      host,
-				Port:      uint16(portNum),
-				TLSConfig: nil,
-			},
-		}
-	case PostgresSSLModeRequire:
-		cc.TLSConfig = &tls.Config{
-			ServerName:         sniHost,
-			InsecureSkipVerify: true, //nolint:gosec // G402: matches libpq sslmode=require (require TLS 1.2+ transport encryption)
-			MinVersion:         tls.VersionTLS12,
-		}
-	case PostgresSSLModeVerifyCA:
-		cc.TLSConfig = &tls.Config{
-			ServerName:         sniHost,
-			InsecureSkipVerify: true, //nolint:gosec // G402: libpq sslmode=verify-ca skips hostname check intentionally; CA chain verified in VerifyConnection
-			MinVersion:         tls.VersionTLS12,
-			VerifyConnection: func(cs tls.ConnectionState) error {
+		if sslMode == PostgresSSLModeVerifyCA {
+			// Upgrade pgconn's VerifyPeerCertificate callback to VerifyConnection so resumed TLS
+			// sessions also re-verify the server certificate chain against the system root CAs.
+			cc.TLSConfig.VerifyPeerCertificate = nil
+			cc.TLSConfig.VerifyConnection = func(cs tls.ConnectionState) error {
 				if len(cs.PeerCertificates) == 0 {
 					return errors.New("server presented no TLS certificates")
 				}
@@ -435,12 +435,14 @@ func buildPostgresPoolConfig(cfg PostgresConfig) (*pgxpool.Config, error) {
 				}
 				_, verifyErr := cs.PeerCertificates[0].Verify(opts)
 				return verifyErr
-			},
+			}
 		}
-	case PostgresSSLModeVerifyFull:
-		cc.TLSConfig = &tls.Config{
-			ServerName: host,
-			MinVersion: tls.VersionTLS12,
+	}
+	for _, fb := range cc.Fallbacks {
+		fb.Host = host
+		fb.Port = uint16(portNum)
+		if fb.TLSConfig != nil {
+			fb.TLSConfig.MinVersion = tls.VersionTLS12
 		}
 	}
 
