@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.0-rc.1] - 2026-11-26
+
 ### Added
 - Multi-architecture Go backend cross-compilation (`linux/amd64`, `linux/arm64`, `darwin/amd64`, `darwin/arm64`, `windows/amd64`) with embedded `grafana-plugin-sdk-go` build metadata.
 - Automated GitHub Actions release workflow (`.github/workflows/release.yml`) triggered on `v*` version tags and manual `workflow_dispatch` runs, packaging `yuuki-llmstudio-app-<version>.zip`, `yuuki-llmstudio-app-<version>.tar.gz`, `yuuki-llmstudio-app-<version>.zip.sha1`, `SHA256SUMS`, and an optional offline air-gapped bundle (`yuuki-llmstudio-app-<version>-airgap.tar.gz`).
