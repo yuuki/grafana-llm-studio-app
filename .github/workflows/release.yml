@@ -186,7 +186,7 @@ jobs:
     name: Sign, Package & Verify Release Artifacts
     needs: [verify, build-backend]
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 25
     outputs:
       signed: ${{ steps.pkg.outputs.signed }}
       signature_type: ${{ steps.pkg.outputs.signature_type }}
@@ -292,6 +292,7 @@ jobs:
       - name: Run Grafana Plugin Validator (informational catalog readiness check)
         if: github.event_name != 'workflow_dispatch' || inputs.run_plugin_validator != false
         continue-on-error: true
+        timeout-minutes: 5
         env:
           RELEASE_VERSION: ${{ needs.verify.outputs.version }}
         run: |
