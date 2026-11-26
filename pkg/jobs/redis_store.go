@@ -76,7 +76,12 @@ func ValidateRedisAddr(addr string) error {
 	if host == "" {
 		return fmt.Errorf("invalid redisAddr %q: host is empty", trimmed)
 	}
-	if net.ParseIP(host) == nil {
+	if strings.HasPrefix(trimmed, "[") {
+		ip := net.ParseIP(host)
+		if ip == nil || !strings.Contains(host, ":") {
+			return fmt.Errorf("invalid redisAddr %q: bracketed host must be a valid IPv6 literal", trimmed)
+		}
+	} else if net.ParseIP(host) == nil {
 		if !validRedisHostnameRe.MatchString(host) || strings.Contains(host, "..") {
 			return fmt.Errorf("invalid redisAddr %q: invalid hostname %q", trimmed, host)
 		}

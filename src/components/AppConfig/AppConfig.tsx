@@ -16,6 +16,9 @@ import { extractApiError } from '../../api/studioClient';
 import { useStudioTranslation } from '../../i18n';
 import { QueryKind } from '../../ir/types';
 
+export type JobStoreBackend = 'memory' | 'redis' | 'postgres';
+export type PostgresSslMode = 'disable' | 'prefer' | 'require' | 'verify-ca' | 'verify-full';
+
 export interface StudioJsonData {
   allowedDatasourceUids?: string[];
   datasourceDialects?: Record<string, QueryKind>;
@@ -35,21 +38,142 @@ export interface StudioJsonData {
   validationTimeoutSeconds?: number;
   maxConcurrentQueries?: number;
   enableSseProgress?: boolean;
-  jobStoreBackend?: 'memory' | 'redis';
+  jobStoreBackend?: JobStoreBackend;
   jobTtlMinutes?: number;
   redisAddr?: string;
   redisDb?: number;
   redisKeyPrefix?: string;
   redisTls?: boolean;
   redisUsername?: string;
+  postgresAddr?: string;
+  postgresDatabase?: string;
+  postgresSchema?: string;
+  postgresTablePrefix?: string;
+  postgresUsername?: string;
+  postgresSslMode?: PostgresSslMode;
 }
 
 const REDIS_KEY_PREFIX_RE = /^[a-zA-Z0-9:_-]{1,64}$/;
 const REDIS_PORT_RE = /^[1-9]\d{0,4}$/;
 const REDIS_HOSTNAME_RE = /^[a-zA-Z0-9](?:[a-zA-Z0-9.-]*[a-zA-Z0-9])?$/;
-const REDIS_IPV6_HOST_RE = /^[0-9a-fA-F:]+$/;
+const IPV6_HEXTET_RE = /^[0-9a-fA-F]{1,4}$/;
+const IPV4_OCTET_RE = /^(?:0|[1-9]\d{0,2})$/;
+const POSTGRES_SCHEMA_RE = /^[a-z_][a-z0-9_]{0,62}$/;
+const POSTGRES_TABLE_PREFIX_RE = /^[a-z_][a-z0-9_]{0,31}$/;
+const ALLOWED_POSTGRES_SSL_MODES: ReadonlySet<string> = new Set([
+  'disable',
+  'prefer',
+  'require',
+  'verify-ca',
+  'verify-full',
+]);
 export const BOUND_REDIS_PASSWORD_PREFIX = 'llmstudio-redis-bound-v1:';
+export const BOUND_POSTGRES_PASSWORD_PREFIX = 'llmstudio-postgres-bound-v1:';
 export const BOUND_GRAFANA_TOKEN_PREFIX = 'llmstudio-grafana-bound-v1:';
+
+function utf8ByteLength(raw: string): number {
+  if (typeof TextEncoder !== 'undefined') {
+    return new TextEncoder().encode(raw).length;
+  }
+  let bytes = 0;
+  for (let i = 0; i < raw.length; i++) {
+    const code = raw.charCodeAt(i);
+    if (code <= 0x7f) {
+      bytes += 1;
+    } else if (code <= 0x7ff) {
+      bytes += 2;
+    } else if (code >= 0xd800 && code <= 0xdbff && i + 1 < raw.length) {
+      bytes += 4;
+      i++;
+    } else {
+      bytes += 3;
+    }
+  }
+  return bytes;
+}
+
+function hasForbiddenTextChar(raw: string, disallowSpace: boolean): boolean {
+  for (let i = 0; i < raw.length; i++) {
+    const code = raw.charCodeAt(i);
+    if (code < 0x20 || code === 0x7f || (code >= 0x80 && code <= 0x9f) || code === 0xfeff) {
+      return true;
+    }
+    if (disallowSpace && (code === 0x20 || code === 0x09 || code === 0x0a || code === 0x0d)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function isValidIpv4Literal(raw: string): boolean {
+  const parts = raw.split('.');
+  if (parts.length !== 4) {
+    return false;
+  }
+  for (const p of parts) {
+    if (!IPV4_OCTET_RE.test(p)) {
+      return false;
+    }
+    const n = Number(p);
+    if (n < 0 || n > 255) {
+      return false;
+    }
+  }
+  return true;
+}
+
+function isValidIpv6Literal(host: string): boolean {
+  if (!host || !host.includes(':')) {
+    return false;
+  }
+  // Reject triple colon or more than one "::" compression marker.
+  if (host.includes(':::')) {
+    return false;
+  }
+  const doubleColonParts = host.split('::');
+  if (doubleColonParts.length > 2) {
+    return false;
+  }
+  const hasCompression = doubleColonParts.length === 2;
+
+  const parseSide = (side: string, allowTrailingIpv4: boolean): number | null => {
+    if (side === '') {
+      return 0;
+    }
+    const groups = side.split(':');
+    let count = 0;
+    for (let i = 0; i < groups.length; i++) {
+      const g = groups[i];
+      if (g === '') {
+        return null;
+      }
+      if (allowTrailingIpv4 && i === groups.length - 1 && g.includes('.')) {
+        if (!isValidIpv4Literal(g)) {
+          return null;
+        }
+        count += 2;
+      } else if (IPV6_HEXTET_RE.test(g)) {
+        count += 1;
+      } else {
+        return null;
+      }
+    }
+    return count;
+  };
+
+  if (hasCompression) {
+    const leftCount = parseSide(doubleColonParts[0], false);
+    const rightCount = parseSide(doubleColonParts[1], true);
+    if (leftCount === null || rightCount === null) {
+      return false;
+    }
+    // "::" must replace at least one 16-bit group.
+    return leftCount + rightCount < 8;
+  }
+
+  const totalCount = parseSide(host, true);
+  return totalCount === 8;
+}
 
 function parseNumberInput(raw: string): number {
   const trimmed = raw.trim();
@@ -110,6 +234,21 @@ export function encodeBoundRedisPassword(addr: string, tls: boolean, password: s
   );
 }
 
+export function encodeBoundPostgresPassword(
+  addr: string,
+  sslMode: PostgresSslMode,
+  password: string
+): string {
+  return (
+    BOUND_POSTGRES_PASSWORD_PREFIX +
+    JSON.stringify({
+      addr: addr.trim(),
+      sslMode,
+      password,
+    })
+  );
+}
+
 export function encodeBoundGrafanaToken(grafanaUrl: string, token: string): string {
   return (
     BOUND_GRAFANA_TOKEN_PREFIX +
@@ -141,8 +280,7 @@ export function isValidRedisHostPort(raw: string): boolean {
     }
     host = addr.slice(1, closeIdx);
     portStr = addr.slice(closeIdx + 2);
-    // Bracketed host must be a plausible IPv6 literal containing at least one colon.
-    if (!host.includes(':') || !REDIS_IPV6_HOST_RE.test(host)) {
+    if (!isValidIpv6Literal(host)) {
       return false;
     }
   } else {
@@ -173,31 +311,52 @@ export const AppConfig: React.FC<PluginConfigPageProps<AppPluginMeta<StudioJsonD
   const { t } = useStudioTranslation();
   const { enabled, pinned, jsonData, secureJsonFields } = plugin.meta;
 
+  // Track the latest saved jsonData snapshot locally so multiple saves without a page reload
+  // never revert or wipe previously saved fields for inactive job store backends.
+  const [savedJsonData, setSavedJsonData] = useState<StudioJsonData>(() => ({ ...(jsonData ?? {}) }));
+
   const [allowedDsText, setAllowedDsText] = useState((jsonData?.allowedDatasourceUids ?? []).join(', '));
   const [datasourceDialects, setDatasourceDialects] = useState<Record<string, QueryKind | ''>>(() => {
     const init: Record<string, QueryKind | ''> = {};
     if (jsonData?.datasourceDialects) {
-      for (const [uid, kind] of Object.entries(jsonData.datasourceDialects)) {
-        if (uid.trim() && (kind === 'promql' || kind === 'metricsql')) {
-          init[uid.trim()] = kind;
+      for (const [uid, rawKind] of Object.entries(jsonData.datasourceDialects)) {
+        const normalizedKind = String(rawKind ?? '')
+          .trim()
+          .toLowerCase();
+        if (uid.trim() && (normalizedKind === 'promql' || normalizedKind === 'metricsql')) {
+          init[uid.trim()] = normalizedKind;
         }
       }
     }
     return init;
   });
-  const [llmMode, setLlmMode] = useState<'grafana-llm-app' | 'mock'>(jsonData?.llmMode ?? 'grafana-llm-app');
+  const [llmMode, setLlmMode] = useState<'grafana-llm-app' | 'mock'>(
+    jsonData?.llmMode === 'mock' ? 'mock' : 'grafana-llm-app'
+  );
   const [allowMockInDev, setAllowMockInDev] = useState(Boolean(jsonData?.allowMockInDev));
   // Default empty so the Go backend uses Grafana's trusted AppURL automatically without hardcoding localhost:3000.
   const [grafanaUrl, setGrafanaUrl] = useState(jsonData?.grafanaUrl ?? '');
   const [savedGrafanaUrl, setSavedGrafanaUrl] = useState((jsonData?.grafanaUrl ?? '').trim());
-  const [modelTier, setModelTier] = useState<'base' | 'large'>(jsonData?.modelTier ?? 'base');
-  const [structuredOutputMode, setStructuredOutputMode] = useState<'json_schema' | 'json_object'>(
-    jsonData?.structuredOutputMode ?? 'json_schema'
+  const [modelTier, setModelTier] = useState<'base' | 'large'>(
+    jsonData?.modelTier === 'large' ? 'large' : 'base'
   );
-  const [tokenLimitField, setTokenLimitField] = useState<'max_completion_tokens' | 'max_tokens'>(
-    jsonData?.tokenLimitField ?? 'max_completion_tokens'
+  const [structuredOutputMode, setStructuredOutputMode] = useState<'json_schema' | 'json_object'>(() => {
+    const normalized = String(jsonData?.structuredOutputMode ?? '')
+      .trim()
+      .toLowerCase();
+    return normalized === 'json_object' ? 'json_object' : 'json_schema';
+  });
+  const [tokenLimitField, setTokenLimitField] = useState<'max_completion_tokens' | 'max_tokens'>(() => {
+    const normalized = String(jsonData?.tokenLimitField ?? '')
+      .trim()
+      .toLowerCase();
+    return normalized === 'max_tokens' ? 'max_tokens' : 'max_completion_tokens';
+  });
+  const [reasoningEffort, setReasoningEffort] = useState(() =>
+    String(jsonData?.reasoningEffort ?? '')
+      .trim()
+      .toLowerCase()
   );
-  const [reasoningEffort, setReasoningEffort] = useState(jsonData?.reasoningEffort ?? '');
   const [maxPanels, setMaxPanels] = useState(jsonData?.maxPanels ?? 6);
   const [maxRepairAttempts, setMaxRepairAttempts] = useState(jsonData?.maxRepairAttempts ?? 2);
   const [maxOutputTokens, setMaxOutputTokens] = useState(jsonData?.maxOutputTokens ?? 2048);
@@ -212,9 +371,18 @@ export const AppConfig: React.FC<PluginConfigPageProps<AppPluginMeta<StudioJsonD
   );
   const [enableSseProgress, setEnableSseProgress] = useState(Boolean(jsonData?.enableSseProgress));
 
-  const [jobStoreBackend, setJobStoreBackend] = useState<'memory' | 'redis'>(
-    jsonData?.jobStoreBackend === 'redis' ? 'redis' : 'memory'
-  );
+  const [jobStoreBackend, setJobStoreBackend] = useState<JobStoreBackend>(() => {
+    const normalized = String(jsonData?.jobStoreBackend ?? '')
+      .trim()
+      .toLowerCase();
+    if (normalized === 'redis') {
+      return 'redis';
+    }
+    if (normalized === 'postgres') {
+      return 'postgres';
+    }
+    return 'memory';
+  });
   const [jobTtlMinutes, setJobTtlMinutes] = useState(jsonData?.jobTtlMinutes ?? 30);
   const [redisAddr, setRedisAddr] = useState(jsonData?.redisAddr ?? '');
   const [savedRedisAddr, setSavedRedisAddr] = useState((jsonData?.redisAddr ?? '').trim());
@@ -224,22 +392,67 @@ export const AppConfig: React.FC<PluginConfigPageProps<AppPluginMeta<StudioJsonD
   const [savedRedisTls, setSavedRedisTls] = useState(Boolean(jsonData?.redisTls));
   const [redisUsername, setRedisUsername] = useState(jsonData?.redisUsername ?? '');
 
+  const initialPostgresSslMode = (() => {
+    const normalized = String(jsonData?.postgresSslMode ?? '')
+      .trim()
+      .toLowerCase();
+    return ALLOWED_POSTGRES_SSL_MODES.has(normalized) ? (normalized as PostgresSslMode) : 'prefer';
+  })();
+  const [postgresAddr, setPostgresAddr] = useState(jsonData?.postgresAddr ?? '');
+  const [savedPostgresAddr, setSavedPostgresAddr] = useState((jsonData?.postgresAddr ?? '').trim());
+  const [postgresDatabase, setPostgresDatabase] = useState(jsonData?.postgresDatabase ?? '');
+  const [postgresSchema, setPostgresSchema] = useState(jsonData?.postgresSchema ?? 'public');
+  const [postgresTablePrefix, setPostgresTablePrefix] = useState(
+    jsonData?.postgresTablePrefix ?? 'llm_studio_'
+  );
+  const [postgresUsername, setPostgresUsername] = useState(jsonData?.postgresUsername ?? '');
+  const [postgresSslMode, setPostgresSslMode] = useState<PostgresSslMode>(initialPostgresSslMode);
+  const [savedPostgresSslMode, setSavedPostgresSslMode] = useState<PostgresSslMode>(initialPostgresSslMode);
+
   const [isTokenConfigured, setIsTokenConfigured] = useState(
     Boolean(secureJsonFields?.llmServiceAccountToken)
   );
   const [wasTokenReset, setWasTokenReset] = useState(false);
   const [llmServiceAccountToken, setLlmServiceAccountToken] = useState('');
 
+  const [savedRedisPasswordConfigured, setSavedRedisPasswordConfigured] = useState(
+    Boolean(secureJsonFields?.redisPassword)
+  );
   const [isRedisPasswordConfigured, setIsRedisPasswordConfigured] = useState(
     Boolean(secureJsonFields?.redisPassword)
   );
   const [wasRedisPasswordReset, setWasRedisPasswordReset] = useState(false);
   const [redisPassword, setRedisPassword] = useState('');
 
+  const [savedPostgresPasswordConfigured, setSavedPostgresPasswordConfigured] = useState(
+    Boolean(secureJsonFields?.postgresPassword)
+  );
+  const [isPostgresPasswordConfigured, setIsPostgresPasswordConfigured] = useState(
+    Boolean(secureJsonFields?.postgresPassword)
+  );
+  const [wasPostgresPasswordReset, setWasPostgresPasswordReset] = useState(false);
+  const [postgresPassword, setPostgresPassword] = useState('');
+
   const [saving, setSaving] = useState(false);
   const [statusMessage, setStatusMessage] = useState<{ severity: 'success' | 'error'; text: string } | null>(
     null
   );
+
+  // Switching away from a backend discards unsaved secret edits/reset flags for the hidden backend
+  // so switching back later never silently clears a password still stored on the server.
+  const handleJobStoreBackendChange = (nextBackend: JobStoreBackend) => {
+    if (nextBackend !== 'redis') {
+      setRedisPassword('');
+      setWasRedisPasswordReset(false);
+      setIsRedisPasswordConfigured(savedRedisPasswordConfigured);
+    }
+    if (nextBackend !== 'postgres') {
+      setPostgresPassword('');
+      setWasPostgresPasswordReset(false);
+      setIsPostgresPasswordConfigured(savedPostgresPasswordConfigured);
+    }
+    setJobStoreBackend(nextBackend);
+  };
 
   const parsedAllowedUids = Array.from(
     new Set(
@@ -291,7 +504,7 @@ export const AppConfig: React.FC<PluginConfigPageProps<AppPluginMeta<StudioJsonD
       if (trimmedPrefix && !REDIS_KEY_PREFIX_RE.test(trimmedPrefix)) {
         return t('appConfig.validation.redisKeyPrefixInvalid');
       }
-      if (redisUsername.trim().length > 128) {
+      if (utf8ByteLength(redisUsername.trim()) > 128) {
         return t('appConfig.validation.redisUsernameTooLong');
       }
       if (
@@ -300,6 +513,42 @@ export const AppConfig: React.FC<PluginConfigPageProps<AppPluginMeta<StudioJsonD
           redisTls !== savedRedisTls)
       ) {
         return t('appConfig.validation.redisPasswordReentryRequired');
+      }
+    }
+    if (jobStoreBackend === 'postgres') {
+      if (!isValidRedisHostPort(postgresAddr)) {
+        return t('appConfig.validation.postgresAddrRequired');
+      }
+      const trimmedDb = postgresDatabase.trim();
+      if (!trimmedDb || utf8ByteLength(trimmedDb) > 63 || hasForbiddenTextChar(trimmedDb, true)) {
+        return t('appConfig.validation.postgresDatabaseRequired');
+      }
+      const trimmedUser = postgresUsername.trim();
+      if (!trimmedUser || utf8ByteLength(trimmedUser) > 128 || hasForbiddenTextChar(trimmedUser, false)) {
+        return t('appConfig.validation.postgresUsernameRequired');
+      }
+      const trimmedSchema = postgresSchema.trim();
+      if (
+        trimmedSchema &&
+        (!POSTGRES_SCHEMA_RE.test(trimmedSchema) ||
+          trimmedSchema.startsWith('pg_') ||
+          trimmedSchema === 'information_schema')
+      ) {
+        return t('appConfig.validation.postgresSchemaInvalid');
+      }
+      const trimmedTablePrefix = postgresTablePrefix.trim();
+      if (trimmedTablePrefix && !POSTGRES_TABLE_PREFIX_RE.test(trimmedTablePrefix)) {
+        return t('appConfig.validation.postgresTablePrefixInvalid');
+      }
+      if (!ALLOWED_POSTGRES_SSL_MODES.has(postgresSslMode)) {
+        return t('appConfig.validation.postgresSslModeInvalid');
+      }
+      if (
+        isPostgresPasswordConfigured &&
+        (canonicalRedisAddrForCompare(postgresAddr) !== canonicalRedisAddrForCompare(savedPostgresAddr) ||
+          postgresSslMode !== savedPostgresSslMode)
+      ) {
+        return t('appConfig.validation.postgresPasswordReentryRequired');
       }
     }
     return null;
@@ -316,7 +565,7 @@ export const AppConfig: React.FC<PluginConfigPageProps<AppPluginMeta<StudioJsonD
     setStatusMessage(null);
     try {
       const allowedDatasourceUids = parsedAllowedUids;
-      // Always write an explicit object (even `{}`) so H-11 `...(jsonData ?? {})` spread
+      // Always write an explicit object (even `{}`) so H-11 `...savedJsonData` spread
       // never retains previously pinned dialects when all UIDs are reset back to Auto.
       const cleanedDialects: Record<string, QueryKind> = {};
       for (const uid of allowedDatasourceUids) {
@@ -326,14 +575,20 @@ export const AppConfig: React.FC<PluginConfigPageProps<AppPluginMeta<StudioJsonD
         }
       }
 
-      // Preserve any existing jsonData fields (H-11), strip dev-only mockDelayMs (L-1), and normalize allowMockInDev=false outside mock mode (M-13).
-      // Only write Redis-specific jsonData/secureJsonData fields when jobStoreBackend === 'redis' so switching
-      // back to memory never overwrites saved settings with unvalidated hidden fields or resets redisPassword.
-      const { mockDelayMs: _stripMockDelayMs, ...preservedJsonData } = (jsonData ?? {}) as StudioJsonData & {
+      const effectiveRedisKeyPrefix = redisKeyPrefix.trim() || 'llmstudio:jobs';
+      const effectivePostgresSchema = postgresSchema.trim() || 'public';
+      const effectivePostgresTablePrefix = postgresTablePrefix.trim() || 'llm_studio_';
+
+      // Preserve any existing/previously saved jsonData fields (H-11), strip dev-only mockDelayMs (L-1),
+      // and normalize allowMockInDev=false outside mock mode (M-13).
+      // Only write backend-specific jsonData/secureJsonData fields for the active jobStoreBackend so switching
+      // backends never overwrites saved settings with unvalidated hidden fields or resets hidden passwords.
+      const { mockDelayMs: _stripMockDelayMs, ...preservedJsonData } = savedJsonData as StudioJsonData & {
         mockDelayMs?: unknown;
       };
       const trimmedGrafanaUrl = grafanaUrl.trim();
       const trimmedRedisAddr = redisAddr.trim();
+      const trimmedPostgresAddr = postgresAddr.trim();
       const nextJsonData: StudioJsonData = {
         ...preservedJsonData,
         allowedDatasourceUids,
@@ -360,9 +615,19 @@ export const AppConfig: React.FC<PluginConfigPageProps<AppPluginMeta<StudioJsonD
           ? {
               redisAddr: trimmedRedisAddr,
               redisDb,
-              redisKeyPrefix: redisKeyPrefix.trim() || 'llmstudio:jobs',
+              redisKeyPrefix: effectiveRedisKeyPrefix,
               redisTls,
               redisUsername: redisUsername.trim(),
+            }
+          : {}),
+        ...(jobStoreBackend === 'postgres'
+          ? {
+              postgresAddr: trimmedPostgresAddr,
+              postgresDatabase: postgresDatabase.trim(),
+              postgresSchema: effectivePostgresSchema,
+              postgresTablePrefix: effectivePostgresTablePrefix,
+              postgresUsername: postgresUsername.trim(),
+              postgresSslMode,
             }
           : {}),
       };
@@ -390,6 +655,17 @@ export const AppConfig: React.FC<PluginConfigPageProps<AppPluginMeta<StudioJsonD
           secureJsonData.redisPassword = '';
         }
       }
+      if (jobStoreBackend === 'postgres') {
+        if (postgresPassword.length > 0) {
+          secureJsonData.postgresPassword = encodeBoundPostgresPassword(
+            trimmedPostgresAddr,
+            postgresSslMode,
+            postgresPassword
+          );
+        } else if (wasPostgresPasswordReset) {
+          secureJsonData.postgresPassword = '';
+        }
+      }
       const hasSecureJsonData = Object.keys(secureJsonData).length > 0;
 
       await lastValueFrom(
@@ -406,6 +682,7 @@ export const AppConfig: React.FC<PluginConfigPageProps<AppPluginMeta<StudioJsonD
         })
       );
 
+      setSavedJsonData(nextJsonData);
       setSavedGrafanaUrl(trimmedGrafanaUrl);
       if (llmServiceAccountToken.trim().length > 0) {
         setIsTokenConfigured(true);
@@ -416,15 +693,34 @@ export const AppConfig: React.FC<PluginConfigPageProps<AppPluginMeta<StudioJsonD
         setWasTokenReset(false);
       }
       if (jobStoreBackend === 'redis') {
+        setRedisKeyPrefix(effectiveRedisKeyPrefix);
         setSavedRedisAddr(trimmedRedisAddr);
         setSavedRedisTls(redisTls);
         if (redisPassword.length > 0) {
+          setSavedRedisPasswordConfigured(true);
           setIsRedisPasswordConfigured(true);
           setWasRedisPasswordReset(false);
           setRedisPassword('');
         } else if (wasRedisPasswordReset) {
+          setSavedRedisPasswordConfigured(false);
           setIsRedisPasswordConfigured(false);
           setWasRedisPasswordReset(false);
+        }
+      }
+      if (jobStoreBackend === 'postgres') {
+        setPostgresSchema(effectivePostgresSchema);
+        setPostgresTablePrefix(effectivePostgresTablePrefix);
+        setSavedPostgresAddr(trimmedPostgresAddr);
+        setSavedPostgresSslMode(postgresSslMode);
+        if (postgresPassword.length > 0) {
+          setSavedPostgresPasswordConfigured(true);
+          setIsPostgresPasswordConfigured(true);
+          setWasPostgresPasswordReset(false);
+          setPostgresPassword('');
+        } else if (wasPostgresPasswordReset) {
+          setSavedPostgresPasswordConfigured(false);
+          setIsPostgresPasswordConfigured(false);
+          setWasPostgresPasswordReset(false);
         }
       }
       setStatusMessage({
@@ -711,9 +1007,10 @@ export const AppConfig: React.FC<PluginConfigPageProps<AppPluginMeta<StudioJsonD
             options={[
               { label: t('appConfig.jobStorage.backendMemory'), value: 'memory' },
               { label: t('appConfig.jobStorage.backendRedis'), value: 'redis' },
+              { label: t('appConfig.jobStorage.backendPostgres'), value: 'postgres' },
             ]}
             value={jobStoreBackend}
-            onChange={(v) => setJobStoreBackend((v.value as 'memory' | 'redis') ?? 'memory')}
+            onChange={(v) => handleJobStoreBackendChange((v.value as JobStoreBackend) ?? 'memory')}
           />
         </Field>
         <Field label={t('appConfig.jobStorage.jobTtlMinutesLabel')}>
@@ -785,6 +1082,91 @@ export const AppConfig: React.FC<PluginConfigPageProps<AppPluginMeta<StudioJsonD
                 value={redisTls}
                 onChange={(e) => setRedisTls(e.currentTarget.checked)}
                 label={t('appConfig.jobStorage.redisTlsCheckbox')}
+              />
+            </Field>
+          </>
+        )}
+
+        {jobStoreBackend === 'postgres' && (
+          <>
+            <Field
+              label={t('appConfig.jobStorage.postgresAddrLabel')}
+              description={t('appConfig.jobStorage.postgresAddrDescription')}
+            >
+              <Input
+                value={postgresAddr}
+                onChange={(e) => setPostgresAddr(e.currentTarget.value)}
+                placeholder="postgres:5432"
+              />
+            </Field>
+            <Field
+              label={t('appConfig.jobStorage.postgresDatabaseLabel')}
+              description={t('appConfig.jobStorage.postgresDatabaseDescription')}
+            >
+              <Input
+                value={postgresDatabase}
+                onChange={(e) => setPostgresDatabase(e.currentTarget.value)}
+                placeholder="grafana"
+              />
+            </Field>
+            <Field
+              label={t('appConfig.jobStorage.postgresSchemaLabel')}
+              description={t('appConfig.jobStorage.postgresSchemaDescription')}
+            >
+              <Input
+                value={postgresSchema}
+                onChange={(e) => setPostgresSchema(e.currentTarget.value)}
+                placeholder="public"
+              />
+            </Field>
+            <Field
+              label={t('appConfig.jobStorage.postgresTablePrefixLabel')}
+              description={t('appConfig.jobStorage.postgresTablePrefixDescription')}
+            >
+              <Input
+                value={postgresTablePrefix}
+                onChange={(e) => setPostgresTablePrefix(e.currentTarget.value)}
+                placeholder="llm_studio_"
+              />
+            </Field>
+            <Field label={t('appConfig.jobStorage.postgresUsernameLabel')}>
+              <Input
+                value={postgresUsername}
+                onChange={(e) => setPostgresUsername(e.currentTarget.value)}
+                placeholder="grafana"
+              />
+            </Field>
+            <Field
+              label={t('appConfig.jobStorage.postgresPasswordLabel')}
+              description={t('appConfig.jobStorage.postgresPasswordDescription')}
+            >
+              <SecretInput
+                isConfigured={isPostgresPasswordConfigured}
+                value={postgresPassword}
+                onChange={(e) => setPostgresPassword(e.currentTarget.value)}
+                onReset={() => {
+                  setIsPostgresPasswordConfigured(false);
+                  setWasPostgresPasswordReset(true);
+                  setPostgresPassword('');
+                }}
+                placeholder="postgres-password"
+              />
+            </Field>
+            <Field
+              label={t('appConfig.jobStorage.postgresSslModeLabel')}
+              description={t('appConfig.jobStorage.postgresSslModeDescription')}
+            >
+              <Select
+                aria-label={t('appConfig.jobStorage.postgresSslModeLabel')}
+                options={[
+                  { label: t('appConfig.jobStorage.postgresSslModeDisable'), value: 'disable' },
+                  { label: t('appConfig.jobStorage.postgresSslModePrefer'), value: 'prefer' },
+                  { label: t('appConfig.jobStorage.postgresSslModeRequire'), value: 'require' },
+                  { label: t('appConfig.jobStorage.postgresSslModeVerifyCa'), value: 'verify-ca' },
+                  { label: t('appConfig.jobStorage.postgresSslModeVerifyFull'), value: 'verify-full' },
+                ]}
+                value={postgresSslMode}
+                onChange={(v) => setPostgresSslMode((v.value as PostgresSslMode) ?? 'prefer')}
               />
             </Field>
           </>

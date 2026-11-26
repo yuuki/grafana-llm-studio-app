@@ -28,6 +28,8 @@ func FuzzLoadSettings(f *testing.F) {
 		`{"datasourceDialects":{"prom-1":"metricsql"," ":"promql"},"allowedDatasourceUids":[" prom-1 ",""]}`,
 		`{"jobStoreBackend":"redis","redisAddr":"redis:6379","redisDb":3,"redisKeyPrefix":"llmstudio:jobs"}`,
 		`{"jobStoreBackend":"redis","redisAddr":"redis://x","redisDb":16}`,
+		`{"jobStoreBackend":"postgres","postgresAddr":"postgres:5432","postgresDatabase":"grafana","postgresUsername":"grafana","postgresSchema":"llm_studio","postgresSslMode":"require"}`,
+		`{"jobStoreBackend":"postgres","postgresAddr":"postgres://x","postgresSchema":"pg_catalog"}`,
 	} {
 		f.Add([]byte(s))
 	}

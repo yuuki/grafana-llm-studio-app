@@ -416,6 +416,327 @@ describe.each(SUPPORTED_LOCALES)(
       });
     });
 
+    test('validates PostgreSQL fields, saves HA Postgres job store settings, and supports resetting postgresPassword secret', async () => {
+      const plugin = makePlugin(
+        {
+          allowedDatasourceUids: ['prom-main'],
+          llmMode: 'grafana-llm-app',
+          jobStoreBackend: 'memory',
+        },
+        { postgresPassword: true }
+      );
+
+      render(<AppConfig plugin={plugin as never} query={{}} />);
+
+      const storeSelect = screen.getByLabelText(t('appConfig.jobStorage.backendLabel'));
+      fireEvent.change(storeSelect, { target: { value: 'postgres' } });
+
+      // Saving postgres without postgresAddr MUST fail client-side validation before fetch.
+      fireEvent.click(screen.getByText(t('appConfig.actions.save')));
+      await waitFor(() =>
+        expect(screen.getByText(t('appConfig.validation.postgresAddrRequired'))).toBeTruthy()
+      );
+      expect(mockFetch).not.toHaveBeenCalled();
+
+      // Reject URL/credentials in postgresAddr.
+      fireEvent.change(screen.getByPlaceholderText('postgres:5432'), {
+        target: { value: 'postgres://user:pass@pg:5432/grafana' },
+      });
+      fireEvent.click(screen.getByText(t('appConfig.actions.save')));
+      await waitFor(() =>
+        expect(screen.getByText(t('appConfig.validation.postgresAddrRequired'))).toBeTruthy()
+      );
+
+      // Valid addr, missing database -> rejected.
+      fireEvent.change(screen.getByPlaceholderText('postgres:5432'), {
+        target: { value: 'postgres.ha:5432' },
+      });
+      fireEvent.click(screen.getByText(t('appConfig.actions.save')));
+      await waitFor(() =>
+        expect(screen.getByText(t('appConfig.validation.postgresDatabaseRequired'))).toBeTruthy()
+      );
+
+      // Valid database, missing username -> rejected.
+      const dbInput = screen.getByLabelText(t('appConfig.jobStorage.postgresDatabaseLabel'));
+      fireEvent.change(dbInput, { target: { value: 'grafana' } });
+      fireEvent.click(screen.getByText(t('appConfig.actions.save')));
+      await waitFor(() =>
+        expect(screen.getByText(t('appConfig.validation.postgresUsernameRequired'))).toBeTruthy()
+      );
+
+      // Invalid schema -> rejected.
+      const userInput = screen.getByLabelText(t('appConfig.jobStorage.postgresUsernameLabel'));
+      fireEvent.change(userInput, { target: { value: 'grafana_app' } });
+      const schemaInput = screen.getByLabelText(t('appConfig.jobStorage.postgresSchemaLabel'));
+      fireEvent.change(schemaInput, { target: { value: 'bad;schema' } });
+      fireEvent.click(screen.getByText(t('appConfig.actions.save')));
+      await waitFor(() =>
+        expect(screen.getByText(t('appConfig.validation.postgresSchemaInvalid'))).toBeTruthy()
+      );
+
+      // Invalid table prefix -> rejected.
+      fireEvent.change(schemaInput, { target: { value: 'llm_studio' } });
+      const prefixInput = screen.getByLabelText(t('appConfig.jobStorage.postgresTablePrefixLabel'));
+      fireEvent.change(prefixInput, { target: { value: 'bad-prefix' } });
+      fireEvent.click(screen.getByText(t('appConfig.actions.save')));
+      await waitFor(() =>
+        expect(screen.getByText(t('appConfig.validation.postgresTablePrefixInvalid'))).toBeTruthy()
+      );
+      expect(mockFetch).not.toHaveBeenCalled();
+
+      // Fix prefix, select verify-full SSL mode, reset existing postgresPassword, and save.
+      fireEvent.change(prefixInput, { target: { value: 'studio_' } });
+      const sslSelect = screen.getByLabelText(t('appConfig.jobStorage.postgresSslModeLabel'));
+      fireEvent.change(sslSelect, { target: { value: 'verify-full' } });
+      fireEvent.click(screen.getByText('Reset Secret'));
+
+      fireEvent.click(screen.getByText(t('appConfig.actions.save')));
+      await waitFor(() => expect(mockFetch).toHaveBeenCalledTimes(1));
+      const payload = mockFetch.mock.calls[0][0].data;
+      expect(payload.jsonData.jobStoreBackend).toBe('postgres');
+      expect(payload.jsonData.postgresAddr).toBe('postgres.ha:5432');
+      expect(payload.jsonData.postgresDatabase).toBe('grafana');
+      expect(payload.jsonData.postgresSchema).toBe('llm_studio');
+      expect(payload.jsonData.postgresTablePrefix).toBe('studio_');
+      expect(payload.jsonData.postgresUsername).toBe('grafana_app');
+      expect(payload.jsonData.postgresSslMode).toBe('verify-full');
+      expect(payload.secureJsonData).toEqual({ postgresPassword: '' });
+    });
+
+    test('blocks changing postgresAddr or postgresSslMode while postgresPassword is configured until reset/re-entered, and binds new secrets to endpoint+SSL', async () => {
+      const plugin = makePlugin(
+        {
+          allowedDatasourceUids: ['prom-main'],
+          llmMode: 'grafana-llm-app',
+          jobStoreBackend: 'postgres',
+          postgresAddr: 'postgres.ha:5432',
+          postgresDatabase: 'grafana',
+          postgresUsername: 'grafana',
+          postgresSslMode: 'require',
+        },
+        { postgresPassword: true }
+      );
+
+      render(<AppConfig plugin={plugin as never} query={{}} />);
+
+      // Changing postgresAddr without resetting/re-entering postgresPassword MUST be blocked before fetch.
+      const addrInput = screen.getByPlaceholderText('postgres:5432');
+      fireEvent.change(addrInput, { target: { value: 'attacker.invalid:5432' } });
+      fireEvent.click(screen.getByText(t('appConfig.actions.save')));
+      await waitFor(() =>
+        expect(screen.getByText(t('appConfig.validation.postgresPasswordReentryRequired'))).toBeTruthy()
+      );
+      expect(mockFetch).not.toHaveBeenCalled();
+
+      // Restoring postgresAddr but downgrading postgresSslMode without resetting postgresPassword MUST also be blocked.
+      fireEvent.change(addrInput, { target: { value: 'postgres.ha:5432' } });
+      const sslSelect = screen.getByLabelText(t('appConfig.jobStorage.postgresSslModeLabel'));
+      fireEvent.change(sslSelect, { target: { value: 'disable' } });
+      fireEvent.click(screen.getByText(t('appConfig.actions.save')));
+      await waitFor(() =>
+        expect(screen.getByText(t('appConfig.validation.postgresPasswordReentryRequired'))).toBeTruthy()
+      );
+      expect(mockFetch).not.toHaveBeenCalled();
+
+      // Switch to verify-full + new legitimate host, reset & re-enter password -> saves destination-bound secret.
+      fireEvent.change(sslSelect, { target: { value: 'verify-full' } });
+      fireEvent.change(addrInput, { target: { value: 'postgres2.ha:5432' } });
+      fireEvent.click(screen.getByText('Reset Secret'));
+      fireEvent.change(screen.getByPlaceholderText('postgres-password'), {
+        target: { value: 'new-pg-secret' },
+      });
+      fireEvent.click(screen.getByText(t('appConfig.actions.save')));
+      await waitFor(() => expect(mockFetch).toHaveBeenCalledTimes(1));
+
+      const savedSecret = mockFetch.mock.calls[0][0].data.secureJsonData.postgresPassword as string;
+      expect(savedSecret.startsWith('llmstudio-postgres-bound-v1:')).toBe(true);
+      expect(JSON.parse(savedSecret.slice('llmstudio-postgres-bound-v1:'.length))).toEqual({
+        addr: 'postgres2.ha:5432',
+        sslMode: 'verify-full',
+        password: 'new-pg-secret',
+      });
+    });
+
+    test('switching postgres -> memory does not reset hidden postgresPassword or persist unvalidated hidden Postgres edits', async () => {
+      const plugin = makePlugin(
+        {
+          allowedDatasourceUids: ['prom-main'],
+          llmMode: 'grafana-llm-app',
+          jobStoreBackend: 'postgres',
+          postgresAddr: 'postgres.ha:5432',
+          postgresDatabase: 'grafana',
+          postgresSchema: 'llm_studio',
+          postgresUsername: 'grafana',
+          postgresSslMode: 'require',
+        },
+        { postgresPassword: true }
+      );
+
+      render(<AppConfig plugin={plugin as never} query={{}} />);
+
+      // User clicks Reset Secret on Postgres password and types invalid schema, then switches back to memory.
+      fireEvent.click(screen.getByText('Reset Secret'));
+      const schemaInput = screen.getByLabelText(t('appConfig.jobStorage.postgresSchemaLabel'));
+      fireEvent.change(schemaInput, { target: { value: 'invalid;schema' } });
+
+      const storeSelect = screen.getByLabelText(t('appConfig.jobStorage.backendLabel'));
+      fireEvent.change(storeSelect, { target: { value: 'memory' } });
+
+      fireEvent.click(screen.getByText(t('appConfig.actions.save')));
+      await waitFor(() => expect(mockFetch).toHaveBeenCalledTimes(1));
+      const payload = mockFetch.mock.calls[0][0].data;
+      expect(payload.jsonData.jobStoreBackend).toBe('memory');
+      expect(payload.jsonData.postgresSchema).toBe('llm_studio');
+      expect(payload.secureJsonData).toBeUndefined();
+    });
+
+    test('normalizes uppercase/whitespace provisioned jobStoreBackend and postgresSslMode without silent downgrade', async () => {
+      const plugin = makePlugin({
+        allowedDatasourceUids: ['prom-main'],
+        llmMode: 'grafana-llm-app',
+        jobStoreBackend: ' POSTGRES ' as unknown as 'postgres',
+        postgresAddr: 'postgres.ha:5432',
+        postgresDatabase: 'grafana',
+        postgresUsername: 'grafana',
+        postgresSslMode: ' VERIFY-FULL ' as unknown as 'verify-full',
+      });
+
+      render(<AppConfig plugin={plugin as never} query={{}} />);
+
+      // Save an unrelated setting without touching Job Storage -> MUST NOT downgrade to memory or prefer.
+      fireEvent.click(screen.getByText(t('appConfig.actions.save')));
+      await waitFor(() => expect(mockFetch).toHaveBeenCalledTimes(1));
+      const payload = mockFetch.mock.calls[0][0].data;
+      expect(payload.jsonData.jobStoreBackend).toBe('postgres');
+      expect(payload.jsonData.postgresSslMode).toBe('verify-full');
+    });
+
+    test('multi-save without reload preserves newly saved Postgres fields and switching away disarms secret reset', async () => {
+      const plugin = makePlugin(
+        {
+          allowedDatasourceUids: ['prom-main'],
+          llmMode: 'grafana-llm-app',
+          jobStoreBackend: 'memory',
+        },
+        { postgresPassword: true }
+      );
+
+      render(<AppConfig plugin={plugin as never} query={{}} />);
+      const storeSelect = screen.getByLabelText(t('appConfig.jobStorage.backendLabel'));
+
+      // Save #1: configure postgres with a new password (preserving leading/trailing space inside bound envelope).
+      fireEvent.change(storeSelect, { target: { value: 'postgres' } });
+      fireEvent.change(screen.getByPlaceholderText('postgres:5432'), {
+        target: { value: '[::ffff:127.0.0.1]:5432' },
+      });
+      fireEvent.change(screen.getByLabelText(t('appConfig.jobStorage.postgresDatabaseLabel')), {
+        target: { value: 'grafana' },
+      });
+      fireEvent.change(screen.getByLabelText(t('appConfig.jobStorage.postgresUsernameLabel')), {
+        target: { value: 'grafana@flex' },
+      });
+      fireEvent.change(screen.getByLabelText(t('appConfig.jobStorage.postgresSchemaLabel')), {
+        target: { value: '' },
+      });
+      fireEvent.change(screen.getByLabelText(t('appConfig.jobStorage.postgresTablePrefixLabel')), {
+        target: { value: '' },
+      });
+      fireEvent.change(screen.getByLabelText(t('appConfig.jobStorage.postgresSslModeLabel')), {
+        target: { value: 'require' },
+      });
+      fireEvent.click(screen.getByText('Reset Secret'));
+      fireEvent.change(screen.getByPlaceholderText('postgres-password'), {
+        target: { value: ' pg-pass-1 ' },
+      });
+
+      fireEvent.click(screen.getByText(t('appConfig.actions.save')));
+      await waitFor(() => expect(mockFetch).toHaveBeenCalledTimes(1));
+      expect(mockFetch.mock.calls[0][0].data.jsonData.postgresAddr).toBe('[::ffff:127.0.0.1]:5432');
+      expect(mockFetch.mock.calls[0][0].data.jsonData.postgresSchema).toBe('public');
+      expect(mockFetch.mock.calls[0][0].data.jsonData.postgresTablePrefix).toBe('llm_studio_');
+      const savedPgSecret = mockFetch.mock.calls[0][0].data.secureJsonData.postgresPassword as string;
+      expect(savedPgSecret.startsWith('llmstudio-postgres-bound-v1:')).toBe(true);
+      expect(JSON.parse(savedPgSecret.slice('llmstudio-postgres-bound-v1:'.length))).toEqual({
+        addr: '[::ffff:127.0.0.1]:5432',
+        sslMode: 'require',
+        password: ' pg-pass-1 ',
+      });
+
+      // Click Reset Secret on postgres password, then switch to memory and Save #2 (without reload).
+      fireEvent.click(screen.getByText('Reset Secret'));
+      fireEvent.change(storeSelect, { target: { value: 'memory' } });
+      fireEvent.click(screen.getByText(t('appConfig.actions.save')));
+      await waitFor(() => expect(mockFetch).toHaveBeenCalledTimes(2));
+      const save2 = mockFetch.mock.calls[1][0].data;
+      expect(save2.jsonData.jobStoreBackend).toBe('memory');
+      // Newly saved Postgres fields from Save #1 MUST still be preserved (not wiped by stale mount jsonData).
+      expect(save2.jsonData.postgresAddr).toBe('[::ffff:127.0.0.1]:5432');
+      expect(save2.jsonData.postgresSslMode).toBe('require');
+      expect(save2.secureJsonData).toBeUndefined();
+
+      // Switch back to postgres and Save #3 -> armed reset from before switching MUST have been disarmed!
+      fireEvent.change(storeSelect, { target: { value: 'postgres' } });
+      fireEvent.click(screen.getByText(t('appConfig.actions.save')));
+      await waitFor(() => expect(mockFetch).toHaveBeenCalledTimes(3));
+      expect(mockFetch.mock.calls[2][0].data.secureJsonData).toBeUndefined();
+    });
+
+    test('enforces UTF-8 byte limits, strict RFC 4291 IPv6, and reserved/uppercase PostgreSQL schemas', async () => {
+      const plugin = makePlugin({
+        allowedDatasourceUids: ['prom-main'],
+        llmMode: 'grafana-llm-app',
+        jobStoreBackend: 'postgres',
+      });
+
+      render(<AppConfig plugin={plugin as never} query={{}} />);
+
+      // Malformed IPv6 and bracketed non-IPv6 MUST be rejected client-side.
+      for (const badAddr of ['[:::]:5432', '[1::2::3]:5432', '[:]:5432', '[127.0.0.1]:5432', '[postgres]:5432']) {
+        fireEvent.change(screen.getByPlaceholderText('postgres:5432'), { target: { value: badAddr } });
+        fireEvent.click(screen.getByText(t('appConfig.actions.save')));
+        await waitFor(() =>
+          expect(screen.getByText(t('appConfig.validation.postgresAddrRequired'))).toBeTruthy()
+        );
+      }
+
+      // Valid IPv6, but multi-byte Japanese DB name exceeding 63 UTF-8 bytes (22 chars = 66 bytes) MUST fail.
+      fireEvent.change(screen.getByPlaceholderText('postgres:5432'), { target: { value: '[::1]:5432' } });
+      fireEvent.change(screen.getByLabelText(t('appConfig.jobStorage.postgresDatabaseLabel')), {
+        target: { value: 'あ'.repeat(22) },
+      });
+      fireEvent.click(screen.getByText(t('appConfig.actions.save')));
+      await waitFor(() =>
+        expect(screen.getByText(t('appConfig.validation.postgresDatabaseRequired'))).toBeTruthy()
+      );
+
+      // Valid DB, multi-byte username exceeding 128 UTF-8 bytes (43 chars = 129 bytes) MUST fail.
+      fireEvent.change(screen.getByLabelText(t('appConfig.jobStorage.postgresDatabaseLabel')), {
+        target: { value: 'grafana' },
+      });
+      fireEvent.change(screen.getByLabelText(t('appConfig.jobStorage.postgresUsernameLabel')), {
+        target: { value: 'あ'.repeat(43) },
+      });
+      fireEvent.click(screen.getByText(t('appConfig.actions.save')));
+      await waitFor(() =>
+        expect(screen.getByText(t('appConfig.validation.postgresUsernameRequired'))).toBeTruthy()
+      );
+
+      // Reserved system schemas and uppercase schema MUST fail.
+      fireEvent.change(screen.getByLabelText(t('appConfig.jobStorage.postgresUsernameLabel')), {
+        target: { value: 'grafana' },
+      });
+      for (const badSchema of ['PUBLIC', 'pg_temp', 'pg_catalog', 'information_schema']) {
+        fireEvent.change(screen.getByLabelText(t('appConfig.jobStorage.postgresSchemaLabel')), {
+          target: { value: badSchema },
+        });
+        fireEvent.click(screen.getByText(t('appConfig.actions.save')));
+        await waitFor(() =>
+          expect(screen.getByText(t('appConfig.validation.postgresSchemaInvalid'))).toBeTruthy()
+        );
+      }
+      expect(mockFetch).not.toHaveBeenCalled();
+    });
+
     test('clearing a numeric input fails validation instead of silently coercing to 0', async () => {
       const plugin = makePlugin({
         allowedDatasourceUids: ['prom-main'],

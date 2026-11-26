@@ -13,6 +13,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Grafana plugin signing integration (`@grafana/sign-plugin@3.3.3`) supporting Community and Private signing workflows, post-signing `MANIFEST.txt` integrity verification, and documentation for Grafana plugin catalog submission (`docs/plugin-signing-and-publishing.md`).
 - Optional decoupled SSE stage-progress streaming over `CallResource` (`enableSseProgress`).
 - Optional Redis/Valkey HA job store backend (`jobStoreBackend: "redis"`).
+- Optional PostgreSQL HA job store backend (`jobStoreBackend: "postgres"`) with transactional concurrency locking, `LISTEN`/`NOTIFY` cross-replica cancellation, destination-bound `postgresPassword` credentials, and optional `LLMSTUDIO_POSTGRES_ADDR` operator pinning.
 - First-class VictoriaMetrics MetricsQL datasource adapter.
 - Expanded Dashboard IR v1.1 (7 panel types, multi-query panels, template variables, safe existing dashboard import).
 - English (default) and Japanese (`ja`) UI internationalization via Grafana's shared `i18next` runtime.

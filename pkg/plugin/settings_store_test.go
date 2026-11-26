@@ -2,13 +2,20 @@ package plugin_test
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"net/http"
+	"net/url"
+	"os"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/alicebob/miniredis/v2"
 	"github.com/grafana/grafana-plugin-sdk-go/backend"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/yuuki/grafana-llm-studio-app/pkg/jobs"
 	"github.com/yuuki/grafana-llm-studio-app/pkg/plugin"
 )
@@ -111,6 +118,109 @@ func TestLoadSettings_JobStoreValidation(t *testing.T) {
 		JSONData: []byte(`{"llmMode":"mock","allowMockInDev":true,"allowedDatasourceUids":["prom-1"],"jobStoreBackend":"redis","redisAddr":"attacker.invalid:6379"}`),
 	}, plugin.LoadOptions{PinnedRedisAddr: "redis.pinned:6379"}); err == nil {
 		t.Fatal("expected mismatched redisAddr to be rejected against operator-pinned LLMSTUDIO_REDIS_ADDR")
+	}
+
+	// Postgres backend validation: required fields & strict format checks.
+	if _, err := plugin.LoadSettings(backend.AppInstanceSettings{
+		JSONData: []byte(`{"llmMode":"mock","allowMockInDev":true,"allowedDatasourceUids":["prom-1"],"jobStoreBackend":"postgres"}`),
+	}); err == nil {
+		t.Fatal("expected jobStoreBackend=postgres without postgresAddr to fail")
+	}
+	if _, err := plugin.LoadSettings(backend.AppInstanceSettings{
+		JSONData: []byte(`{"llmMode":"mock","allowMockInDev":true,"allowedDatasourceUids":["prom-1"],"jobStoreBackend":"postgres","postgresAddr":"postgres://user:pass@pg:5432/grafana","postgresDatabase":"grafana","postgresUsername":"grafana"}`),
+	}); err == nil {
+		t.Fatal("expected credentials/URL scheme in postgresAddr to be rejected")
+	}
+	if _, err := plugin.LoadSettings(backend.AppInstanceSettings{
+		JSONData: []byte(`{"llmMode":"mock","allowMockInDev":true,"allowedDatasourceUids":["prom-1"],"jobStoreBackend":"postgres","postgresAddr":"pg:5432","postgresUsername":"grafana"}`),
+	}); err == nil {
+		t.Fatal("expected jobStoreBackend=postgres without postgresDatabase to fail")
+	}
+	if _, err := plugin.LoadSettings(backend.AppInstanceSettings{
+		JSONData: []byte(`{"llmMode":"mock","allowMockInDev":true,"allowedDatasourceUids":["prom-1"],"jobStoreBackend":"postgres","postgresAddr":"pg:5432","postgresDatabase":"grafana"}`),
+	}); err == nil {
+		t.Fatal("expected jobStoreBackend=postgres without postgresUsername to fail")
+	}
+	if _, err := plugin.LoadSettings(backend.AppInstanceSettings{
+		JSONData: []byte(`{"llmMode":"mock","allowMockInDev":true,"allowedDatasourceUids":["prom-1"],"jobStoreBackend":"postgres","postgresAddr":"pg:5432","postgresDatabase":"grafana","postgresUsername":"grafana","postgresSchema":"bad;schema"}`),
+	}); err == nil {
+		t.Fatal("expected invalid postgresSchema to fail")
+	}
+	if _, err := plugin.LoadSettings(backend.AppInstanceSettings{
+		JSONData: []byte(`{"llmMode":"mock","allowMockInDev":true,"allowedDatasourceUids":["prom-1"],"jobStoreBackend":"postgres","postgresAddr":"pg:5432","postgresDatabase":"grafana","postgresUsername":"grafana","postgresTablePrefix":"bad-prefix"}`),
+	}); err == nil {
+		t.Fatal("expected invalid postgresTablePrefix to fail")
+	}
+	if _, err := plugin.LoadSettings(backend.AppInstanceSettings{
+		JSONData: []byte(`{"llmMode":"mock","allowMockInDev":true,"allowedDatasourceUids":["prom-1"],"jobStoreBackend":"postgres","postgresAddr":"pg:5432","postgresDatabase":"grafana","postgresUsername":"grafana","postgresSslMode":"allow"}`),
+	}); err == nil {
+		t.Fatal("expected unsupported postgresSslMode to fail")
+	}
+
+	// Valid Postgres config accepted and normalized with defaults.
+	sPg, err := plugin.LoadSettings(backend.AppInstanceSettings{
+		JSONData: []byte(`{"llmMode":"mock","allowMockInDev":true,"allowedDatasourceUids":["prom-1"],"jobStoreBackend":"POSTGRES","postgresAddr":"postgres.internal:5432","postgresDatabase":"grafana","postgresUsername":"grafana","jobTtlMinutes":45}`),
+	})
+	if err != nil {
+		t.Fatalf("expected valid postgres settings to pass, got %v", err)
+	}
+	if sPg.JobStoreBackend != plugin.JobStoreBackendPostgres ||
+		sPg.PostgresSchema != jobs.DefaultPostgresSchema ||
+		sPg.PostgresTablePrefix != jobs.DefaultPostgresTablePrefix ||
+		sPg.PostgresSSLMode != jobs.DefaultPostgresSSLMode ||
+		sPg.JobTTLMinutes != 45 {
+		t.Fatalf("unexpected parsed postgres settings: %+v", sPg)
+	}
+
+	// Destination-bound postgresPassword succeeds for matching endpoint+SSLMode and rejects redirected addr or SSL downgrade.
+	boundPgPass, err := plugin.EncodeBoundPostgresPassword("postgres.internal:5432", "require", "secret-pg-pw")
+	if err != nil {
+		t.Fatalf("EncodeBoundPostgresPassword: %v", err)
+	}
+	if _, err := plugin.LoadSettings(backend.AppInstanceSettings{
+		JSONData:                []byte(`{"llmMode":"mock","allowMockInDev":true,"allowedDatasourceUids":["prom-1"],"jobStoreBackend":"postgres","postgresAddr":"POSTGRES.INTERNAL:5432","postgresDatabase":"grafana","postgresUsername":"grafana","postgresSslMode":"require"}`),
+		DecryptedSecureJSONData: map[string]string{"postgresPassword": boundPgPass},
+	}); err != nil {
+		t.Fatalf("expected bound postgresPassword to match canonical endpoint+SSLMode, got %v", err)
+	}
+	if _, err := plugin.LoadSettings(backend.AppInstanceSettings{
+		JSONData:                []byte(`{"llmMode":"mock","allowMockInDev":true,"allowedDatasourceUids":["prom-1"],"jobStoreBackend":"postgres","postgresAddr":"attacker.invalid:5432","postgresDatabase":"grafana","postgresUsername":"grafana","postgresSslMode":"require"}`),
+		DecryptedSecureJSONData: map[string]string{"postgresPassword": boundPgPass},
+	}); err == nil {
+		t.Fatal("expected bound postgresPassword to be rejected when postgresAddr changed to another server")
+	}
+	if _, err := plugin.LoadSettings(backend.AppInstanceSettings{
+		JSONData:                []byte(`{"llmMode":"mock","allowMockInDev":true,"allowedDatasourceUids":["prom-1"],"jobStoreBackend":"postgres","postgresAddr":"postgres.internal:5432","postgresDatabase":"grafana","postgresUsername":"grafana","postgresSslMode":"disable"}`),
+		DecryptedSecureJSONData: map[string]string{"postgresPassword": boundPgPass},
+	}); err == nil {
+		t.Fatal("expected bound postgresPassword to be rejected when postgresSslMode was downgraded")
+	}
+	// Switching back to memory ignores bound postgresPassword without error.
+	if _, err := plugin.LoadSettings(backend.AppInstanceSettings{
+		JSONData:                []byte(`{"llmMode":"mock","allowMockInDev":true,"allowedDatasourceUids":["prom-1"],"jobStoreBackend":"memory"}`),
+		DecryptedSecureJSONData: map[string]string{"postgresPassword": boundPgPass},
+	}); err != nil {
+		t.Fatalf("expected memory mode to ignore bound postgresPassword, got %v", err)
+	}
+
+	// Operator-pinned PostgreSQL address rejects mismatched jsonData.postgresAddr and fills empty postgresAddr.
+	sPgPinned, err := plugin.LoadSettingsWithOptions(backend.AppInstanceSettings{
+		JSONData: []byte(`{"llmMode":"mock","allowMockInDev":true,"allowedDatasourceUids":["prom-1"],"jobStoreBackend":"postgres","postgresDatabase":"grafana","postgresUsername":"grafana"}`),
+	}, plugin.LoadOptions{PinnedPostgresAddr: "postgres.pinned:5432"})
+	if err != nil || sPgPinned.PostgresAddr != "postgres.pinned:5432" {
+		t.Fatalf("expected operator-pinned postgresAddr fallback, got err=%v addr=%q", err, sPgPinned.PostgresAddr)
+	}
+	if _, err := plugin.LoadSettingsWithOptions(backend.AppInstanceSettings{
+		JSONData: []byte(`{"llmMode":"mock","allowMockInDev":true,"allowedDatasourceUids":["prom-1"],"jobStoreBackend":"postgres","postgresAddr":"attacker.invalid:5432","postgresDatabase":"grafana","postgresUsername":"grafana"}`),
+	}, plugin.LoadOptions{PinnedPostgresAddr: "postgres.pinned:5432"}); err == nil {
+		t.Fatal("expected mismatched postgresAddr to be rejected against operator-pinned LLMSTUDIO_POSTGRES_ADDR")
+	}
+
+	// Stale hidden postgres fields MUST be ignored when jobStoreBackend=memory.
+	if _, err := plugin.LoadSettings(backend.AppInstanceSettings{
+		JSONData: []byte(`{"llmMode":"mock","allowMockInDev":true,"allowedDatasourceUids":["prom-1"],"jobStoreBackend":"memory","postgresSchema":"bad;schema","postgresSslMode":"invalid"}`),
+	}); err != nil {
+		t.Fatalf("expected stale postgres fields to be ignored when jobStoreBackend=memory, got %v", err)
 	}
 }
 
@@ -416,5 +526,316 @@ func TestApp_BoundRedisPasswordEndToEnd(t *testing.T) {
 		},
 	}); err == nil {
 		t.Fatal("expected NewApp to reject redirected redisAddr with bound redisPassword from mr1")
+	}
+}
+
+func TestApp_PostgresUnreachableSecretIsolation(t *testing.T) {
+	const pgSecret = "super-secret-pg-pass-999"
+	const pgAddr = "127.0.0.1:1"
+
+	boundPgSecret, err := plugin.EncodeBoundPostgresPassword(pgAddr, "disable", pgSecret)
+	if err != nil {
+		t.Fatalf("EncodeBoundPostgresPassword: %v", err)
+	}
+
+	// Redirecting postgresAddr while keeping a bound postgresPassword MUST fail in NewApp before dialing.
+	if _, err := plugin.NewApp(context.Background(), backend.AppInstanceSettings{
+		JSONData: []byte(`{
+			"llmMode": "mock",
+			"allowMockInDev": true,
+			"allowedDatasourceUids": ["prom-1"],
+			"jobStoreBackend": "postgres",
+			"postgresAddr": "attacker.invalid:5432",
+			"postgresDatabase": "grafana",
+			"postgresUsername": "grafana",
+			"postgresSslMode": "disable"
+		}`),
+		DecryptedSecureJSONData: map[string]string{
+			"postgresPassword": boundPgSecret,
+		},
+	}); err == nil {
+		t.Fatal("expected NewApp to reject redirected postgresAddr with bound postgresPassword")
+	}
+
+	inst, err := plugin.NewApp(context.Background(), backend.AppInstanceSettings{
+		JSONData: []byte(`{
+			"llmMode": "mock",
+			"allowMockInDev": true,
+			"allowedDatasourceUids": ["prom-1"],
+			"jobStoreBackend": "postgres",
+			"postgresAddr": "` + pgAddr + `",
+			"postgresDatabase": "grafana",
+			"postgresUsername": "grafana",
+			"postgresSslMode": "disable"
+		}`),
+		DecryptedSecureJSONData: map[string]string{
+			"postgresPassword":       boundPgSecret,
+			"llmServiceAccountToken": "glsa_secret_token",
+		},
+	})
+	if err != nil {
+		t.Fatalf("NewApp postgres unreachable: %v", err)
+	}
+	app := inst.(*plugin.App)
+	defer app.Dispose()
+
+	aliceCtx := backend.PluginContext{OrgID: 1, User: &backend.User{Login: "alice", Role: "Admin"}}
+	bobCtx := backend.PluginContext{OrgID: 1, User: &backend.User{Login: "bob", Role: "Editor"}}
+
+	// /config/public MUST NEVER leak postgresPassword or postgresAddr.
+	pubSender := &captureSender{}
+	_ = app.CallResource(context.Background(), &backend.CallResourceRequest{
+		PluginContext: aliceCtx,
+		Path:          "config/public",
+		Method:        http.MethodGet,
+	}, pubSender)
+	if pubSender.resp == nil || pubSender.resp.Status != http.StatusOK {
+		t.Fatalf("expected 200 for /config/public, got %+v", pubSender.resp)
+	}
+	pubBody := string(pubSender.resp.Body)
+	if strings.Contains(pubBody, pgSecret) || strings.Contains(pubBody, pgAddr) {
+		t.Fatalf("postgres secret or addr leaked in /config/public: %s", pubBody)
+	}
+
+	// CheckHealth MUST return HealthStatusError without leaking postgresPassword.
+	healthCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	health, err := app.CheckHealth(healthCtx, &backend.CheckHealthRequest{})
+	if err != nil || health.Status != backend.HealthStatusError {
+		t.Fatalf("expected HealthStatusError for unreachable Postgres, got err=%v health=%+v", err, health)
+	}
+	if strings.Contains(health.Message, pgSecret) {
+		t.Fatalf("postgresPassword leaked in CheckHealth: %s", health.Message)
+	}
+
+	// Non-admin /health MUST return 503 without leaking internal address or password.
+	nonAdminHealth := &captureSender{}
+	_ = app.CallResource(healthCtx, &backend.CallResourceRequest{
+		PluginContext: bobCtx,
+		Path:          "health",
+		Method:        http.MethodGet,
+	}, nonAdminHealth)
+	if nonAdminHealth.resp == nil || nonAdminHealth.resp.Status != http.StatusServiceUnavailable {
+		t.Fatalf("expected 503 on non-admin /health when Postgres is down, got %+v", nonAdminHealth.resp)
+	}
+	if strings.Contains(string(nonAdminHealth.resp.Body), pgAddr) || strings.Contains(string(nonAdminHealth.resp.Body), pgSecret) {
+		t.Fatalf("internal Postgres details leaked in non-admin /health: %s", string(nonAdminHealth.resp.Body))
+	}
+
+	// /jobs/{id} MUST return 503 without leaking internal address or password.
+	downSender := &captureSender{}
+	_ = app.CallResource(healthCtx, &backend.CallResourceRequest{
+		PluginContext: aliceCtx,
+		Path:          "jobs/job-123",
+		Method:        http.MethodGet,
+	}, downSender)
+	if downSender.resp == nil || downSender.resp.Status != http.StatusServiceUnavailable {
+		t.Fatalf("expected 503 when Postgres is unreachable, got %+v", downSender.resp)
+	}
+	if strings.Contains(string(downSender.resp.Body), pgAddr) || strings.Contains(string(downSender.resp.Body), pgSecret) {
+		t.Fatalf("internal Postgres details leaked in 503 body: %s", string(downSender.resp.Body))
+	}
+}
+
+func TestApp_MultiReplicaPostgresJobStoreHTTPAndSecretIsolation(t *testing.T) {
+	pgAddr := strings.TrimSpace(os.Getenv("LLM_STUDIO_TEST_POSTGRES_ADDR"))
+	if pgAddr == "" {
+		if strings.TrimSpace(os.Getenv("LLM_STUDIO_REQUIRE_POSTGRES_TESTS")) == "1" {
+			t.Fatal("LLM_STUDIO_REQUIRE_POSTGRES_TESTS=1 is set but LLM_STUDIO_TEST_POSTGRES_ADDR is empty")
+		}
+		t.Skip("set LLM_STUDIO_TEST_POSTGRES_ADDR to run live PostgreSQL plugin HTTP tests")
+	}
+	pgDB := strings.TrimSpace(os.Getenv("LLM_STUDIO_TEST_POSTGRES_DB"))
+	if pgDB == "" {
+		pgDB = "grafana"
+	}
+	pgUser := strings.TrimSpace(os.Getenv("LLM_STUDIO_TEST_POSTGRES_USER"))
+	if pgUser == "" {
+		pgUser = "grafana"
+	}
+	pgPass := os.Getenv("LLM_STUDIO_TEST_POSTGRES_PASSWORD")
+	pgSSLMode := strings.TrimSpace(os.Getenv("LLM_STUDIO_TEST_POSTGRES_SSLMODE"))
+	if pgSSLMode == "" {
+		pgSSLMode = jobs.PostgresSSLModeDisable
+	}
+
+	var rnd [6]byte
+	_, _ = rand.Read(rnd[:])
+	schema := "llmstudio_http_" + hex.EncodeToString(rnd[:])
+	defer func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		u := &url.URL{
+			Scheme: "postgres",
+			User:   url.UserPassword(pgUser, pgPass),
+			Host:   pgAddr,
+			Path:   "/" + pgDB,
+		}
+		q := u.Query()
+		q.Set("sslmode", pgSSLMode)
+		u.RawQuery = q.Encode()
+		if pool, err := pgxpool.New(ctx, u.String()); err == nil {
+			defer pool.Close()
+			_, _ = pool.Exec(ctx, "DROP SCHEMA IF EXISTS "+pgx.Identifier{schema}.Sanitize()+" CASCADE")
+		}
+	}()
+
+	jsonData, err := json.Marshal(map[string]any{
+		"llmMode":               "mock",
+		"allowMockInDev":        true,
+		"allowedDatasourceUids": []string{"prom-1"},
+		"jobStoreBackend":       "postgres",
+		"postgresAddr":          pgAddr,
+		"postgresDatabase":      pgDB,
+		"postgresUsername":      pgUser,
+		"postgresSchema":        schema,
+		"postgresTablePrefix":   "llm_studio_",
+		"postgresSslMode":       pgSSLMode,
+		"jobTtlMinutes":         45,
+	})
+	if err != nil {
+		t.Fatalf("marshal settings: %v", err)
+	}
+
+	storedPgPass := pgPass
+	if pgPass != "" {
+		storedPgPass, err = plugin.EncodeBoundPostgresPassword(pgAddr, pgSSLMode, pgPass)
+		if err != nil {
+			t.Fatalf("EncodeBoundPostgresPassword: %v", err)
+		}
+	}
+
+	appSettings := backend.AppInstanceSettings{
+		JSONData: jsonData,
+		DecryptedSecureJSONData: map[string]string{
+			"postgresPassword":       storedPgPass,
+			"llmServiceAccountToken": "glsa_secret_token",
+		},
+	}
+
+	inst1, err := plugin.NewApp(context.Background(), appSettings)
+	if err != nil {
+		t.Fatalf("NewApp replica 1: %v", err)
+	}
+	app1 := inst1.(*plugin.App)
+
+	inst2, err := plugin.NewApp(context.Background(), appSettings)
+	if err != nil {
+		t.Fatalf("NewApp replica 2: %v", err)
+	}
+	app2 := inst2.(*plugin.App)
+	defer app2.Dispose()
+
+	// CheckHealth verifies live PostgreSQL connectivity and reports jobStore=postgres without leaking secrets.
+	health, err := app1.CheckHealth(context.Background(), &backend.CheckHealthRequest{})
+	if err != nil || health.Status != backend.HealthStatusOk {
+		t.Fatalf("expected CheckHealth OK with live Postgres, got err=%v health=%+v", err, health)
+	}
+	if !strings.Contains(health.Message, "jobStore=postgres") {
+		t.Fatalf("expected jobStore=postgres in health message, got %q", health.Message)
+	}
+	if pgPass != "" && strings.Contains(health.Message, pgPass) {
+		t.Fatal("postgresPassword leaked in CheckHealth message")
+	}
+
+	aliceCtx := backend.PluginContext{OrgID: 1, User: &backend.User{Login: "alice", Role: "Admin"}}
+	bobCtx := backend.PluginContext{OrgID: 1, User: &backend.User{Login: "bob", Role: "Editor"}}
+
+	// /config/public and /health MUST NEVER leak postgresPassword or postgresAddr.
+	for _, p := range []string{"config/public", "health"} {
+		sender := &captureSender{}
+		_ = app1.CallResource(context.Background(), &backend.CallResourceRequest{
+			PluginContext: aliceCtx,
+			Path:          p,
+			Method:        http.MethodGet,
+		}, sender)
+		if sender.resp == nil || sender.resp.Status != http.StatusOK {
+			t.Fatalf("expected 200 for /%s, got %+v", p, sender.resp)
+		}
+		body := string(sender.resp.Body)
+		if pgPass != "" && strings.Contains(body, pgPass) {
+			t.Fatalf("postgresPassword leaked in /%s response", p)
+		}
+		if p == "config/public" && strings.Contains(body, pgAddr) {
+			t.Fatalf("postgresAddr leaked in /config/public response: %s", body)
+		}
+	}
+
+	// Replica 1 generates a job over HTTP CallResource.
+	genSender := &captureSender{}
+	_ = app1.CallResource(context.Background(), &backend.CallResourceRequest{
+		PluginContext: aliceCtx,
+		Path:          "jobs/generate",
+		Method:        http.MethodPost,
+		Body: []byte(`{
+			"datasourceUid": "prom-1",
+			"scope": {"labelName": "service", "labelValue": "checkout-api"},
+			"userIntent": "Show request rate and error rate",
+			"catalog": [
+				{"name": "http_requests_total", "type": "counter", "labels": ["service", "status"]}
+			]
+		}`),
+	}, genSender)
+	if genSender.resp == nil || genSender.resp.Status != http.StatusOK {
+		t.Fatalf("replica 1 /jobs/generate failed: %+v", genSender.resp)
+	}
+	var genSnap jobs.JobSnapshot
+	if err := json.Unmarshal(genSender.resp.Body, &genSnap); err != nil {
+		t.Fatalf("unmarshal generate response: %v", err)
+	}
+
+	// Dispose Replica 1 (simulating pod restart/rollout).
+	app1.Dispose()
+
+	// Replica 2 serves GET, Patch, and Undo for Alice's job seamlessly.
+	getSender := &captureSender{}
+	_ = app2.CallResource(context.Background(), &backend.CallResourceRequest{
+		PluginContext: aliceCtx,
+		Path:          "jobs/" + genSnap.JobID,
+		Method:        http.MethodGet,
+	}, getSender)
+	if getSender.resp == nil || getSender.resp.Status != http.StatusOK {
+		t.Fatalf("replica 2 GET job failed after replica 1 dispose: %+v", getSender.resp)
+	}
+
+	// Bob attempting GET on Replica 2 MUST get 403 Forbidden.
+	bobSender := &captureSender{}
+	_ = app2.CallResource(context.Background(), &backend.CallResourceRequest{
+		PluginContext: bobCtx,
+		Path:          "jobs/" + genSnap.JobID,
+		Method:        http.MethodGet,
+	}, bobSender)
+	if bobSender.resp == nil || bobSender.resp.Status != http.StatusForbidden {
+		t.Fatalf("expected 403 for bob on replica 2, got %+v", bobSender.resp)
+	}
+
+	// Patch on Replica 2 (rev 1 -> rev 2).
+	patchSender := &captureSender{}
+	_ = app2.CallResource(context.Background(), &backend.CallResourceRequest{
+		PluginContext: aliceCtx,
+		Path:          "jobs/" + genSnap.JobID + "/patch",
+		Method:        http.MethodPost,
+		Body: []byte(`{
+			"baseRevision": 1,
+			"targetPanelId": "panel-error-rate",
+			"editIntent": "Switch error rate to timeseries",
+			"catalog": [
+				{"name": "http_requests_total", "type": "counter", "labels": ["service", "status"]}
+			]
+		}`),
+	}, patchSender)
+	if patchSender.resp == nil || patchSender.resp.Status != http.StatusOK {
+		t.Fatalf("replica 2 patch failed: %+v (body=%s)", patchSender.resp, string(patchSender.resp.Body))
+	}
+
+	// Undo on Replica 2 (rev 2 -> rev 3).
+	undoSender := &captureSender{}
+	_ = app2.CallResource(context.Background(), &backend.CallResourceRequest{
+		PluginContext: aliceCtx,
+		Path:          "jobs/" + genSnap.JobID + "/undo",
+		Method:        http.MethodPost,
+	}, undoSender)
+	if undoSender.resp == nil || undoSender.resp.Status != http.StatusOK {
+		t.Fatalf("replica 2 undo failed: %+v", undoSender.resp)
 	}
 }

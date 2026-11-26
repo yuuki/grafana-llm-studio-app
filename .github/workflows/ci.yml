@@ -53,6 +53,20 @@ jobs:
   backend:
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_DB: grafana
+          POSTGRES_USER: grafana
+          POSTGRES_PASSWORD: grafana-ci-password
+        ports:
+          - 5432
+        options: >-
+          --health-cmd="pg_isready -h 127.0.0.1 -U grafana -d grafana"
+          --health-interval=5s
+          --health-timeout=3s
+          --health-retries=10
     steps:
       - uses: actions/checkout@v7.0.1
         with:
@@ -65,7 +79,14 @@ jobs:
       - name: Vet
         run: make vet
 
-      - name: Test (race)
+      - name: Test (race — Memory, Redis/miniredis, PostgreSQL 16)
+        env:
+          LLM_STUDIO_REQUIRE_POSTGRES_TESTS: '1'
+          LLM_STUDIO_TEST_POSTGRES_ADDR: 127.0.0.1:${{ job.services.postgres.ports['5432'] }}
+          LLM_STUDIO_TEST_POSTGRES_DB: grafana
+          LLM_STUDIO_TEST_POSTGRES_USER: grafana
+          LLM_STUDIO_TEST_POSTGRES_PASSWORD: grafana-ci-password
+          LLM_STUDIO_TEST_POSTGRES_SSLMODE: disable
         run: make test-race
 
   lint:
@@ -122,6 +143,7 @@ jobs:
           docker compose -f deploy/docker-compose.yml config --quiet
           docker compose -f deploy/docker-compose.yml -f deploy/docker-compose.bench-verify.yml config --quiet
           docker compose -f deploy/docker-compose.yml -f deploy/docker-compose.redis.yml config --quiet
+          docker compose -f deploy/docker-compose.yml -f deploy/docker-compose.postgres.yml config --quiet
           docker compose -f deploy/docker-compose.yml -f deploy/docker-compose.victoriametrics.yml config --quiet
 
       - name: Upload plugin build

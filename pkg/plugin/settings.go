@@ -18,10 +18,11 @@ import (
 )
 
 const (
-	LLMModeGrafanaLLMApp  = "grafana-llm-app"
-	LLMModeMock           = "mock"
-	JobStoreBackendMemory = "memory"
-	JobStoreBackendRedis  = "redis"
+	LLMModeGrafanaLLMApp    = "grafana-llm-app"
+	LLMModeMock             = "mock"
+	JobStoreBackendMemory   = "memory"
+	JobStoreBackendRedis    = "redis"
+	JobStoreBackendPostgres = "postgres"
 )
 
 var allowedReasoningEfforts = map[string]bool{
@@ -69,6 +70,12 @@ type JSONSettings struct {
 	RedisKeyPrefix        string            `json:"redisKeyPrefix,omitempty"`
 	RedisTLS              bool              `json:"redisTls,omitempty"`
 	RedisUsername         string            `json:"redisUsername,omitempty"`
+	PostgresAddr          string            `json:"postgresAddr,omitempty"`
+	PostgresDatabase      string            `json:"postgresDatabase,omitempty"`
+	PostgresSchema        string            `json:"postgresSchema,omitempty"`
+	PostgresTablePrefix   string            `json:"postgresTablePrefix,omitempty"`
+	PostgresUsername      string            `json:"postgresUsername,omitempty"`
+	PostgresSSLMode       string            `json:"postgresSslMode,omitempty"`
 }
 
 // Settings combines validated jsonData and decrypted secureJsonData.
@@ -82,6 +89,9 @@ type Settings struct {
 	// redisPassword is the optional decrypted secret for jobStoreBackend=redis.
 	// It MUST NEVER be exposed in PublicConfig, health responses, or logs.
 	redisPassword string
+	// postgresPassword is the optional decrypted secret for jobStoreBackend=postgres.
+	// It MUST NEVER be exposed in PublicConfig, health responses, or logs.
+	postgresPassword string
 }
 
 // PublicConfig is the secret-free subset exposed to the Frontend via GET /config/public.
@@ -131,8 +141,9 @@ func (s Settings) Public() PublicConfig {
 }
 
 const (
-	BoundRedisPasswordPrefix = "llmstudio-redis-bound-v1:"   //nolint:gosec // G101: envelope format prefix constant, not a credential
-	BoundGrafanaTokenPrefix  = "llmstudio-grafana-bound-v1:" //nolint:gosec // G101: envelope format prefix constant, not a credential
+	BoundRedisPasswordPrefix    = "llmstudio-redis-bound-v1:"    //nolint:gosec // G101: envelope format prefix constant, not a credential
+	BoundPostgresPasswordPrefix = "llmstudio-postgres-bound-v1:" //nolint:gosec // G101: envelope format prefix constant, not a credential
+	BoundGrafanaTokenPrefix     = "llmstudio-grafana-bound-v1:"  //nolint:gosec // G101: envelope format prefix constant, not a credential
 )
 
 // LoadOptions supplies deployment-level trusted boundaries from Grafana or process environment.
@@ -141,11 +152,19 @@ type LoadOptions struct {
 	TrustedGrafanaAppURL string
 	// PinnedRedisAddr optionally pins redisAddr at the deployment level (from LLMSTUDIO_REDIS_ADDR).
 	PinnedRedisAddr string
+	// PinnedPostgresAddr optionally pins postgresAddr at the deployment level (from LLMSTUDIO_POSTGRES_ADDR).
+	PinnedPostgresAddr string
 }
 
 type boundRedisPasswordPayload struct {
 	Addr     string `json:"addr"`
 	TLS      bool   `json:"tls"`
+	Password string `json:"password"`
+}
+
+type boundPostgresPasswordPayload struct {
+	Addr     string `json:"addr"`
+	SSLMode  string `json:"sslMode"`
 	Password string `json:"password"`
 }
 
@@ -171,6 +190,32 @@ func EncodeBoundRedisPassword(addr string, tlsEnabled bool, password string) (st
 		return "", err
 	}
 	return BoundRedisPasswordPrefix + string(b), nil
+}
+
+// EncodeBoundPostgresPassword encodes a PostgreSQL password bound to a specific host:port and SSL mode.
+func EncodeBoundPostgresPassword(addr, sslMode, password string) (string, error) {
+	if err := jobs.ValidatePostgresAddr(addr); err != nil {
+		return "", err
+	}
+	normalizedSSL := strings.TrimSpace(strings.ToLower(sslMode))
+	if normalizedSSL == "" {
+		normalizedSSL = jobs.DefaultPostgresSSLMode
+	}
+	if err := jobs.ValidatePostgresSSLMode(normalizedSSL); err != nil {
+		return "", err
+	}
+	if password == "" {
+		return "", errors.New("postgres password must not be empty")
+	}
+	b, err := json.Marshal(boundPostgresPasswordPayload{ //nolint:gosec // G117: intentionally marshals destination-bound secret envelope for encrypted secureJsonData
+		Addr:     strings.TrimSpace(addr),
+		SSLMode:  normalizedSSL,
+		Password: password,
+	})
+	if err != nil {
+		return "", err
+	}
+	return BoundPostgresPasswordPrefix + string(b), nil
 }
 
 // EncodeBoundGrafanaToken encodes a Grafana service account token bound to a specific Grafana base URL
@@ -218,6 +263,7 @@ func LoadSettingsWithOptions(appSettings backend.AppInstanceSettings, opts LoadO
 
 	trustedAppURL := strings.TrimSpace(opts.TrustedGrafanaAppURL)
 	pinnedRedisAddr := strings.TrimSpace(opts.PinnedRedisAddr)
+	pinnedPostgresAddr := strings.TrimSpace(opts.PinnedPostgresAddr)
 
 	if strings.TrimSpace(js.LLMMode) == "" {
 		js.LLMMode = LLMModeGrafanaLLMApp
@@ -349,8 +395,8 @@ func LoadSettingsWithOptions(appSettings backend.AppInstanceSettings, opts LoadO
 	if js.JobStoreBackend == "" {
 		js.JobStoreBackend = JobStoreBackendMemory
 	}
-	if js.JobStoreBackend != JobStoreBackendMemory && js.JobStoreBackend != JobStoreBackendRedis {
-		return Settings{}, fmt.Errorf("unsupported jobStoreBackend %q (must be %q or %q)", js.JobStoreBackend, JobStoreBackendMemory, JobStoreBackendRedis)
+	if js.JobStoreBackend != JobStoreBackendMemory && js.JobStoreBackend != JobStoreBackendRedis && js.JobStoreBackend != JobStoreBackendPostgres {
+		return Settings{}, fmt.Errorf("unsupported jobStoreBackend %q (must be %q, %q, or %q)", js.JobStoreBackend, JobStoreBackendMemory, JobStoreBackendRedis, JobStoreBackendPostgres)
 	}
 	if js.JobTTLMinutes <= 0 || js.JobTTLMinutes > 1440 {
 		js.JobTTLMinutes = 30
@@ -386,11 +432,59 @@ func LoadSettingsWithOptions(appSettings backend.AppInstanceSettings, opts LoadO
 		}
 	}
 
+	js.PostgresAddr = strings.TrimSpace(js.PostgresAddr)
+	js.PostgresDatabase = strings.TrimSpace(js.PostgresDatabase)
+	js.PostgresSchema = strings.TrimSpace(js.PostgresSchema)
+	js.PostgresTablePrefix = strings.TrimSpace(js.PostgresTablePrefix)
+	js.PostgresUsername = strings.TrimSpace(js.PostgresUsername)
+	js.PostgresSSLMode = strings.TrimSpace(strings.ToLower(js.PostgresSSLMode))
+	if js.JobStoreBackend == JobStoreBackendPostgres {
+		if pinnedPostgresAddr != "" {
+			if err := jobs.ValidatePostgresAddr(pinnedPostgresAddr); err != nil {
+				return Settings{}, fmt.Errorf("invalid operator-pinned LLMSTUDIO_POSTGRES_ADDR: %w", err)
+			}
+			if js.PostgresAddr == "" {
+				js.PostgresAddr = pinnedPostgresAddr
+			} else if canonicalRedisAddr(js.PostgresAddr) != canonicalRedisAddr(pinnedPostgresAddr) {
+				return Settings{}, fmt.Errorf("postgresAddr %q does not match operator-pinned LLMSTUDIO_POSTGRES_ADDR", js.PostgresAddr)
+			}
+		}
+		if err := jobs.ValidatePostgresAddr(js.PostgresAddr); err != nil {
+			return Settings{}, err
+		}
+		if err := jobs.ValidatePostgresDatabase(js.PostgresDatabase); err != nil {
+			return Settings{}, err
+		}
+		if err := jobs.ValidatePostgresUsername(js.PostgresUsername); err != nil {
+			return Settings{}, err
+		}
+		if err := jobs.ValidatePostgresSchema(js.PostgresSchema); err != nil {
+			return Settings{}, err
+		}
+		if js.PostgresSchema == "" {
+			js.PostgresSchema = jobs.DefaultPostgresSchema
+		}
+		if err := jobs.ValidatePostgresTablePrefix(js.PostgresTablePrefix); err != nil {
+			return Settings{}, err
+		}
+		if js.PostgresTablePrefix == "" {
+			js.PostgresTablePrefix = jobs.DefaultPostgresTablePrefix
+		}
+		if err := jobs.ValidatePostgresSSLMode(js.PostgresSSLMode); err != nil {
+			return Settings{}, err
+		}
+		if js.PostgresSSLMode == "" {
+			js.PostgresSSLMode = jobs.DefaultPostgresSSLMode
+		}
+	}
+
 	var token string
 	var redisPass string
+	var postgresPass string
 	if appSettings.DecryptedSecureJSONData != nil {
 		token = strings.TrimSpace(appSettings.DecryptedSecureJSONData["llmServiceAccountToken"])
 		redisPass = appSettings.DecryptedSecureJSONData["redisPassword"]
+		postgresPass = appSettings.DecryptedSecureJSONData["postgresPassword"]
 	}
 
 	if token != "" {
@@ -413,12 +507,25 @@ func LoadSettingsWithOptions(appSettings backend.AppInstanceSettings, opts LoadO
 		redisPass = ""
 	}
 
+	if js.JobStoreBackend == JobStoreBackendPostgres {
+		if postgresPass != "" {
+			unwrappedPass, err := unwrapBoundPostgresPassword(postgresPass, js.PostgresAddr, js.PostgresSSLMode)
+			if err != nil {
+				return Settings{}, err
+			}
+			postgresPass = unwrappedPass
+		}
+	} else {
+		postgresPass = ""
+	}
+
 	return Settings{
 		JSONSettings:             js,
 		EffectiveReasoningEffort: reasoning,
 		EffectiveMaxRepairs:      effectiveRepairs,
 		llmServiceAccountToken:   token,
 		redisPassword:            redisPass,
+		postgresPassword:         postgresPass,
 	}, nil
 }
 
@@ -435,6 +542,24 @@ func unwrapBoundRedisPassword(rawSecret, activeAddr string, activeTLS bool) (str
 	}
 	if canonicalRedisAddr(payload.Addr) != canonicalRedisAddr(activeAddr) || payload.TLS != activeTLS {
 		return "", errors.New("stored redisPassword is bound to a different Redis endpoint or TLS setting; re-enter or reset redisPassword")
+	}
+	return payload.Password, nil
+}
+
+func unwrapBoundPostgresPassword(rawSecret, activeAddr, activeSSLMode string) (string, error) {
+	if !strings.HasPrefix(rawSecret, BoundPostgresPasswordPrefix) {
+		return rawSecret, nil
+	}
+	var payload boundPostgresPasswordPayload
+	if err := json.Unmarshal([]byte(strings.TrimPrefix(rawSecret, BoundPostgresPasswordPrefix)), &payload); err != nil {
+		return "", errors.New("stored postgresPassword binding metadata is malformed; re-enter or reset postgresPassword")
+	}
+	boundSSL := strings.TrimSpace(strings.ToLower(payload.SSLMode))
+	if err := jobs.ValidatePostgresAddr(payload.Addr); err != nil || boundSSL == "" || jobs.ValidatePostgresSSLMode(boundSSL) != nil || payload.Password == "" {
+		return "", errors.New("stored postgresPassword binding metadata is incomplete; re-enter or reset postgresPassword")
+	}
+	if canonicalRedisAddr(payload.Addr) != canonicalRedisAddr(activeAddr) || boundSSL != activeSSLMode {
+		return "", errors.New("stored postgresPassword is bound to a different PostgreSQL endpoint or SSL mode; re-enter or reset postgresPassword")
 	}
 	return payload.Password, nil
 }

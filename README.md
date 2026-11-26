@@ -151,20 +151,27 @@ Configured via **Administration → Plugins → LLM Dashboard Studio** (`jsonDat
 | `validationTimeoutSeconds` | `jsonData` | `10` | `2..30` | Per-panel dry-run query timeout |
 | `maxConcurrentQueries` | `jsonData` | `2` | `1..4` | Concurrent dry-run query cap in the browser |
 | `enableSseProgress` | `jsonData` | `false` | `boolean` | Opt-in decoupled SSE stage-progress streaming over `CallResource` (`generating` -> `validating_ir` -> `awaiting_preview`, never raw LLM tokens); requires reverse-proxy `proxy_buffering off` and HTTP/1.1, with graceful non-streaming fallback |
-| `jobStoreBackend` | `jsonData` | `"memory"` | `"memory"`, `"redis"` | Job storage backend (`"memory"` zero-dependency default; `"redis"` for HA multi-replica persistence) |
+| `jobStoreBackend` | `jsonData` | `"memory"` | `"memory"`, `"redis"`, `"postgres"` | Job storage backend (`"memory"` zero-dependency default; `"redis"` or `"postgres"` for HA multi-replica persistence) |
 | `jobTtlMinutes` | `jsonData` | `30` | `1..1440` | Automatic expiration TTL (minutes) for idle draft jobs |
 | `redisAddr` | `jsonData` | *(unset)* | `host:port` or `[ipv6]:port` | Single-endpoint Redis/Valkey server or cluster proxy address (required when `jobStoreBackend="redis"`; optionally operator-pinned via `LLMSTUDIO_REDIS_ADDR`) |
 | `redisDb` | `jsonData` | `0` | `0..15` | Redis logical database index (use `0` when connecting through a Redis Cluster proxy) |
 | `redisKeyPrefix` | `jsonData` | `"llmstudio:jobs"` | `[a-zA-Z0-9:_-]{1,64}` | Redis key namespace prefix wrapped in `{prefix}` hash tag (all Lua scripts access only declared `KEYS[]`) |
 | `redisTls` | `jsonData` | `false` | `boolean` | Enable TLS (minimum TLS 1.2) using the container/host system CA trust store |
-| `redisUsername` | `jsonData` | *(unset)* | `<= 128` chars | Optional Redis 6+ ACL username |
+| `redisUsername` | `jsonData` | *(unset)* | `<= 128` UTF-8 bytes | Optional Redis 6+ ACL username |
 | `redisPassword` | `secureJsonData` | *(unset)* | Encrypted secret | Optional Redis password stored encrypted in `secureJsonData`, bound to `redisAddr` + `redisTls` (re-entry required on change) |
+| `postgresAddr` | `jsonData` | *(unset)* | `host:port` or `[ipv6]:port` | Single-endpoint PostgreSQL server address (required when `jobStoreBackend="postgres"`; optionally operator-pinned via `LLMSTUDIO_POSTGRES_ADDR`; connect directly or via session pooling — PgBouncer transaction pooling breaks `LISTEN`/`NOTIFY`; no URL scheme, whitespace, or credentials) |
+| `postgresDatabase` | `jsonData` | *(unset)* | `1..63` UTF-8 bytes (no whitespace/control/BOM) | Target PostgreSQL database name (required when `jobStoreBackend="postgres"`) |
+| `postgresSchema` | `jsonData` | `"public"` | `[a-z_][a-z0-9_]{0,62}` (excl. `pg_*`, `information_schema`) | Lowercase PostgreSQL schema for plugin tables (on PG 15+ or when sharing Grafana's DB, pre-create a dedicated schema such as `llm_studio`, or pre-create tables for a least-privilege DML-only role) |
+| `postgresTablePrefix` | `jsonData` | `"llm_studio_"` | `[a-z_][a-z0-9_]{0,31}` | Lowercase prefix for plugin-owned PostgreSQL tables (`<prefix>jobs`, `<prefix>slots`) |
+| `postgresUsername` | `jsonData` | *(unset)* | `1..128` UTF-8 bytes (no control/BOM) | PostgreSQL login username (required when `jobStoreBackend="postgres"`) |
+| `postgresPassword` | `secureJsonData` | *(unset)* | Encrypted secret | Optional PostgreSQL password stored encrypted in `secureJsonData`, bound to `postgresAddr` + `postgresSslMode` (re-entry required on change) |
+| `postgresSslMode` | `jsonData` | `"prefer"` | `"disable"`, `"prefer"`, `"require"`, `"verify-ca"`, `"verify-full"` | PostgreSQL TLS mode (minimum TLS 1.2; sends SNI for DNS hosts; `verify-ca`/`verify-full` validate against the container/host system root CA trust store; use `require`, `verify-ca`, or `verify-full` in production) |
 
 ## Security & Trust Boundaries
 
 - **Trusted Identity & Isolation:** Job ownership is bound to Grafana's server-supplied `PluginContext` (`OrgID` + `User.Login`). Browser-supplied IDs are never trusted for authorization.
 - **No Cross-User Metadata Cache:** Metric names, `HELP` strings, and label values are kept strictly in browser memory per session and cleared on organization or datasource switch.
-- **SSRF, Redirect, & Credential-Redirection Protection:** When Grafana's trusted `AppURL` (or operator-pinned `LLMSTUDIO_GRAFANA_URL`) is present, `grafanaUrl` is strictly pinned to that exact base URL (arbitrary loopback ports are rejected) and `llmclient` disables HTTP redirects. Stored UI credentials (`redisPassword` and `llmServiceAccountToken`) are bound to their target endpoint/TLS mode so changing the destination requires re-entering or clearing the secret; operators can also pin Redis at the deployment level via `LLMSTUDIO_REDIS_ADDR`.
+- **SSRF, Redirect, & Credential-Redirection Protection:** When Grafana's trusted `AppURL` (or operator-pinned `LLMSTUDIO_GRAFANA_URL`) is present, `grafanaUrl` is strictly pinned to that exact base URL (arbitrary loopback ports are rejected) and `llmclient` disables HTTP redirects. Stored UI credentials (`redisPassword`, `postgresPassword`, and `llmServiceAccountToken`) are bound to their target endpoint/TLS mode so changing the destination requires re-entering or clearing the secret; operators can also pin Redis or PostgreSQL at the deployment level via `LLMSTUDIO_REDIS_ADDR` and `LLMSTUDIO_POSTGRES_ADDR`.
 - **Prompt Injection Defense-in-Depth:** User prompts, metric metadata, LLM outputs, and datasource errors are treated as untrusted input—sanitized, length-bounded, and checked against deterministic schemas, catalog allowlists, and PromQL AST/regex safety rules. Raw URLs, HTML, JavaScript, and arbitrary datasource UIDs are disallowed in the IR.
 - **Multi-Tenancy Caveat (Grafana OSS):** Within a single Grafana OSS organization, folder permissions or UI hiding do **not** isolate Prometheus metric access. Serving users with different data-access scopes in production requires separate Grafana organizations paired with upstream credential, tenant, or authorization-proxy isolation (detailed in [`docs/architecture.md`](docs/architecture.md)).
 
@@ -182,6 +189,8 @@ make help    # every target, with a one-line description
 make verify-schemas    # Bidirectional enum & string-only schema sync (JSON Schema <-> TS <-> Go)
 make lint              # golangci-lint, go.mod tidiness, TypeScript type check and ESLint
 make test-race         # Go unit, PromQL/MetricsQL AST, job isolation, and grafana-llm-app contract tests
+# To include live PostgreSQL integration & race tests locally:
+LLM_STUDIO_TEST_POSTGRES_ADDR=127.0.0.1:5432 LLM_STUDIO_TEST_POSTGRES_DB=grafana LLM_STUDIO_TEST_POSTGRES_USER=grafana LLM_STUDIO_TEST_POSTGRES_PASSWORD=grafana-dev-pass LLM_STUDIO_TEST_POSTGRES_SSLMODE=disable make test-race
 make test-frontend     # Jest unit, Scenes/Foundation parity, saver, and UI lifecycle tests
 make test-release      # Unit tests for multi-arch build, checksum, and MANIFEST.txt verification helpers
 make build             # dist/module.js (externals checked) and dist/gpx_yuuki_llmstudio_app_linux_amd64
@@ -189,6 +198,7 @@ make build-backend-all # All 5 Go backend targets (linux/amd64, linux/arm64, dar
 make package-airgap    # Package .zip, .tar.gz, .zip.sha1, -airgap.tar.gz, and SHA256SUMS + verify all archives
 make test-fuzz         # Go fuzz targets: IR decoding and patching, PromQL/MetricsQL validators, settings
 make vuln vuln-deps    # govulncheck for the Go code, osv-scanner for package-lock.json
+docker compose -f deploy/docker-compose.yml -f deploy/docker-compose.postgres.yml up -d  # Optional PostgreSQL HA overlay
 ```
 
 [CONTRIBUTING.md](CONTRIBUTING.md) describes how to propose a change, and [AGENTS.md](AGENTS.md) lists the design rules, the compatibility contracts and the checks each kind of change needs. Report vulnerabilities as [SECURITY.md](SECURITY.md) describes.
@@ -215,14 +225,14 @@ GitHub Actions runs the same checks: `.github/workflows/ci.yml` (lint, unit test
 ├── tests/e2e/              # Live Playwright / @grafana/plugin-e2e tests
 ├── schemas/                # Canonical Dashboard IR & Patch JSON Schemas and sample payloads
 ├── scripts/                # Schema sync verifier, bundle verifier, multi-arch release packager/verifier, and E2E helpers
-├── deploy/                 # Local Docker Compose stack (+ optional OpenAI/Redis/VictoriaMetrics overrides), Prometheus config, provisioning templates
+├── deploy/                 # Local Docker Compose stack (+ optional OpenAI/Redis/Postgres/VictoriaMetrics overrides), Prometheus config, provisioning templates
 └── docs/                   # Architecture, compatibility matrix, signing & publishing, air-gapped & OpenAI-compatible API guides, and ADRs
 ```
 
 ## Known Limitations (MVP Scope)
 
 - **Scope:** Single Grafana organization, Prometheus-compatible datasources (PromQL & VictoriaMetrics MetricsQL), auto-refresh disabled, non-streaming structured LLM outputs (with optional decoupled SSE stage-progress notifications via `enableSseProgress: true`). (Loki, Tempo, ClickHouse, repeat panels, GitOps sync, and MCP/tool execution are out of scope for MVP.)
-- **Job State Persistence:** Defaults to process-local in-memory storage (`jobStoreBackend: "memory"`). For multi-replica HA Grafana deployments or restart persistence, enable `jobStoreBackend: "redis"` (see `deploy/docker-compose.redis.yml` for a local overlay).
+- **Job State Persistence:** Defaults to process-local in-memory storage (`jobStoreBackend: "memory"`). For multi-replica HA Grafana deployments or restart persistence, enable `jobStoreBackend: "redis"` (`deploy/docker-compose.redis.yml`) or `jobStoreBackend: "postgres"` (`deploy/docker-compose.postgres.yml`, which can share Grafana's own PostgreSQL server using a dedicated schema or table prefix).
 - **`grafana-llm-app` JSON Schema Proxy Behavior:** `grafana-llm-app` (`v1.0.8` / `v1.2.0`) unmarshals `response_format.json_schema.schema` into `go-openai/jsonschema.Definition`, which strips numeric/length/regex keywords and `extra_body`. Structure, `additionalProperties: false`, and string enums are enforced via structured outputs (or system-prompt schema in `json_object` mode), while bounds, regexes, PromQL AST rules, and catalog membership are deterministically re-enforced in the Go backend.
 - **Verification Coverage:** Automated unit tests, Scenes/Foundation parity tests, bundle externalization checks (`verify:bundle`), `grafana-llm-app` HTTP contract tests, live `CallResource` SSE flush & client-disconnect verification (`scripts/verify-sse-callresource.mjs`), and live Playwright / `@grafana/plugin-e2e` tests against running Grafana `13.3.1` (React 19) and `12.4.15` (React 18) containers (in mock mode with live Prometheus) run in GitHub Actions CI. Live LLM inference backends (vLLM or OpenAI-compatible APIs via `grafana-llm-app`) should still be validated in your target environment before production rollout.
 
