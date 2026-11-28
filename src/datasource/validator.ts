@@ -311,42 +311,66 @@ async function validateSinglePanel(
 const TIMEOUT_TOKEN_REGEX =
   /(?:^|[^a-z0-9_])(?:timeout|timed out|deadline exceeded|maxqueryduration|context canceled)(?:$|[^a-z0-9_])/i;
 
+const PERMISSION_ERROR_KEYWORDS = [
+  'forbidden',
+  'unauthorized',
+  'access denied',
+  'permission denied',
+];
+
+const INFRA_OR_LIMIT_ERROR_KEYWORDS = [
+  'connection refused',
+  'no such host',
+  'dial tcp',
+  'unexpected eof',
+  'maxuniquetimeseries',
+  'maxmemory',
+  'maxsamples',
+  'out of memory',
+  'exceeds',
+];
+
+const SYNTAX_ERROR_KEYWORDS = [
+  'parse error',
+  'bad_data',
+  'unexpected',
+  'invalid parameter',
+  'unknown function',
+  'cannot parse',
+  'unsupported function',
+  'invalid number of args',
+  'unparsed data',
+  'cannot expand with',
+  'missing closing',
+  'many-to-many',
+  'duplicate match',
+];
+
+function matchesAnyKeyword(lower: string, keywords: readonly string[]): boolean {
+  return keywords.some((kw) => lower.includes(kw));
+}
+
+function classifyDatasourceErrorMessage(message: string): ValidationCategory {
+  const lower = message.toLowerCase();
+  if (matchesAnyKeyword(lower, PERMISSION_ERROR_KEYWORDS)) {
+    return 'permission_error';
+  }
+  if (TIMEOUT_TOKEN_REGEX.test(message)) {
+    return 'timeout';
+  }
+  if (matchesAnyKeyword(lower, INFRA_OR_LIMIT_ERROR_KEYWORDS)) {
+    return 'datasource_error';
+  }
+  if (matchesAnyKeyword(lower, SYNTAX_ERROR_KEYWORDS)) {
+    return 'syntax_error';
+  }
+  return 'datasource_error';
+}
+
 export function classifyDatasourceError(
   status?: number,
   message = ''
 ): ValidationCategory {
-  const lower = message.toLowerCase();
-  const isPermissionMsg =
-    lower.includes('forbidden') ||
-    lower.includes('unauthorized') ||
-    lower.includes('access denied') ||
-    lower.includes('permission denied');
-  const isTimeoutMsg = TIMEOUT_TOKEN_REGEX.test(message);
-  const isInfraOrLimitMsg =
-    lower.includes('connection refused') ||
-    lower.includes('no such host') ||
-    lower.includes('dial tcp') ||
-    lower.includes('unexpected eof') ||
-    lower.includes('maxuniquetimeseries') ||
-    lower.includes('maxmemory') ||
-    lower.includes('maxsamples') ||
-    lower.includes('out of memory') ||
-    lower.includes('exceeds');
-  const isSyntaxMsg =
-    lower.includes('parse error') ||
-    lower.includes('bad_data') ||
-    lower.includes('unexpected') ||
-    lower.includes('invalid parameter') ||
-    lower.includes('unknown function') ||
-    lower.includes('cannot parse') ||
-    lower.includes('unsupported function') ||
-    lower.includes('invalid number of args') ||
-    lower.includes('unparsed data') ||
-    lower.includes('cannot expand with') ||
-    lower.includes('missing closing') ||
-    lower.includes('many-to-many') ||
-    lower.includes('duplicate match');
-
   // 1. Trust explicit HTTP status codes first so metric names (e.g. http_timeout_total,
   //    auth_permission_checks_total) inside 400 parse errors are never misclassified.
   if (status === 401 || status === 403) {
@@ -359,41 +383,14 @@ export function classifyDatasourceError(
     // Classify permission, timeout, and network/resource-limit errors BEFORE syntax patterns:
     // victoriametrics-metrics-datasource maps transport/timeout errors to HTTP 400 and VM maps
     // -search.maxQueryDuration / -search.maxUniqueTimeseries to HTTP 422.
-    if (isPermissionMsg) {
-      return 'permission_error';
-    }
-    if (isTimeoutMsg) {
-      return 'timeout';
-    }
-    if (isInfraOrLimitMsg) {
-      return 'datasource_error';
-    }
-    if (isSyntaxMsg) {
-      return 'syntax_error';
-    }
-    return 'datasource_error';
+    return classifyDatasourceErrorMessage(message);
   }
   if (status !== undefined && status >= 500) {
-    if (isTimeoutMsg) {
-      return 'timeout';
-    }
-    return 'datasource_error';
+    return TIMEOUT_TOKEN_REGEX.test(message) ? 'timeout' : 'datasource_error';
   }
 
   // 2. Fallback heuristic when status is omitted or 200 with embedded error text.
-  if (isPermissionMsg) {
-    return 'permission_error';
-  }
-  if (isTimeoutMsg) {
-    return 'timeout';
-  }
-  if (isInfraOrLimitMsg) {
-    return 'datasource_error';
-  }
-  if (isSyntaxMsg) {
-    return 'syntax_error';
-  }
-  return 'datasource_error';
+  return classifyDatasourceErrorMessage(message);
 }
 
 function extractAndClassifyError(

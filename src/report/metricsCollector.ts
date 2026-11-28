@@ -122,104 +122,134 @@ export function parseFramesToSeries(frames: GrafanaDataFrame[] | undefined): Par
   }
   const series: ParsedSeries[] = [];
   for (const frame of frames) {
-    const fields = frame.schema?.fields ?? [];
-    const columns = frame.data?.values ?? [];
-    if (columns.length === 0) {
-      continue;
-    }
-
-    let timeColIdx = fields.findIndex((f) => f.type === 'time');
-    if (timeColIdx === -1 && columns.length >= 2) {
-      timeColIdx = 0;
-    }
-    const rawTimes = timeColIdx >= 0 ? columns[timeColIdx] ?? [] : [];
-
-    // Detect long-format frames: string label columns alongside numeric columns.
-    const stringColIndices: number[] = [];
-    for (let i = 0; i < columns.length; i++) {
-      if (i !== timeColIdx && fields[i]?.type === 'string') {
-        stringColIndices.push(i);
-      }
-    }
-
-    for (let colIdx = 0; colIdx < columns.length; colIdx++) {
-      if (colIdx === timeColIdx) {
-        continue;
-      }
-      const fieldMeta = fields[colIdx];
-      if (fieldMeta?.type && fieldMeta.type !== 'number') {
-        continue;
-      }
-      const rawVals = columns[colIdx] ?? [];
-
-      if (stringColIndices.length > 0 && (!fieldMeta?.labels || Object.keys(fieldMeta.labels).length === 0)) {
-        // Long DataFrame: partition rows by tuple of string label columns.
-        const grouped = new Map<string, { timestamps: number[]; values: number[] }>();
-        for (let i = 0; i < rawVals.length; i++) {
-          const num = parseFiniteNumericCell(rawVals[i]);
-          if (!Number.isFinite(num)) {
-            continue;
-          }
-          const labelPairs = stringColIndices
-            .map((si) => {
-              const colName = fields[si]?.name || `label_${si}`;
-              const cell = columns[si]?.[i];
-              return `${colName}=${cell === null || cell === undefined ? '' : String(cell)}`;
-            })
-            .sort();
-          const fullKey = labelPairs.join(', ') || fieldMeta?.name || frame.name || `series_${colIdx}`;
-          let bucket = grouped.get(fullKey);
-          if (!bucket) {
-            bucket = { timestamps: [], values: [] };
-            grouped.set(fullKey, bucket);
-          }
-          const rawT = rawTimes[i];
-          const ts = typeof rawT === 'number' && Number.isFinite(rawT) ? rawT : 0;
-          bucket.timestamps.push(ts);
-          bucket.values.push(num);
-        }
-        for (const [fullKey, bucket] of grouped.entries()) {
-          if (bucket.values.length > 0) {
-            series.push({
-              fullLabelKey: fullKey,
-              labelKey: fullKey.slice(0, 140),
-              timestamps: bucket.timestamps,
-              values: bucket.values,
-            });
-          }
-        }
-        continue;
-      }
-
-      const timestamps: number[] = [];
-      const values: number[] = [];
-
-      for (let i = 0; i < rawVals.length; i++) {
-        const num = parseFiniteNumericCell(rawVals[i]);
-        if (!Number.isFinite(num)) {
-          continue;
-        }
-        const rawT = rawTimes[i];
-        const ts = typeof rawT === 'number' && Number.isFinite(rawT) ? rawT : 0;
-        timestamps.push(ts);
-        values.push(num);
-      }
-
-      if (values.length > 0) {
-        const fullLabelKey = fullCanonicalLabelString(
-          fieldMeta?.labels,
-          fieldMeta?.name || frame.name || `series_${colIdx}`
-        );
-        series.push({
-          fullLabelKey,
-          labelKey: fullLabelKey.slice(0, 140),
-          timestamps,
-          values,
-        });
-      }
-    }
+    parseFrameIntoSeries(frame, series);
   }
   return series;
+}
+
+function parseFrameIntoSeries(frame: GrafanaDataFrame, series: ParsedSeries[]): void {
+  const fields = frame.schema?.fields ?? [];
+  const columns = frame.data?.values ?? [];
+  if (columns.length === 0) {
+    return;
+  }
+
+  let timeColIdx = fields.findIndex((f) => f.type === 'time');
+  if (timeColIdx === -1 && columns.length >= 2) {
+    timeColIdx = 0;
+  }
+  const rawTimes = timeColIdx >= 0 ? columns[timeColIdx] ?? [] : [];
+
+  // Detect long-format frames: string label columns alongside numeric columns.
+  const stringColIndices: number[] = [];
+  for (let i = 0; i < columns.length; i++) {
+    if (i !== timeColIdx && fields[i]?.type === 'string') {
+      stringColIndices.push(i);
+    }
+  }
+
+  for (let colIdx = 0; colIdx < columns.length; colIdx++) {
+    if (colIdx === timeColIdx) {
+      continue;
+    }
+    const fieldMeta = fields[colIdx];
+    if (fieldMeta?.type && fieldMeta.type !== 'number') {
+      continue;
+    }
+    const rawVals = columns[colIdx] ?? [];
+    const isLongColumn =
+      stringColIndices.length > 0 &&
+      (!fieldMeta?.labels || Object.keys(fieldMeta.labels).length === 0);
+
+    if (isLongColumn) {
+      parseLongFrameColumn(frame, fields, columns, stringColIndices, rawTimes, rawVals, colIdx, series);
+    } else {
+      parseWideFrameColumn(frame, fieldMeta, rawTimes, rawVals, colIdx, series);
+    }
+  }
+}
+
+function parseLongFrameColumn(
+  frame: GrafanaDataFrame,
+  fields: NonNullable<NonNullable<GrafanaDataFrame['schema']>['fields']>,
+  columns: unknown[][],
+  stringColIndices: number[],
+  rawTimes: unknown[],
+  rawVals: unknown[],
+  colIdx: number,
+  series: ParsedSeries[]
+): void {
+  const fieldMeta = fields[colIdx];
+  const grouped = new Map<string, { timestamps: number[]; values: number[] }>();
+  for (let i = 0; i < rawVals.length; i++) {
+    const num = parseFiniteNumericCell(rawVals[i]);
+    if (!Number.isFinite(num)) {
+      continue;
+    }
+    const labelPairs = stringColIndices
+      .map((si) => {
+        const colName = fields[si]?.name || `label_${si}`;
+        const cell = columns[si]?.[i];
+        return `${colName}=${cell === null || cell === undefined ? '' : String(cell)}`;
+      })
+      .sort();
+    const fullKey = labelPairs.join(', ') || fieldMeta?.name || frame.name || `series_${colIdx}`;
+    let bucket = grouped.get(fullKey);
+    if (!bucket) {
+      bucket = { timestamps: [], values: [] };
+      grouped.set(fullKey, bucket);
+    }
+    const rawT = rawTimes[i];
+    const ts = typeof rawT === 'number' && Number.isFinite(rawT) ? rawT : 0;
+    bucket.timestamps.push(ts);
+    bucket.values.push(num);
+  }
+  for (const [fullKey, bucket] of grouped.entries()) {
+    if (bucket.values.length > 0) {
+      series.push({
+        fullLabelKey: fullKey,
+        labelKey: fullKey.slice(0, 140),
+        timestamps: bucket.timestamps,
+        values: bucket.values,
+      });
+    }
+  }
+}
+
+function parseWideFrameColumn(
+  frame: GrafanaDataFrame,
+  fieldMeta: NonNullable<NonNullable<GrafanaDataFrame['schema']>['fields']>[number] | undefined,
+  rawTimes: unknown[],
+  rawVals: unknown[],
+  colIdx: number,
+  series: ParsedSeries[]
+): void {
+  const timestamps: number[] = [];
+  const values: number[] = [];
+
+  for (let i = 0; i < rawVals.length; i++) {
+    const num = parseFiniteNumericCell(rawVals[i]);
+    if (!Number.isFinite(num)) {
+      continue;
+    }
+    const rawT = rawTimes[i];
+    const ts = typeof rawT === 'number' && Number.isFinite(rawT) ? rawT : 0;
+    timestamps.push(ts);
+    values.push(num);
+  }
+
+  if (values.length > 0) {
+    const fullLabelKey = fullCanonicalLabelString(
+      fieldMeta?.labels,
+      fieldMeta?.name || frame.name || `series_${colIdx}`
+    );
+    series.push({
+      fullLabelKey,
+      labelKey: fullLabelKey.slice(0, 140),
+      timestamps,
+      values,
+    });
+  }
 }
 
 function percentile(sorted: number[], p: number): number {
@@ -555,12 +585,7 @@ export async function collectDashboardMetricEvidence(
     deadlineCtrl.abort(new Error('overall_deadline'));
   }, overallDeadlineMs);
 
-  interface RankedMetric {
-    anomalyScore: number;
-    item: Omit<MetricEvidenceItem, 'id'>;
-  }
-
-  const rankedItems: RankedMetric[] = [];
+  const rankedItems: RankedMetricEntry[] = [];
   let cursor = 0;
   let baselineSkippedCount = 0;
   let analyzedPanelCount = 0;
@@ -593,159 +618,39 @@ export async function collectDashboardMetricEvidence(
       }
       panelQueried = true;
 
-      if (curRes.status === 'error' || curRes.status === 'timeout') {
+      const nonOkEntry = buildNonOkMetricEntry(panel, curRes);
+      if (nonOkEntry) {
         if (options.baselineMode !== 'none') {
           baselineSkippedCount++;
         }
-        rankedItems.push({
-          anomalyScore: 85,
-          item: {
-            panelTitle: panel.title,
-            unit: panel.unit,
-            queryStatus: curRes.status,
-            errorText: curRes.errorText,
-            trend: 'no_data',
-            thresholdBreached: 'none',
-            anomalyHint: 'query_error',
-          },
-        });
-        continue;
-      }
-
-      if (curRes.status === 'empty') {
-        if (options.baselineMode !== 'none') {
-          baselineSkippedCount++;
-        }
-        rankedItems.push({
-          anomalyScore: 45,
-          item: {
-            panelTitle: panel.title,
-            unit: panel.unit,
-            queryStatus: 'empty',
-            trend: 'no_data',
-            thresholdBreached: 'none',
-            anomalyHint: 'missing_data',
-          },
-        });
+        rankedItems.push(nonOkEntry);
         continue;
       }
 
       // Current query succeeded: optionally fetch baseline window for comparison.
-      const baselineByFullLabel = new Map<string, MetricBaselineStats>();
-      if (options.baselineMode !== 'none' && !deadlineCtrl.signal.aborted) {
-        const baseFromMs =
-          options.baselineMode === '24h_ago'
-            ? currentFromMs - 24 * 60 * 60 * 1000
-            : currentFromMs - winCfg.durationMs;
-        const baseToMs =
-          options.baselineMode === '24h_ago' ? currentToMs - 24 * 60 * 60 * 1000 : currentFromMs;
-        try {
-          const baseRes = await runSingleRangeQuery(
-            q,
-            baseFromMs,
-            baseToMs,
-            winCfg.intervalMs,
-            perQueryTimeoutMs,
-            deadlineCtrl.signal
-          );
-          if (baseRes.status === 'ok') {
-            for (const bs of baseRes.series) {
-              const bStats = computeWindowStats(bs, expectedSteps);
-              baselineByFullLabel.set(bs.fullLabelKey, {
-                avg: bStats.avg,
-                p95: bStats.p95,
-                max: bStats.max,
-              });
-            }
-          } else if (baseRes.status === 'error' || baseRes.status === 'timeout') {
-            baselineSkippedCount++;
-          }
-        } catch (err) {
-          if (options.signal?.aborted) {
-            throw err;
-          }
-          baselineSkippedCount++;
-        }
-      }
-
-      const lowerIsWorse = LOWER_IS_WORSE_RE.test(panel.title) || isInvertedThreshold(panel.thresholds);
-      const perPanelCandidates: RankedMetric[] = [];
-
-      for (const s of curRes.series) {
-        const current = computeWindowStats(s, expectedSteps);
-        const baseline = baselineByFullLabel.get(s.fullLabelKey);
-        const trend = classifyTrend(s.values, current.avg, current.min, current.max);
-        const thresholdBreached = evaluateThresholdBreach(current, panel.thresholds);
-
-        let deltaPctAvg: number | undefined;
-        let deltaPctP95: number | undefined;
-        let baselineWasZero = false;
-        if (baseline) {
-          if (Math.abs(baseline.avg) >= EPSILON_BASELINE) {
-            deltaPctAvg = roundNum(((current.avg - baseline.avg) / Math.abs(baseline.avg)) * 100);
-          } else {
-            baselineWasZero = true;
-          }
-          if (Math.abs(baseline.p95) >= EPSILON_BASELINE) {
-            deltaPctP95 = roundNum(((current.p95 - baseline.p95) / Math.abs(baseline.p95)) * 100);
-          } else {
-            baselineWasZero = true;
-          }
-        }
-
-        let anomalyHint: AnomalyHint = 'normal';
-        let anomalyScore = 10;
-
-        if (thresholdBreached === 'critical') {
-          anomalyHint = 'degraded';
-          anomalyScore = 100;
-        } else if (thresholdBreached === 'warning') {
-          anomalyHint = 'elevated';
-          anomalyScore = 80;
-        } else if (lowerIsWorse && current.min === 0 && (baseline === undefined || baseline.avg > 0.5)) {
-          anomalyHint = 'degraded';
-          anomalyScore = 95;
-        } else if (baselineWasZero && Math.abs(current.avg) >= EPSILON_BASELINE) {
-          // Series went from 0 baseline to non-zero activity (e.g., 5xx errors emerging from 0/s).
-          anomalyHint = 'degraded';
-          anomalyScore = 88;
-        } else if (deltaPctAvg !== undefined && Math.abs(deltaPctAvg) >= 50) {
-          anomalyHint = Math.abs(deltaPctAvg) >= 100 ? 'degraded' : 'elevated';
-          anomalyScore = Math.min(90, 50 + Math.abs(deltaPctAvg) / 5);
-        } else if (current.missingRatio >= 0.3) {
-          anomalyHint = 'missing_data';
-          anomalyScore = 60;
-        } else if (trend === 'spiking') {
-          anomalyHint = 'elevated';
-          anomalyScore = 55;
-        } else if (lowerIsWorse) {
-          anomalyScore = 20 - Math.min(15, current.min);
-        } else {
-          anomalyScore = 15 + Math.min(10, Math.abs(current.max) / 100);
-        }
-
-        perPanelCandidates.push({
-          anomalyScore,
-          item: {
-            panelTitle: panel.title,
-            unit: panel.unit,
-            seriesLabel: s.labelKey,
-            queryStatus: 'ok',
-            current,
-            baseline,
-            deltaPctAvg,
-            deltaPctP95,
-            baselineWasZero: baselineWasZero || undefined,
-            trend,
-            thresholdBreached,
-            anomalyHint,
-          },
-        });
+      const { baselineByFullLabel, skipped } = await fetchBaselineStatsForQuery(
+        q,
+        options.baselineMode,
+        currentFromMs,
+        currentToMs,
+        winCfg,
+        expectedSteps,
+        perQueryTimeoutMs,
+        deadlineCtrl.signal,
+        options.signal
+      );
+      if (skipped) {
+        baselineSkippedCount++;
       }
 
       // Keep top 3 most anomalous series per query so outages on low-value series (e.g. up == 0) are never hidden.
-      perPanelCandidates.sort((a, b) => b.anomalyScore - a.anomalyScore);
-      rankedItems.push(...perPanelCandidates.slice(0, 3));
+      const topCandidates = rankQuerySeriesCandidates(
+        panel,
+        curRes.series,
+        baselineByFullLabel,
+        expectedSteps
+      );
+      rankedItems.push(...topCandidates);
     }
 
     if (panelQueried) {
@@ -811,3 +716,205 @@ export async function collectDashboardMetricEvidence(
     analyzedPanelCount,
   };
 }
+
+interface RankedMetricEntry {
+  anomalyScore: number;
+  item: Omit<MetricEvidenceItem, 'id'>;
+}
+
+function buildNonOkMetricEntry(
+  panel: ExtractedReportPanel,
+  curRes: { status: 'ok' | 'empty' | 'error' | 'timeout'; errorText?: string }
+): RankedMetricEntry | null {
+  if (curRes.status === 'error' || curRes.status === 'timeout') {
+    return {
+      anomalyScore: 85,
+      item: {
+        panelTitle: panel.title,
+        unit: panel.unit,
+        queryStatus: curRes.status,
+        errorText: curRes.errorText,
+        trend: 'no_data',
+        thresholdBreached: 'none',
+        anomalyHint: 'query_error',
+      },
+    };
+  }
+  if (curRes.status === 'empty') {
+    return {
+      anomalyScore: 45,
+      item: {
+        panelTitle: panel.title,
+        unit: panel.unit,
+        queryStatus: 'empty',
+        trend: 'no_data',
+        thresholdBreached: 'none',
+        anomalyHint: 'missing_data',
+      },
+    };
+  }
+  return null;
+}
+
+async function fetchBaselineStatsForQuery(
+  q: ExtractedReportQuery,
+  baselineMode: BaselineMode,
+  currentFromMs: number,
+  currentToMs: number,
+  winCfg: { durationMs: number; intervalMs: number },
+  expectedSteps: number,
+  perQueryTimeoutMs: number,
+  deadlineSignal: AbortSignal,
+  externalSignal?: AbortSignal
+): Promise<{ baselineByFullLabel: Map<string, MetricBaselineStats>; skipped: boolean }> {
+  const baselineByFullLabel = new Map<string, MetricBaselineStats>();
+  if (baselineMode === 'none' || deadlineSignal.aborted) {
+    return { baselineByFullLabel, skipped: false };
+  }
+  const baseFromMs =
+    baselineMode === '24h_ago' ? currentFromMs - 24 * 60 * 60 * 1000 : currentFromMs - winCfg.durationMs;
+  const baseToMs =
+    baselineMode === '24h_ago' ? currentToMs - 24 * 60 * 60 * 1000 : currentFromMs;
+  try {
+    const baseRes = await runSingleRangeQuery(
+      q,
+      baseFromMs,
+      baseToMs,
+      winCfg.intervalMs,
+      perQueryTimeoutMs,
+      deadlineSignal
+    );
+    if (baseRes.status === 'ok') {
+      for (const bs of baseRes.series) {
+        const bStats = computeWindowStats(bs, expectedSteps);
+        baselineByFullLabel.set(bs.fullLabelKey, {
+          avg: bStats.avg,
+          p95: bStats.p95,
+          max: bStats.max,
+        });
+      }
+      return { baselineByFullLabel, skipped: false };
+    }
+    return {
+      baselineByFullLabel,
+      skipped: baseRes.status === 'error' || baseRes.status === 'timeout',
+    };
+  } catch (err) {
+    if (externalSignal?.aborted) {
+      throw err;
+    }
+    return { baselineByFullLabel, skipped: true };
+  }
+}
+
+function computeBaselineDeltas(
+  current: MetricWindowStats,
+  baseline: MetricBaselineStats | undefined
+): { deltaPctAvg?: number; deltaPctP95?: number; baselineWasZero: boolean } {
+  if (!baseline) {
+    return { baselineWasZero: false };
+  }
+  let deltaPctAvg: number | undefined;
+  let deltaPctP95: number | undefined;
+  let baselineWasZero = false;
+  if (Math.abs(baseline.avg) >= EPSILON_BASELINE) {
+    deltaPctAvg = roundNum(((current.avg - baseline.avg) / Math.abs(baseline.avg)) * 100);
+  } else {
+    baselineWasZero = true;
+  }
+  if (Math.abs(baseline.p95) >= EPSILON_BASELINE) {
+    deltaPctP95 = roundNum(((current.p95 - baseline.p95) / Math.abs(baseline.p95)) * 100);
+  } else {
+    baselineWasZero = true;
+  }
+  return { deltaPctAvg, deltaPctP95, baselineWasZero };
+}
+
+function classifySeriesAnomaly(
+  current: MetricWindowStats,
+  baseline: MetricBaselineStats | undefined,
+  deltaPctAvg: number | undefined,
+  baselineWasZero: boolean,
+  trend: MetricEvidenceItem['trend'],
+  thresholdBreached: MetricEvidenceItem['thresholdBreached'],
+  lowerIsWorse: boolean
+): { anomalyHint: AnomalyHint; anomalyScore: number } {
+  if (thresholdBreached === 'critical') {
+    return { anomalyHint: 'degraded', anomalyScore: 100 };
+  }
+  if (thresholdBreached === 'warning') {
+    return { anomalyHint: 'elevated', anomalyScore: 80 };
+  }
+  if (lowerIsWorse && current.min === 0 && (baseline === undefined || baseline.avg > 0.5)) {
+    return { anomalyHint: 'degraded', anomalyScore: 95 };
+  }
+  if (baselineWasZero && Math.abs(current.avg) >= EPSILON_BASELINE) {
+    // Series went from 0 baseline to non-zero activity (e.g., 5xx errors emerging from 0/s).
+    return { anomalyHint: 'degraded', anomalyScore: 88 };
+  }
+  if (deltaPctAvg !== undefined && Math.abs(deltaPctAvg) >= 50) {
+    return {
+      anomalyHint: Math.abs(deltaPctAvg) >= 100 ? 'degraded' : 'elevated',
+      anomalyScore: Math.min(90, 50 + Math.abs(deltaPctAvg) / 5),
+    };
+  }
+  if (current.missingRatio >= 0.3) {
+    return { anomalyHint: 'missing_data', anomalyScore: 60 };
+  }
+  if (trend === 'spiking') {
+    return { anomalyHint: 'elevated', anomalyScore: 55 };
+  }
+  const anomalyScore = lowerIsWorse
+    ? 20 - Math.min(15, current.min)
+    : 15 + Math.min(10, Math.abs(current.max) / 100);
+  return { anomalyHint: 'normal', anomalyScore };
+}
+
+function rankQuerySeriesCandidates(
+  panel: ExtractedReportPanel,
+  series: ParsedSeries[],
+  baselineByFullLabel: Map<string, MetricBaselineStats>,
+  expectedSteps: number
+): RankedMetricEntry[] {
+  const lowerIsWorse = LOWER_IS_WORSE_RE.test(panel.title) || isInvertedThreshold(panel.thresholds);
+  const candidates: RankedMetricEntry[] = [];
+
+  for (const s of series) {
+    const current = computeWindowStats(s, expectedSteps);
+    const baseline = baselineByFullLabel.get(s.fullLabelKey);
+    const trend = classifyTrend(s.values, current.avg, current.min, current.max);
+    const thresholdBreached = evaluateThresholdBreach(current, panel.thresholds);
+    const { deltaPctAvg, deltaPctP95, baselineWasZero } = computeBaselineDeltas(current, baseline);
+    const { anomalyHint, anomalyScore } = classifySeriesAnomaly(
+      current,
+      baseline,
+      deltaPctAvg,
+      baselineWasZero,
+      trend,
+      thresholdBreached,
+      lowerIsWorse
+    );
+
+    candidates.push({
+      anomalyScore,
+      item: {
+        panelTitle: panel.title,
+        unit: panel.unit,
+        seriesLabel: s.labelKey,
+        queryStatus: 'ok',
+        current,
+        baseline,
+        deltaPctAvg,
+        deltaPctP95,
+        baselineWasZero: baselineWasZero || undefined,
+        trend,
+        thresholdBreached,
+        anomalyHint,
+      },
+    });
+  }
+
+  candidates.sort((a, b) => b.anomalyScore - a.anomalyScore);
+  return candidates.slice(0, 3);
+}
+

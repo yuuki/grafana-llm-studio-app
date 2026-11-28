@@ -31,6 +31,120 @@ import { downloadBlob } from '../utils/downloadBlob';
 
 type TranslateFn = (key: TranslationKey, vars?: Record<string, string | number>) => string;
 
+interface DashboardReportEvidence {
+  metrics: AnalyzeStatusPayload['evidence']['metrics'];
+  dashboardContext?: AnalyzeStatusPayload['dashboardContext'];
+  queriedDatasourceUid: string;
+}
+
+function appendBoundedWarning(
+  warnings: CollectionWarningItem[],
+  warning: Omit<CollectionWarningItem, 'id'>
+): void {
+  if (warnings.length < 12) {
+    warnings.push({
+      ...warning,
+      id: `ev-warn-${warnings.length + 1}`,
+    });
+  }
+}
+
+async function collectDashboardReportEvidence(
+  selectedDashboardUid: string,
+  selectedDsUid: string,
+  publicCfg: PublicConfig,
+  activeScope: ScopeFilter | undefined,
+  windowVal: ReportWindow,
+  baselineMode: BaselineMode,
+  warnings: CollectionWarningItem[],
+  signal: AbortSignal
+): Promise<DashboardReportEvidence> {
+  const fetched = await fetchExistingDashboardByUid(selectedDashboardUid, signal);
+  const extracted = extractDashboardReportQueries(fetched.rawDashboard, {
+    selectedDatasourceUid: selectedDsUid || undefined,
+    allowedDatasourceUids: publicCfg.allowedDatasourceUids,
+    scope: activeScope,
+  });
+
+  for (const msg of extracted.warnings) {
+    appendBoundedWarning(warnings, { code: 'dashboard_partial', message: msg });
+  }
+
+  if (extracted.panels.length === 0) {
+    appendBoundedWarning(warnings, {
+      code: 'dashboard_no_panels',
+      message: `No allowlisted Prometheus/VictoriaMetrics panels could be extracted from "${extracted.dashboardTitle}".`,
+    });
+    return {
+      metrics: [],
+      dashboardContext: undefined,
+      queriedDatasourceUid: selectedDsUid,
+    };
+  }
+
+  const queriedDatasourceUid = extracted.panels[0]?.queries[0]?.datasourceUid || selectedDsUid;
+  const metricRes = await collectDashboardMetricEvidence(extracted.panels, {
+    window: windowVal,
+    baselineMode,
+    maxConcurrency: publicCfg.maxConcurrentQueries ?? 2,
+    perQueryTimeoutMs: (publicCfg.validationTimeoutSeconds ?? 10) * 1000,
+    signal,
+  });
+  for (const mw of metricRes.warnings) {
+    appendBoundedWarning(warnings, mw);
+  }
+  return {
+    metrics: metricRes.metrics,
+    dashboardContext: {
+      uid: selectedDashboardUid,
+      title: extracted.dashboardTitle,
+      panelCount: extracted.totalPanelCount,
+      analyzedPanelCount: metricRes.analyzedPanelCount,
+    },
+    queriedDatasourceUid,
+  };
+}
+
+interface RawAnalyzePayloadArgs {
+  collectedAt: string;
+  alertRes: Awaited<ReturnType<typeof collectGrafanaAlertingEvidence>>;
+  metrics: AnalyzeStatusPayload['evidence']['metrics'];
+  dashboardContext?: AnalyzeStatusPayload['dashboardContext'];
+  queriedDatasourceUid: string;
+  activeScope?: ScopeFilter;
+  windowVal: ReportWindow;
+  baselineMode: BaselineMode;
+  reportLanguage: ReportLanguage;
+  userFocus: string;
+  warnings: CollectionWarningItem[];
+}
+
+function buildRawAnalyzePayload(args: RawAnalyzePayloadArgs): AnalyzeStatusPayload {
+  const trimmedFocus = args.userFocus.trim();
+  return {
+    ...(args.queriedDatasourceUid && (args.metrics.length > 0 || args.dashboardContext)
+      ? { datasourceUid: args.queriedDatasourceUid }
+      : {}),
+    ...(args.activeScope ? { scope: args.activeScope } : {}),
+    window: args.windowVal,
+    baselineMode: args.baselineMode,
+    language: args.reportLanguage,
+    ...(trimmedFocus
+      ? { userFocus: Array.from(trimmedFocus).slice(0, MAX_ANALYZE_FOCUS_RUNES).join('') }
+      : {}),
+    ...(args.dashboardContext ? { dashboardContext: args.dashboardContext } : {}),
+    collectionStatus: args.alertRes.collectionStatus,
+    evidence: {
+      collectedAt: args.collectedAt,
+      alerts: args.alertRes.alerts,
+      rules: args.alertRes.rules,
+      metrics: args.metrics,
+      ...(args.alertRes.statusNotes.length > 0 ? { statusNotes: args.alertRes.statusNotes } : {}),
+    },
+    ...(args.warnings.length > 0 ? { collectionWarnings: args.warnings } : {}),
+  };
+}
+
 export function useStatusReportWorkflow(currentOrgId: number, t: TranslateFn) {
   const [publicCfg, setPublicCfg] = useState<PublicConfig | null>(null);
   const [allowedDatasources, setAllowedDatasources] = useState<AllowedDatasourceOption[]>([]);
@@ -228,95 +342,50 @@ export function useStatusReportWorkflow(currentOrgId: number, t: TranslateFn) {
       });
 
       const warnings: CollectionWarningItem[] = [...alertRes.warnings];
-      let metrics = [] as AnalyzeStatusPayload['evidence']['metrics'];
-      let dashboardContext: AnalyzeStatusPayload['dashboardContext'];
-      let queriedDatasourceUid = selectedDsUid;
-
-      if (selectedDashboardUid) {
-        const fetched = await fetchExistingDashboardByUid(selectedDashboardUid, ctrl.signal);
-        const extracted = extractDashboardReportQueries(fetched.rawDashboard, {
-          selectedDatasourceUid: selectedDsUid || undefined,
-          allowedDatasourceUids: publicCfg.allowedDatasourceUids,
-          scope: activeScope,
-        });
-
-        for (const msg of extracted.warnings) {
-          if (warnings.length < 12) {
-            warnings.push({
-              id: `ev-warn-${warnings.length + 1}`,
-              code: 'dashboard_partial',
-              message: msg,
-            });
-          }
-        }
-
-        if (extracted.panels.length === 0) {
-          if (warnings.length < 12) {
-            warnings.push({
-              id: `ev-warn-${warnings.length + 1}`,
-              code: 'dashboard_no_panels',
-              message: `No allowlisted Prometheus/VictoriaMetrics panels could be extracted from "${extracted.dashboardTitle}".`,
-            });
-          }
-        } else {
-          queriedDatasourceUid = extracted.panels[0]?.queries[0]?.datasourceUid || selectedDsUid;
-          const metricRes = await collectDashboardMetricEvidence(extracted.panels, {
-            window: windowVal,
+      const dashEvidence = selectedDashboardUid
+        ? await collectDashboardReportEvidence(
+            selectedDashboardUid,
+            selectedDsUid,
+            publicCfg,
+            activeScope,
+            windowVal,
             baselineMode,
-            maxConcurrency: publicCfg.maxConcurrentQueries ?? 2,
-            perQueryTimeoutMs: (publicCfg.validationTimeoutSeconds ?? 10) * 1000,
-            signal: ctrl.signal,
-          });
-          metrics = metricRes.metrics;
-          for (const mw of metricRes.warnings) {
-            if (warnings.length < 12) {
-              warnings.push({
-                ...mw,
-                id: `ev-warn-${warnings.length + 1}`,
-              });
-            }
-          }
-          dashboardContext = {
-            uid: selectedDashboardUid,
-            title: extracted.dashboardTitle,
-            panelCount: extracted.totalPanelCount,
-            analyzedPanelCount: metricRes.analyzedPanelCount,
+            warnings,
+            ctrl.signal
+          )
+        : {
+            metrics: [] as AnalyzeStatusPayload['evidence']['metrics'],
+            dashboardContext: undefined,
+            queriedDatasourceUid: selectedDsUid,
           };
-        }
-      }
 
       if (opSeqRef.current !== opSeq || ctrl.signal.aborted) {
         return;
       }
 
-      if (!alertRes.collectionStatus.alertsChecked && !alertRes.collectionStatus.rulesChecked && metrics.length === 0) {
+      if (
+        !alertRes.collectionStatus.alertsChecked &&
+        !alertRes.collectionStatus.rulesChecked &&
+        dashEvidence.metrics.length === 0
+      ) {
         setUiError(t('report.errors.noSources'));
         setBusyState('idle');
         return;
       }
 
-      const rawPayload: AnalyzeStatusPayload = {
-        ...(queriedDatasourceUid && (metrics.length > 0 || dashboardContext)
-          ? { datasourceUid: queriedDatasourceUid }
-          : {}),
-        ...(activeScope ? { scope: activeScope } : {}),
-        window: windowVal,
+      const rawPayload = buildRawAnalyzePayload({
+        collectedAt,
+        alertRes,
+        metrics: dashEvidence.metrics,
+        dashboardContext: dashEvidence.dashboardContext,
+        queriedDatasourceUid: dashEvidence.queriedDatasourceUid,
+        activeScope,
+        windowVal,
         baselineMode,
-        language: reportLanguage,
-        ...(userFocus.trim()
-          ? { userFocus: Array.from(userFocus.trim()).slice(0, MAX_ANALYZE_FOCUS_RUNES).join('') }
-          : {}),
-        ...(dashboardContext ? { dashboardContext } : {}),
-        collectionStatus: alertRes.collectionStatus,
-        evidence: {
-          collectedAt,
-          alerts: alertRes.alerts,
-          rules: alertRes.rules,
-          metrics,
-          ...(alertRes.statusNotes.length > 0 ? { statusNotes: alertRes.statusNotes } : {}),
-        },
-        ...(warnings.length > 0 ? { collectionWarnings: warnings } : {}),
-      };
+        reportLanguage,
+        userFocus,
+        warnings,
+      });
 
       const bounded = redactAndBoundAnalyzePayload(rawPayload);
       setCollectedPayload(bounded.payload);

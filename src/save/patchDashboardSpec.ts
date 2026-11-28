@@ -125,6 +125,56 @@ function nextAvailableRefId(used: Set<string>): string {
   return fallback;
 }
 
+function collectPreservedTargetRefIds(
+  origTargets: unknown[],
+  importedIndexSet: Set<number>
+): Set<string> {
+  const usedRefIds = new Set<string>();
+  for (let i = 0; i < origTargets.length; i++) {
+    if (importedIndexSet.has(i)) {
+      continue;
+    }
+    const t = origTargets[i];
+    if (isRecord(t) && typeof t.refId === 'string' && t.refId.trim() !== '') {
+      usedRefIds.add(t.refId.trim());
+    }
+  }
+  return usedRefIds;
+}
+
+function patchSingleExistingTarget(
+  existing: unknown,
+  newTarget: NormalizedPanelSpec['targets'][number],
+  prevLegend: string,
+  usedRefIds: Set<string>
+): Record<string, unknown> {
+  const cloned: Record<string, unknown> = isRecord(existing)
+    ? safeDeepClone(existing)
+    : buildFoundationTargetObject(newTarget);
+  cloned.expr = newTarget.expr;
+  cloned.datasource = { ...newTarget.datasource };
+
+  const origRefId = typeof cloned.refId === 'string' ? cloned.refId.trim() : '';
+  if (origRefId && !usedRefIds.has(origRefId)) {
+    usedRefIds.add(origRefId);
+  } else if (!usedRefIds.has(newTarget.refId)) {
+    usedRefIds.add(newTarget.refId);
+    cloned.refId = newTarget.refId;
+  } else {
+    cloned.refId = nextAvailableRefId(usedRefIds);
+  }
+
+  const nextLegend = newTarget.legendFormat ?? '';
+  if (nextLegend !== prevLegend) {
+    if (nextLegend) {
+      cloned.legendFormat = nextLegend;
+    } else {
+      delete cloned.legendFormat;
+    }
+  }
+  return cloned;
+}
+
 function patchPanelTargets(
   rawPanel: Record<string, unknown>,
   normPanel: NormalizedPanelSpec,
@@ -137,16 +187,7 @@ function patchPanelTargets(
 
   // Collect refIds owned by preserved non-imported targets (e.g. hidden or other-datasource targets)
   // so appended targets never collide on refId.
-  const usedRefIds = new Set<string>();
-  for (let i = 0; i < origTargets.length; i++) {
-    if (importedIndexSet.has(i)) {
-      continue;
-    }
-    const t = origTargets[i];
-    if (isRecord(t) && typeof t.refId === 'string' && t.refId.trim() !== '') {
-      usedRefIds.add(t.refId.trim());
-    }
-  }
+  const usedRefIds = collectPreservedTargetRefIds(origTargets, importedIndexSet);
 
   const updatedByOrigIdx = new Map<number, Record<string, unknown>>();
   const removeOrigIndices = new Set<number>();
@@ -156,30 +197,15 @@ function patchPanelTargets(
     const newTarget = normPanel.targets[qi];
     if (qi < importedTargetIndices.length) {
       const origIdx = importedTargetIndices[qi];
-      const existing = origTargets[origIdx];
-      const cloned: Record<string, unknown> = isRecord(existing)
-        ? safeDeepClone(existing)
-        : buildFoundationTargetObject(newTarget);
-      cloned.expr = newTarget.expr;
-      cloned.datasource = { ...newTarget.datasource };
-      const origRefId = typeof cloned.refId === 'string' ? cloned.refId.trim() : '';
-      if (origRefId && !usedRefIds.has(origRefId)) {
-        usedRefIds.add(origRefId);
-      } else {
-        cloned.refId = !usedRefIds.has(newTarget.refId)
-          ? (usedRefIds.add(newTarget.refId), newTarget.refId)
-          : nextAvailableRefId(usedRefIds);
-      }
-      const prevLegend = initialQueries[qi]?.legendFormat ?? '';
-      const nextLegend = newTarget.legendFormat ?? '';
-      if (nextLegend !== prevLegend) {
-        if (nextLegend) {
-          cloned.legendFormat = nextLegend;
-        } else {
-          delete cloned.legendFormat;
-        }
-      }
-      updatedByOrigIdx.set(origIdx, cloned);
+      updatedByOrigIdx.set(
+        origIdx,
+        patchSingleExistingTarget(
+          origTargets[origIdx],
+          newTarget,
+          initialQueries[qi]?.legendFormat ?? '',
+          usedRefIds
+        )
+      );
     } else {
       const built = buildFoundationTargetObject(newTarget);
       if (typeof built.refId !== 'string' || usedRefIds.has(built.refId)) {
@@ -200,16 +226,147 @@ function patchPanelTargets(
     if (removeOrigIndices.has(i)) {
       continue;
     }
-    if (updatedByOrigIdx.has(i)) {
-      nextTargets.push(updatedByOrigIdx.get(i));
+    nextTargets.push(updatedByOrigIdx.has(i) ? updatedByOrigIdx.get(i) : origTargets[i]);
+  }
+  rawPanel.targets = [...nextTargets, ...appendedTargets];
+}
+
+interface PanelChangeFlags {
+  typeChanged: boolean;
+  unitChanged: boolean;
+  thresholdsChanged: boolean;
+  queriesChanged: boolean;
+  layoutChanged: boolean;
+  titleChanged: boolean;
+  descChanged: boolean;
+}
+
+function patchPanelWithTypeChange(
+  rawPanel: Record<string, unknown>,
+  fresh: Record<string, unknown>,
+  initialPanel: PanelIR,
+  normPanel: NormalizedPanelSpec,
+  locator: ImportedPanelLocator,
+  flags: PanelChangeFlags
+): Record<string, unknown> {
+  const nextPanel = safeDeepClone(fresh);
+  if (typeof rawPanel.id === 'number') {
+    nextPanel.id = rawPanel.id;
+  }
+  if (!flags.titleChanged && typeof rawPanel.title === 'string') {
+    nextPanel.title = rawPanel.title;
+  }
+  if (!flags.descChanged) {
+    if (rawPanel.description !== undefined) {
+      nextPanel.description = rawPanel.description;
     } else {
-      nextTargets.push(origTargets[i]);
+      delete nextPanel.description;
     }
   }
-  for (const extra of appendedTargets) {
-    nextTargets.push(extra);
+  if (!flags.layoutChanged && isRecord(rawPanel.gridPos)) {
+    nextPanel.gridPos = safeDeepClone(rawPanel.gridPos);
   }
-  rawPanel.targets = nextTargets;
+  if (rawPanel.transformations !== undefined) {
+    nextPanel.transformations = safeDeepClone(rawPanel.transformations);
+  }
+  for (const extraKey of ['links', 'transparent', 'repeat', 'repeatDirection', 'maxPerRow']) {
+    if (rawPanel[extraKey] !== undefined) {
+      nextPanel[extraKey] = safeDeepClone(rawPanel[extraKey]);
+    }
+  }
+  mergeFieldConfigOnTypeChange(rawPanel, nextPanel, flags.unitChanged, flags.thresholdsChanged);
+  if (!flags.queriesChanged && Array.isArray(rawPanel.targets)) {
+    nextPanel.targets = safeDeepClone(rawPanel.targets);
+  } else if (flags.queriesChanged) {
+    nextPanel.targets = Array.isArray(rawPanel.targets) ? safeDeepClone(rawPanel.targets) : [];
+    patchPanelTargets(nextPanel, normPanel, initialPanel, locator.importedTargetIndices);
+  }
+  return nextPanel;
+}
+
+function mergeFieldConfigOnTypeChange(
+  rawPanel: Record<string, unknown>,
+  nextPanel: Record<string, unknown>,
+  unitChanged: boolean,
+  thresholdsChanged: boolean
+): void {
+  // Preserve untouched fieldConfig.overrides and extra fieldConfig.defaults fields.
+  if (!isRecord(rawPanel.fieldConfig)) {
+    return;
+  }
+  const nextFc: Record<string, unknown> = isRecord(nextPanel.fieldConfig)
+    ? safeDeepClone(nextPanel.fieldConfig)
+    : {};
+  if (rawPanel.fieldConfig.overrides !== undefined) {
+    nextFc.overrides = safeDeepClone(rawPanel.fieldConfig.overrides);
+  }
+  if (isRecord(rawPanel.fieldConfig.defaults)) {
+    const mergedDefaults: Record<string, unknown> = safeDeepClone(rawPanel.fieldConfig.defaults);
+    const freshDefaults = isRecord(nextFc.defaults) ? nextFc.defaults : {};
+    if (unitChanged) {
+      mergedDefaults.unit = freshDefaults.unit;
+    }
+    if (thresholdsChanged) {
+      mergedDefaults.thresholds = safeDeepClone(freshDefaults.thresholds);
+    }
+    nextFc.defaults = mergedDefaults;
+  }
+  nextPanel.fieldConfig = nextFc;
+}
+
+function patchSameTypePanelFieldConfig(
+  patched: Record<string, unknown>,
+  fresh: Record<string, unknown>,
+  normPanel: NormalizedPanelSpec,
+  unitChanged: boolean,
+  thresholdsChanged: boolean
+): void {
+  const fc: Record<string, unknown> = isRecord(patched.fieldConfig)
+    ? safeDeepClone(patched.fieldConfig)
+    : {};
+  const defaults: Record<string, unknown> = isRecord(fc.defaults)
+    ? safeDeepClone(fc.defaults)
+    : {};
+  const freshDefaults =
+    isRecord(fresh.fieldConfig) && isRecord(fresh.fieldConfig.defaults)
+      ? fresh.fieldConfig.defaults
+      : {};
+  if (unitChanged) {
+    defaults.unit = normPanel.unit;
+  }
+  if (thresholdsChanged) {
+    defaults.thresholds = safeDeepClone(freshDefaults.thresholds);
+  }
+  fc.defaults = defaults;
+  patched.fieldConfig = fc;
+}
+
+function patchSameTypePanelGridPos(
+  patched: Record<string, unknown>,
+  initialPanel: PanelIR,
+  currentPanel: PanelIR,
+  normPanel: NormalizedPanelSpec
+): void {
+  const prevGrid = isRecord(patched.gridPos) ? safeDeepClone(patched.gridPos) : {};
+  const widthChanged = currentPanel.layout.width !== initialPanel.layout.width;
+  const posChanged =
+    currentPanel.layout.row !== initialPanel.layout.row ||
+    currentPanel.layout.col !== initialPanel.layout.col;
+  if (posChanged) {
+    patched.gridPos = {
+      ...prevGrid,
+      x: normPanel.gridPos.x,
+      y: normPanel.gridPos.y,
+      w: normPanel.gridPos.w,
+      h: typeof prevGrid.h === 'number' ? prevGrid.h : normPanel.gridPos.h,
+    };
+  } else if (widthChanged) {
+    patched.gridPos = {
+      ...prevGrid,
+      w: normPanel.gridPos.w,
+      ...(normPanel.gridPos.w === 24 ? { x: 0 } : { x: normPanel.gridPos.x }),
+    };
+  }
 }
 
 function patchSingleRawPanel(
@@ -220,128 +377,76 @@ function patchSingleRawPanel(
   locator: ImportedPanelLocator
 ): Record<string, unknown> {
   const fresh = buildFoundationPanelObject(normPanel);
-  const typeChanged = currentPanel.type !== initialPanel.type;
-  const unitChanged = currentPanel.unit !== initialPanel.unit;
-  const thresholdsChanged = !thresholdsEqual(initialPanel.thresholds, currentPanel.thresholds);
-  const queriesChanged = !queriesEqual(initialPanel, currentPanel);
-  const layoutChanged = !layoutEqual(initialPanel.layout, currentPanel.layout);
-  const titleChanged = currentPanel.title !== initialPanel.title;
-  const descChanged = (currentPanel.description ?? '') !== (initialPanel.description ?? '');
+  const flags: PanelChangeFlags = {
+    typeChanged: currentPanel.type !== initialPanel.type,
+    unitChanged: currentPanel.unit !== initialPanel.unit,
+    thresholdsChanged: !thresholdsEqual(initialPanel.thresholds, currentPanel.thresholds),
+    queriesChanged: !queriesEqual(initialPanel, currentPanel),
+    layoutChanged: !layoutEqual(initialPanel.layout, currentPanel.layout),
+    titleChanged: currentPanel.title !== initialPanel.title,
+    descChanged: (currentPanel.description ?? '') !== (initialPanel.description ?? ''),
+  };
 
-  if (typeChanged) {
-    const nextPanel = safeDeepClone(fresh);
-    if (typeof rawPanel.id === 'number') {
-      nextPanel.id = rawPanel.id;
-    }
-    if (!titleChanged && typeof rawPanel.title === 'string') {
-      nextPanel.title = rawPanel.title;
-    }
-    if (!descChanged) {
-      if (rawPanel.description !== undefined) {
-        nextPanel.description = rawPanel.description;
-      } else {
-        delete nextPanel.description;
-      }
-    }
-    if (!layoutChanged && isRecord(rawPanel.gridPos)) {
-      nextPanel.gridPos = safeDeepClone(rawPanel.gridPos);
-    }
-    if (rawPanel.transformations !== undefined) {
-      nextPanel.transformations = safeDeepClone(rawPanel.transformations);
-    }
-    for (const extraKey of ['links', 'transparent', 'repeat', 'repeatDirection', 'maxPerRow']) {
-      if (rawPanel[extraKey] !== undefined) {
-        nextPanel[extraKey] = safeDeepClone(rawPanel[extraKey]);
-      }
-    }
-    // Preserve untouched fieldConfig.overrides and extra fieldConfig.defaults fields.
-    if (isRecord(rawPanel.fieldConfig)) {
-      const nextFc: Record<string, unknown> = isRecord(nextPanel.fieldConfig)
-        ? safeDeepClone(nextPanel.fieldConfig)
-        : {};
-      if (rawPanel.fieldConfig.overrides !== undefined) {
-        nextFc.overrides = safeDeepClone(rawPanel.fieldConfig.overrides);
-      }
-      if (isRecord(rawPanel.fieldConfig.defaults)) {
-        const mergedDefaults: Record<string, unknown> = safeDeepClone(rawPanel.fieldConfig.defaults);
-        const freshDefaults = isRecord(nextFc.defaults) ? nextFc.defaults : {};
-        if (unitChanged) {
-          mergedDefaults.unit = freshDefaults.unit;
-        }
-        if (thresholdsChanged) {
-          mergedDefaults.thresholds = safeDeepClone(freshDefaults.thresholds);
-        }
-        nextFc.defaults = mergedDefaults;
-      }
-      nextPanel.fieldConfig = nextFc;
-    }
-    if (!queriesChanged && Array.isArray(rawPanel.targets)) {
-      nextPanel.targets = safeDeepClone(rawPanel.targets);
-    } else if (queriesChanged) {
-      nextPanel.targets = Array.isArray(rawPanel.targets) ? safeDeepClone(rawPanel.targets) : [];
-      patchPanelTargets(nextPanel, normPanel, initialPanel, locator.importedTargetIndices);
-    }
-    return nextPanel;
+  if (flags.typeChanged) {
+    return patchPanelWithTypeChange(rawPanel, fresh, initialPanel, normPanel, locator, flags);
   }
 
   // Same panel type: mutate ONLY the changed fields on the cloned original panel,
   // preserving transformations, fieldConfig.overrides, options, untouched defaults, gridPos, etc.
   const patched = safeDeepClone(rawPanel);
-  if (titleChanged) {
+  if (flags.titleChanged) {
     patched.title = normPanel.title;
   }
-  if (descChanged) {
+  if (flags.descChanged) {
     if (normPanel.description) {
       patched.description = normPanel.description;
     } else {
       delete patched.description;
     }
   }
-  if (unitChanged || thresholdsChanged) {
-    const fc: Record<string, unknown> = isRecord(patched.fieldConfig)
-      ? safeDeepClone(patched.fieldConfig)
-      : {};
-    const defaults: Record<string, unknown> = isRecord(fc.defaults)
-      ? safeDeepClone(fc.defaults)
-      : {};
-    const freshDefaults = isRecord(fresh.fieldConfig) && isRecord(fresh.fieldConfig.defaults)
-      ? fresh.fieldConfig.defaults
-      : {};
-    if (unitChanged) {
-      defaults.unit = normPanel.unit;
-    }
-    if (thresholdsChanged) {
-      defaults.thresholds = safeDeepClone(freshDefaults.thresholds);
-    }
-    fc.defaults = defaults;
-    patched.fieldConfig = fc;
+  if (flags.unitChanged || flags.thresholdsChanged) {
+    patchSameTypePanelFieldConfig(patched, fresh, normPanel, flags.unitChanged, flags.thresholdsChanged);
   }
-  if (queriesChanged) {
+  if (flags.queriesChanged) {
     patchPanelTargets(patched, normPanel, initialPanel, locator.importedTargetIndices);
   }
-  if (layoutChanged) {
-    const prevGrid = isRecord(patched.gridPos) ? safeDeepClone(patched.gridPos) : {};
-    const widthChanged = currentPanel.layout.width !== initialPanel.layout.width;
-    const posChanged =
-      currentPanel.layout.row !== initialPanel.layout.row ||
-      currentPanel.layout.col !== initialPanel.layout.col;
-    if (posChanged) {
-      patched.gridPos = {
-        ...prevGrid,
-        x: normPanel.gridPos.x,
-        y: normPanel.gridPos.y,
-        w: normPanel.gridPos.w,
-        h: typeof prevGrid.h === 'number' ? prevGrid.h : normPanel.gridPos.h,
-      };
-    } else if (widthChanged) {
-      patched.gridPos = {
-        ...prevGrid,
-        w: normPanel.gridPos.w,
-        ...(normPanel.gridPos.w === 24 ? { x: 0 } : { x: normPanel.gridPos.x }),
-      };
-    }
+  if (flags.layoutChanged) {
+    patchSameTypePanelGridPos(patched, initialPanel, currentPanel, normPanel);
   }
   return patched;
+}
+
+function patchVariableTypeSpecificFields(
+  patched: Record<string, unknown>,
+  fresh: Record<string, unknown>,
+  initialVar: VariableIR,
+  currentVar: VariableIR,
+  normVar: NormalizedVariableSpec
+): void {
+  if (currentVar.type === 'query') {
+    const queryChanged =
+      (currentVar.labelName ?? '') !== (initialVar.labelName ?? '') ||
+      (currentVar.metricName ?? '') !== (initialVar.metricName ?? '');
+    if (queryChanged) {
+      patched.query = normVar.query;
+      if (normVar.datasource) {
+        patched.datasource = { ...normVar.datasource };
+      }
+    }
+    return;
+  }
+  if (currentVar.type === 'custom') {
+    const customChanged =
+      !stringArraysEqual(currentVar.options, initialVar.options) ||
+      Boolean(currentVar.includeAll) !== Boolean(initialVar.includeAll) ||
+      (currentVar.defaultValue ?? '') !== (initialVar.defaultValue ?? '');
+    if (customChanged) {
+      patched.query = normVar.query;
+      if (fresh.options !== undefined) {
+        patched.options = safeDeepClone(fresh.options);
+      }
+    }
+  }
 }
 
 function patchSingleRawVariable(
@@ -364,36 +469,13 @@ function patchSingleRawVariable(
   if (Boolean(currentVar.includeAll) !== Boolean(initialVar.includeAll)) {
     patched.includeAll = normVar.includeAll;
   }
-  if (
+  const defaultOrMultiChanged =
     (currentVar.defaultValue ?? '') !== (initialVar.defaultValue ?? '') ||
-    Boolean(currentVar.multi) !== Boolean(initialVar.multi)
-  ) {
-    if (fresh.current !== undefined) {
-      patched.current = safeDeepClone(fresh.current);
-    }
+    Boolean(currentVar.multi) !== Boolean(initialVar.multi);
+  if (defaultOrMultiChanged && fresh.current !== undefined) {
+    patched.current = safeDeepClone(fresh.current);
   }
-  if (currentVar.type === 'query') {
-    if (
-      (currentVar.labelName ?? '') !== (initialVar.labelName ?? '') ||
-      (currentVar.metricName ?? '') !== (initialVar.metricName ?? '')
-    ) {
-      patched.query = normVar.query;
-      if (normVar.datasource) {
-        patched.datasource = { ...normVar.datasource };
-      }
-    }
-  } else if (currentVar.type === 'custom') {
-    if (
-      !stringArraysEqual(currentVar.options, initialVar.options) ||
-      Boolean(currentVar.includeAll) !== Boolean(initialVar.includeAll) ||
-      (currentVar.defaultValue ?? '') !== (initialVar.defaultValue ?? '')
-    ) {
-      patched.query = normVar.query;
-      if (fresh.options !== undefined) {
-        patched.options = safeDeepClone(fresh.options);
-      }
-    }
-  }
+  patchVariableTypeSpecificFields(patched, fresh, initialVar, currentVar, normVar);
   return patched;
 }
 
@@ -446,7 +528,24 @@ export function buildPatchedDashboardSpec({
   const { initialDraft, panelBindings, variableBindings } = patchContext;
 
   patched.uid = targetUid;
+  patchDashboardMeta(patched, initialDraft, currentIR, currentSpec);
+  patched.panels = patchDashboardPanels(
+    Array.isArray(patched.panels) ? [...patched.panels] : [],
+    initialDraft,
+    currentIR,
+    currentSpec,
+    panelBindings
+  );
+  patchDashboardVariables(patched, initialDraft, currentIR, currentSpec, variableBindings);
+  return patched;
+}
 
+function patchDashboardMeta(
+  patched: Record<string, unknown>,
+  initialDraft: DashboardIR,
+  currentIR: DashboardIR,
+  currentSpec: NormalizedDashboardSpec
+): void {
   // 1. Dashboard-level metadata: update ONLY fields that actually changed from import baseline.
   if (currentIR.title !== initialDraft.title) {
     patched.title = currentSpec.title;
@@ -469,18 +568,18 @@ export function buildPatchedDashboardSpec({
       to: currentSpec.timeRange.to,
     };
   }
+}
 
-  // 2. Patch panels in place while keeping skipped/unsupported/untouched panels intact.
-  const rawPanels: unknown[] = Array.isArray(patched.panels) ? [...patched.panels] : [];
-  const { maxNumericId: initialMaxId, maxBottomY } = collectPanelMetrics(rawPanels);
-  let nextNumericId = initialMaxId;
-
-  const initialPanelById = new Map<string, PanelIR>(
-    initialDraft.panels.map((p) => [p.id, p])
-  );
-  const currentPanelById = new Map<string, PanelIR>(
-    currentIR.panels.map((p) => [p.id, p])
-  );
+function patchDashboardPanels(
+  rawPanels: unknown[],
+  initialDraft: DashboardIR,
+  currentIR: DashboardIR,
+  currentSpec: NormalizedDashboardSpec,
+  panelBindings: Record<string, ImportedPanelLocator>
+): unknown[] {
+  const { maxNumericId, maxBottomY } = collectPanelMetrics(rawPanels);
+  const initialPanelById = new Map<string, PanelIR>(initialDraft.panels.map((p) => [p.id, p]));
+  const currentPanelById = new Map<string, PanelIR>(currentIR.panels.map((p) => [p.id, p]));
   const normPanelById = new Map<string, NormalizedPanelSpec>(
     currentSpec.panels.map((p) => [p.id, p])
   );
@@ -489,95 +588,131 @@ export function buildPatchedDashboardSpec({
   const rowChildRemovals = new Map<number, number[]>();
 
   for (const [panelId, locator] of Object.entries(panelBindings)) {
-    const initialPanel = initialPanelById.get(panelId);
-    const currentPanel = currentPanelById.get(panelId);
-
-    const containerItem = rawPanels[locator.topIndex];
-    if (!isRecord(containerItem)) {
-      continue;
-    }
-
-    if (locator.rowChildIndex !== undefined) {
-      const rowPanels = Array.isArray(containerItem.panels) ? containerItem.panels : null;
-      if (!rowPanels || locator.rowChildIndex >= rowPanels.length) {
-        continue;
-      }
-      if (!currentPanel) {
-        const list = rowChildRemovals.get(locator.topIndex) ?? [];
-        list.push(locator.rowChildIndex);
-        rowChildRemovals.set(locator.topIndex, list);
-        continue;
-      }
-      if (!initialPanel || panelIREqual(initialPanel, currentPanel)) {
-        continue;
-      }
-      const targetRaw = rowPanels[locator.rowChildIndex];
-      const normPanel = normPanelById.get(panelId);
-      if (isRecord(targetRaw) && normPanel) {
-        rowPanels[locator.rowChildIndex] = patchSingleRawPanel(
-          targetRaw,
-          initialPanel,
-          currentPanel,
-          normPanel,
-          locator
-        );
-      }
-    } else {
-      if (!currentPanel) {
-        topRemovals.push(locator.topIndex);
-        continue;
-      }
-      if (!initialPanel || panelIREqual(initialPanel, currentPanel)) {
-        continue;
-      }
-      const normPanel = normPanelById.get(panelId);
-      if (normPanel) {
-        rawPanels[locator.topIndex] = patchSingleRawPanel(
-          containerItem,
-          initialPanel,
-          currentPanel,
-          normPanel,
-          locator
-        );
-      }
-    }
+    applySinglePanelBinding(
+      rawPanels,
+      locator,
+      initialPanelById.get(panelId),
+      currentPanelById.get(panelId),
+      normPanelById.get(panelId),
+      topRemovals,
+      rowChildRemovals
+    );
   }
 
+  applyPanelRemovals(rawPanels, topRemovals, rowChildRemovals);
+  appendAddedPanels(rawPanels, currentSpec.panels, panelBindings, maxNumericId, maxBottomY);
+  return rawPanels;
+}
+
+function applySinglePanelBinding(
+  rawPanels: unknown[],
+  locator: ImportedPanelLocator,
+  initialPanel: PanelIR | undefined,
+  currentPanel: PanelIR | undefined,
+  normPanel: NormalizedPanelSpec | undefined,
+  topRemovals: number[],
+  rowChildRemovals: Map<number, number[]>
+): void {
+  const containerItem = rawPanels[locator.topIndex];
+  if (!isRecord(containerItem)) {
+    return;
+  }
+  if (locator.rowChildIndex !== undefined) {
+    const rowPanels = Array.isArray(containerItem.panels) ? containerItem.panels : null;
+    if (!rowPanels || locator.rowChildIndex >= rowPanels.length) {
+      return;
+    }
+    if (!currentPanel) {
+      const list = rowChildRemovals.get(locator.topIndex) ?? [];
+      list.push(locator.rowChildIndex);
+      rowChildRemovals.set(locator.topIndex, list);
+      return;
+    }
+    if (!initialPanel || panelIREqual(initialPanel, currentPanel) || !normPanel) {
+      return;
+    }
+    const targetRaw = rowPanels[locator.rowChildIndex];
+    if (isRecord(targetRaw)) {
+      rowPanels[locator.rowChildIndex] = patchSingleRawPanel(
+        targetRaw,
+        initialPanel,
+        currentPanel,
+        normPanel,
+        locator
+      );
+    }
+    return;
+  }
+
+  if (!currentPanel) {
+    topRemovals.push(locator.topIndex);
+    return;
+  }
+  if (!initialPanel || panelIREqual(initialPanel, currentPanel) || !normPanel) {
+    return;
+  }
+  rawPanels[locator.topIndex] = patchSingleRawPanel(
+    containerItem,
+    initialPanel,
+    currentPanel,
+    normPanel,
+    locator
+  );
+}
+
+function applyPanelRemovals(
+  rawPanels: unknown[],
+  topRemovals: number[],
+  rowChildRemovals: Map<number, number[]>
+): void {
   // Apply row child removals in descending index order.
   for (const [topIdx, childIndices] of rowChildRemovals.entries()) {
     const rowObj = rawPanels[topIdx];
     if (isRecord(rowObj) && Array.isArray(rowObj.panels)) {
-      const sorted = [...childIndices].sort((a, b) => b - a);
-      for (const idx of sorted) {
+      for (const idx of [...childIndices].sort((a, b) => b - a)) {
         rowObj.panels.splice(idx, 1);
       }
     }
   }
-
   // Apply top-level panel removals in descending index order.
   for (const topIdx of [...topRemovals].sort((a, b) => b - a)) {
     rawPanels.splice(topIdx, 1);
   }
+}
 
-  // Append newly added panels below all existing panels with non-colliding numeric IDs.
-  const addedNormPanels = currentSpec.panels.filter((p) => !(p.id in panelBindings));
-  if (addedNormPanels.length > 0) {
-    const minAddedY = Math.min(...addedNormPanels.map((p) => p.gridPos.y));
-    for (const added of addedNormPanels) {
-      const built = buildFoundationPanelObject(added);
-      built.id = ++nextNumericId;
-      built.gridPos = {
-        x: added.gridPos.x,
-        y: maxBottomY + (added.gridPos.y - minAddedY),
-        w: added.gridPos.w,
-        h: added.gridPos.h,
-      };
-      rawPanels.push(built);
-    }
+function appendAddedPanels(
+  rawPanels: unknown[],
+  specPanels: NormalizedPanelSpec[],
+  panelBindings: Record<string, ImportedPanelLocator>,
+  initialMaxId: number,
+  maxBottomY: number
+): void {
+  const addedNormPanels = specPanels.filter((p) => !(p.id in panelBindings));
+  if (addedNormPanels.length === 0) {
+    return;
   }
-  patched.panels = rawPanels;
+  let nextNumericId = initialMaxId;
+  const minAddedY = Math.min(...addedNormPanels.map((p) => p.gridPos.y));
+  for (const added of addedNormPanels) {
+    const built = buildFoundationPanelObject(added);
+    built.id = ++nextNumericId;
+    built.gridPos = {
+      x: added.gridPos.x,
+      y: maxBottomY + (added.gridPos.y - minAddedY),
+      w: added.gridPos.w,
+      h: added.gridPos.h,
+    };
+    rawPanels.push(built);
+  }
+}
 
-  // 3. Patch template variables while keeping skipped/hidden/untouched variables intact.
+function patchDashboardVariables(
+  patched: Record<string, unknown>,
+  initialDraft: DashboardIR,
+  currentIR: DashboardIR,
+  currentSpec: NormalizedDashboardSpec,
+  variableBindings: Record<string, number>
+): void {
   const initialVarByName = new Map<string, VariableIR>(
     (initialDraft.variables ?? []).map((v) => [v.name, v])
   );
@@ -595,46 +730,46 @@ export function buildPatchedDashboardSpec({
       return !curV || !initV || !variableIREqual(initV, curV);
     }) || currentSpec.variables.some((v) => !(v.name in variableBindings));
 
-  if (hasVariableChanges) {
-    const templatingObj: Record<string, unknown> = isRecord(patched.templating)
-      ? safeDeepClone(patched.templating)
-      : {};
-    const rawVars: unknown[] = Array.isArray(templatingObj.list) ? [...templatingObj.list] : [];
-    const varRemovals: number[] = [];
-
-    for (const [varName, origIdx] of Object.entries(variableBindings)) {
-      if (origIdx < 0 || origIdx >= rawVars.length) {
-        continue;
-      }
-      const initialVar = initialVarByName.get(varName);
-      const currentVar = currentVarByName.get(varName);
-      if (!currentVar) {
-        varRemovals.push(origIdx);
-        continue;
-      }
-      if (!initialVar || variableIREqual(initialVar, currentVar)) {
-        continue;
-      }
-      const normVar = normVarByName.get(varName);
-      const existingRawVar = rawVars[origIdx];
-      if (normVar && isRecord(existingRawVar)) {
-        rawVars[origIdx] = patchSingleRawVariable(existingRawVar, initialVar, currentVar, normVar);
-      }
-    }
-
-    for (const idx of [...varRemovals].sort((a, b) => b - a)) {
-      rawVars.splice(idx, 1);
-    }
-
-    for (const addedVar of currentSpec.variables) {
-      if (!(addedVar.name in variableBindings)) {
-        rawVars.push(buildFoundationVariableObject(addedVar));
-      }
-    }
-
-    templatingObj.list = rawVars;
-    patched.templating = templatingObj;
+  if (!hasVariableChanges) {
+    return;
   }
 
-  return patched;
+  const templatingObj: Record<string, unknown> = isRecord(patched.templating)
+    ? safeDeepClone(patched.templating)
+    : {};
+  const rawVars: unknown[] = Array.isArray(templatingObj.list) ? [...templatingObj.list] : [];
+  const varRemovals: number[] = [];
+
+  for (const [varName, origIdx] of Object.entries(variableBindings)) {
+    if (origIdx < 0 || origIdx >= rawVars.length) {
+      continue;
+    }
+    const initialVar = initialVarByName.get(varName);
+    const currentVar = currentVarByName.get(varName);
+    if (!currentVar) {
+      varRemovals.push(origIdx);
+      continue;
+    }
+    if (!initialVar || variableIREqual(initialVar, currentVar)) {
+      continue;
+    }
+    const normVar = normVarByName.get(varName);
+    const existingRawVar = rawVars[origIdx];
+    if (normVar && isRecord(existingRawVar)) {
+      rawVars[origIdx] = patchSingleRawVariable(existingRawVar, initialVar, currentVar, normVar);
+    }
+  }
+
+  for (const idx of [...varRemovals].sort((a, b) => b - a)) {
+    rawVars.splice(idx, 1);
+  }
+
+  for (const addedVar of currentSpec.variables) {
+    if (!(addedVar.name in variableBindings)) {
+      rawVars.push(buildFoundationVariableObject(addedVar));
+    }
+  }
+
+  templatingObj.list = rawVars;
+  patched.templating = templatingObj;
 }

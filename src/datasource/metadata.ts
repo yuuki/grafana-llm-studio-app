@@ -205,6 +205,148 @@ export async function fetchScopeLabelValues(
  *
  * Results stay strictly in React memory for the active user session and are NEVER sent to a shared backend cache.
  */
+async function discoverScopedMetricNames(
+  baseUrls: string[],
+  matcher: string,
+  scopeLabelName: string,
+  startSec: number,
+  nowSec: number,
+  metricLimit: number,
+  metricLabels: Map<string, Set<string>>,
+  signal?: AbortSignal
+): Promise<boolean> {
+  try {
+    const namesResp = await fetchPromApiWithBaseFallback<PromResponse<string[]>>(
+      baseUrls,
+      '/label/__name__/values',
+      {
+        'match[]': matcher,
+        start: String(startSec),
+        end: String(nowSec),
+        limit: String(metricLimit),
+      },
+      signal
+    );
+    if (namesResp.status !== 'success' || !Array.isArray(namesResp.data)) {
+      return false;
+    }
+    for (const name of namesResp.data.slice(0, metricLimit)) {
+      if (name && !metricLabels.has(name)) {
+        metricLabels.set(name, new Set<string>([scopeLabelName]));
+      }
+    }
+    return namesResp.data.length >= metricLimit;
+  } catch (err) {
+    if (signal?.aborted) {
+      throw err;
+    }
+    // Fall back to bounded /api/v1/series below if server lacks match[] on label/__name__/values.
+    return false;
+  }
+}
+
+function mergeSeriesLabels(
+  seriesList: Array<Record<string, string>>,
+  seriesLimit: number,
+  metricLimit: number,
+  metricLabels: Map<string, Set<string>>
+): void {
+  // Slice client-side too in case older Prometheus (<2.47) ignores the limit query parameter.
+  for (const s of seriesList.slice(0, seriesLimit)) {
+    const name = s.__name__;
+    if (!name) {
+      continue;
+    }
+    let lbls = metricLabels.get(name);
+    if (!lbls) {
+      if (metricLabels.size >= metricLimit) {
+        continue;
+      }
+      lbls = new Set<string>();
+      metricLabels.set(name, lbls);
+    }
+    for (const k of Object.keys(s)) {
+      if (k !== '__name__' && lbls.size < 16) {
+        lbls.add(k);
+      }
+    }
+  }
+}
+
+async function enrichMetricLabelsFromSeries(
+  baseUrls: string[],
+  matcher: string,
+  startSec: number,
+  nowSec: number,
+  seriesLimit: number,
+  metricLimit: number,
+  metricLabels: Map<string, Set<string>>,
+  signal?: AbortSignal
+): Promise<boolean> {
+  const seriesResp = await fetchPromApiWithBaseFallback<PromResponse<Array<Record<string, string>>>>(
+    baseUrls,
+    '/series',
+    {
+      'match[]': matcher,
+      start: String(startSec),
+      end: String(nowSec),
+      limit: String(seriesLimit),
+    },
+    signal
+  );
+  if (seriesResp.status !== 'success' || !Array.isArray(seriesResp.data)) {
+    if (metricLabels.size === 0) {
+      throw new Error(seriesResp.error ?? 'Failed to query scoped /api/v1/series');
+    }
+    return false;
+  }
+  mergeSeriesLabels(seriesResp.data, seriesLimit, metricLimit, metricLabels);
+  return seriesResp.data.length >= seriesLimit;
+}
+
+async function fetchBestEffortMetadata(
+  baseUrls: string[],
+  metadataLimit: number,
+  signal?: AbortSignal
+): Promise<Record<string, PromMetadataEntry[]>> {
+  try {
+    const metaResp = await fetchPromApiWithBaseFallback<PromResponse<Record<string, PromMetadataEntry[]>>>(
+      baseUrls,
+      '/metadata',
+      { limit: String(metadataLimit) },
+      signal
+    );
+    if (metaResp.status === 'success' && metaResp.data) {
+      return metaResp.data;
+    }
+  } catch (err) {
+    if (signal?.aborted) {
+      throw err;
+    }
+  }
+  return {};
+}
+
+function buildCatalogItems(
+  metricLabels: Map<string, Set<string>>,
+  metaMap: Record<string, PromMetadataEntry[]>
+): MetricCatalogItem[] {
+  const items: MetricCatalogItem[] = [];
+  for (const [name, lblSet] of metricLabels.entries()) {
+    const baseName = name.replace(/_(bucket|count|sum)$/, '');
+    const metaEntry = metaMap[name]?.[0] ?? metaMap[baseName]?.[0];
+    items.push({
+      name,
+      type: metaEntry?.type ?? inferTypeFromName(name),
+      help: metaEntry?.help?.slice(0, 160),
+      unit: metaEntry?.unit?.slice(0, 32),
+      labels: Array.from(lblSet).sort(),
+    });
+  }
+  items.sort((a, b) => a.name.localeCompare(b.name));
+  return items;
+}
+
 export async function fetchScopedMetricCatalog(
   options: MetadataFetchOptions
 ): Promise<ScopedCatalogResult> {
@@ -225,114 +367,35 @@ export async function fetchScopedMetricCatalog(
 
   // 1. Discover unique metric names via /api/v1/label/__name__/values first (resists single high-cardinality metric starvation).
   const metricLabels = new Map<string, Set<string>>();
-  let truncated = false;
-
-  try {
-    const namesResp = await fetchPromApiWithBaseFallback<PromResponse<string[]>>(
-      baseUrls,
-      '/label/__name__/values',
-      {
-        'match[]': matcher,
-        start: String(startSec),
-        end: String(nowSec),
-        limit: String(metricLimit),
-      },
-      signal
-    );
-    if (namesResp.status === 'success' && Array.isArray(namesResp.data)) {
-      if (namesResp.data.length >= metricLimit) {
-        truncated = true;
-      }
-      for (const name of namesResp.data.slice(0, metricLimit)) {
-        if (name && !metricLabels.has(name)) {
-          metricLabels.set(name, new Set<string>([scope.labelName]));
-        }
-      }
-    }
-  } catch (err) {
-    if (signal?.aborted) {
-      throw err;
-    }
-    // Fall back to bounded /api/v1/series below if server lacks match[] on label/__name__/values.
-  }
-
-  // 2. Bounded /api/v1/series call scoped strictly to the selected service/job for label enrichment.
-  const seriesResp = await fetchPromApiWithBaseFallback<PromResponse<Array<Record<string, string>>>>(
+  const namesTruncated = await discoverScopedMetricNames(
     baseUrls,
-    '/series',
-    {
-      'match[]': matcher,
-      start: String(startSec),
-      end: String(nowSec),
-      limit: String(seriesLimit),
-    },
+    matcher,
+    scope.labelName,
+    startSec,
+    nowSec,
+    metricLimit,
+    metricLabels,
     signal
   );
-  if (seriesResp.status !== 'success' || !Array.isArray(seriesResp.data)) {
-    if (metricLabels.size === 0) {
-      throw new Error(seriesResp.error ?? 'Failed to query scoped /api/v1/series');
-    }
-  } else {
-    if (seriesResp.data.length >= seriesLimit) {
-      truncated = true;
-    }
-    // Slice client-side too in case older Prometheus (<2.47) ignores the limit query parameter.
-    for (const s of seriesResp.data.slice(0, seriesLimit)) {
-      const name = s.__name__;
-      if (!name) {
-        continue;
-      }
-      let lbls = metricLabels.get(name);
-      if (!lbls) {
-        if (metricLabels.size >= metricLimit) {
-          continue;
-        }
-        lbls = new Set<string>();
-        metricLabels.set(name, lbls);
-      }
-      for (const k of Object.keys(s)) {
-        if (k !== '__name__' && lbls.size < 16) {
-          lbls.add(k);
-        }
-      }
-    }
-  }
+
+  // 2. Bounded /api/v1/series call scoped strictly to the selected service/job for label enrichment.
+  const seriesTruncated = await enrichMetricLabelsFromSeries(
+    baseUrls,
+    matcher,
+    startSec,
+    nowSec,
+    seriesLimit,
+    metricLimit,
+    metricLabels,
+    signal
+  );
 
   // 3. Best-effort bounded /api/v1/metadata enrichment (showErrorAlert=false avoids red error toast).
-  let metaMap: Record<string, PromMetadataEntry[]> = {};
-  try {
-    const metaResp = await fetchPromApiWithBaseFallback<PromResponse<Record<string, PromMetadataEntry[]>>>(
-      baseUrls,
-      '/metadata',
-      { limit: String(metadataLimit) },
-      signal
-    );
-    if (metaResp.status === 'success' && metaResp.data) {
-      metaMap = metaResp.data;
-    }
-  } catch (err) {
-    if (signal?.aborted) {
-      throw err;
-    }
-  }
-
-  const items: MetricCatalogItem[] = [];
-  for (const [name, lblSet] of metricLabels.entries()) {
-    const baseName = name.replace(/_(bucket|count|sum)$/, '');
-    const metaEntry = metaMap[name]?.[0] ?? metaMap[baseName]?.[0];
-    items.push({
-      name,
-      type: metaEntry?.type ?? inferTypeFromName(name),
-      help: metaEntry?.help?.slice(0, 160),
-      unit: metaEntry?.unit?.slice(0, 32),
-      labels: Array.from(lblSet).sort(),
-    });
-  }
-  items.sort((a, b) => a.name.localeCompare(b.name));
+  const metaMap = await fetchBestEffortMetadata(baseUrls, metadataLimit, signal);
 
   return {
-    items,
-    truncated,
+    items: buildCatalogItems(metricLabels, metaMap),
+    truncated: namesTruncated || seriesTruncated,
     fetchedAt: new Date().toISOString(),
   };
 }

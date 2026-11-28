@@ -31,6 +31,60 @@ export interface UseStudioValidationPreviewParams {
   t: StudioTranslateFn;
 }
 
+async function findPanelsNeedingValidation(
+  normalized: NormalizedDashboardSpec,
+  targetJobId: string,
+  varsFingerprint: string,
+  validationResults: PanelValidationResult[],
+  cacheMap: Map<string, ValidatedPanelCacheEntry>
+): Promise<{ panelsNeedingValidation: string[]; panelHashMap: Map<string, string> }> {
+  // Compare BOTH queryHash and variablesFingerprint for the SAME jobId so variable
+  // edits always invalidate cached panel dry-run results.
+  const prevByPanel = new Map<string, PanelValidationResult>();
+  for (const r of validationResults) {
+    prevByPanel.set(r.panelId, r);
+  }
+
+  const panelsNeedingValidation: string[] = [];
+  const panelHashMap = new Map<string, string>();
+  for (const panel of normalized.panels) {
+    const expectedHash = await computePanelQueryHash(panel.targets);
+    panelHashMap.set(panel.id, expectedHash);
+    const cacheKey = `${targetJobId}:${panel.id}`;
+    const cachedEntry = cacheMap.get(cacheKey);
+    const prevResult = prevByPanel.get(panel.id);
+    const cachedClean =
+      Boolean(cachedEntry) &&
+      Boolean(prevResult) &&
+      cachedEntry!.rawQueryHash === expectedHash &&
+      cachedEntry!.varsFingerprint === varsFingerprint &&
+      prevResult!.queryHash === expectedHash &&
+      !BLOCKING_CATEGORIES.has(cachedEntry!.category);
+    if (!cachedClean) {
+      panelsNeedingValidation.push(panel.id);
+    }
+  }
+  return { panelsNeedingValidation, panelHashMap };
+}
+
+function syncValidatedFingerprintsCache(
+  cacheMap: Map<string, ValidatedPanelCacheEntry>,
+  targetJobId: string,
+  varsFingerprint: string,
+  mergedResults: PanelValidationResult[],
+  panelHashMap: Map<string, string>
+): void {
+  // Sync cache entries for the current jobId and current panel set.
+  cacheMap.clear();
+  for (const r of mergedResults) {
+    cacheMap.set(`${targetJobId}:${r.panelId}`, {
+      rawQueryHash: panelHashMap.get(r.panelId) ?? r.queryHash,
+      varsFingerprint,
+      category: r.category,
+    });
+  }
+}
+
 export function useStudioValidationPreview({
   job,
   selectedDatasource,
@@ -97,33 +151,13 @@ export function useStudioValidationPreview({
         job.scope
       );
       const varsFingerprint = computeVariablesFingerprint(normalized);
-
-      // Compare BOTH queryHash and variablesFingerprint for the SAME jobId so variable
-      // edits always invalidate cached panel dry-run results.
-      const prevByPanel = new Map<string, PanelValidationResult>();
-      for (const r of validationResults) {
-        prevByPanel.set(r.panelId, r);
-      }
-
-      const panelsNeedingValidation: string[] = [];
-      const panelHashMap = new Map<string, string>();
-      for (const panel of normalized.panels) {
-        const expectedHash = await computePanelQueryHash(panel.targets);
-        panelHashMap.set(panel.id, expectedHash);
-        const cacheKey = `${targetJobId}:${panel.id}`;
-        const cachedEntry = validatedFingerprintsRef.current.get(cacheKey);
-        const prevResult = prevByPanel.get(panel.id);
-        const cachedClean =
-          Boolean(cachedEntry) &&
-          Boolean(prevResult) &&
-          cachedEntry!.rawQueryHash === expectedHash &&
-          cachedEntry!.varsFingerprint === varsFingerprint &&
-          prevResult!.queryHash === expectedHash &&
-          !BLOCKING_CATEGORIES.has(cachedEntry!.category);
-        if (!cachedClean) {
-          panelsNeedingValidation.push(panel.id);
-        }
-      }
+      const { panelsNeedingValidation, panelHashMap } = await findPanelsNeedingValidation(
+        normalized,
+        targetJobId,
+        varsFingerprint,
+        validationResults,
+        validatedFingerprintsRef.current
+      );
 
       const freshResults =
         panelsNeedingValidation.length > 0
@@ -143,15 +177,13 @@ export function useStudioValidationPreview({
       }
 
       const mergedResults = mergeValidationResults(validationResults, freshResults, normalized);
-      // Sync cache entries for the current jobId and current panel set.
-      validatedFingerprintsRef.current.clear();
-      for (const r of mergedResults) {
-        validatedFingerprintsRef.current.set(`${targetJobId}:${r.panelId}`, {
-          rawQueryHash: panelHashMap.get(r.panelId) ?? r.queryHash,
-          varsFingerprint,
-          category: r.category,
-        });
-      }
+      syncValidatedFingerprintsCache(
+        validatedFingerprintsRef.current,
+        targetJobId,
+        varsFingerprint,
+        mergedResults,
+        panelHashMap
+      );
       setValidationResults(mergedResults);
 
       const hasBlockingErrors = mergedResults.some((r) => BLOCKING_CATEGORIES.has(r.category));

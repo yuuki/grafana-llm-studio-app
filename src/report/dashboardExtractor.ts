@@ -134,22 +134,9 @@ function extractDashboardVariables(
       }
       continue;
     }
-    const current = v.current as { value?: unknown } | undefined;
-    const rawVal = current?.value;
-    if (typeof rawVal === 'string' && rawVal.trim() !== '' && rawVal !== '$__all') {
-      values.set(name, rawVal.trim());
-    } else if (Array.isArray(rawVal) && rawVal.length > 0 && typeof rawVal[0] === 'string' && rawVal[0] !== '$__all') {
-      values.set(name, rawVal[0].trim());
-    } else if (Array.isArray(v.options)) {
-      for (const opt of v.options) {
-        if (opt && typeof opt === 'object') {
-          const ov = (opt as { value?: unknown }).value;
-          if (typeof ov === 'string' && ov.trim() !== '' && ov !== '$__all') {
-            values.set(name, ov.trim());
-            break;
-          }
-        }
-      }
+    const concrete = extractConcreteVariableValue(v);
+    if (concrete !== undefined) {
+      values.set(name, concrete);
     }
   }
 
@@ -158,6 +145,30 @@ function extractDashboardVariables(
     values.set(scope.labelName, scope.labelValue);
   }
   return { values, promDatasourceVars, nonPromDatasourceVars };
+}
+
+function extractConcreteVariableValue(v: Record<string, unknown>): string | undefined {
+  const current = v.current as { value?: unknown } | undefined;
+  const rawVal = current?.value;
+  if (typeof rawVal === 'string' && rawVal.trim() !== '' && rawVal !== '$__all') {
+    return rawVal.trim();
+  }
+  if (Array.isArray(rawVal) && rawVal.length > 0 && typeof rawVal[0] === 'string' && rawVal[0] !== '$__all') {
+    return rawVal[0].trim();
+  }
+  if (!Array.isArray(v.options)) {
+    return undefined;
+  }
+  for (const opt of v.options) {
+    if (!opt || typeof opt !== 'object') {
+      continue;
+    }
+    const ov = (opt as { value?: unknown }).value;
+    if (typeof ov === 'string' && ov.trim() !== '' && ov !== '$__all') {
+      return ov.trim();
+    }
+  }
+  return undefined;
 }
 
 function resolveExprVariables(
@@ -252,6 +263,52 @@ function isCompatibleDatasourceVar(
   return true;
 }
 
+function resolveCandidateDatasourceUid(
+  raw: unknown,
+  selectedDatasourceUid: string | undefined,
+  promDatasourceVars: Set<string>,
+  nonPromDatasourceVars: Set<string>
+): string | null {
+  if (raw === null || raw === undefined || raw === '') {
+    try {
+      const def = getDataSourceSrv().getInstanceSettings(null);
+      if (def?.uid) {
+        return def.uid;
+      }
+    } catch {
+      // Fallback to selected datasource below.
+    }
+    return selectedDatasourceUid ?? '';
+  }
+  if (typeof raw === 'string') {
+    const trimmed = raw.trim();
+    if (!ANY_VAR_TOKEN_RE.test(trimmed)) {
+      return trimmed;
+    }
+    return isCompatibleDatasourceVar(trimmed, promDatasourceVars, nonPromDatasourceVars)
+      ? selectedDatasourceUid ?? ''
+      : null;
+  }
+  if (typeof raw === 'object') {
+    const rec = raw as { uid?: unknown; type?: unknown };
+    const uidStr = typeof rec.uid === 'string' ? rec.uid.trim() : '';
+    const explicitType = typeof rec.type === 'string' ? rec.type.trim() : undefined;
+    if (explicitType && !isPromCompatibleType(explicitType)) {
+      return null;
+    }
+    if (uidStr === '') {
+      return selectedDatasourceUid ?? '';
+    }
+    if (ANY_VAR_TOKEN_RE.test(uidStr)) {
+      return isCompatibleDatasourceVar(uidStr, promDatasourceVars, nonPromDatasourceVars, explicitType)
+        ? selectedDatasourceUid ?? ''
+        : null;
+    }
+    return uidStr;
+  }
+  return '';
+}
+
 function resolveTargetDatasource(
   targetDs: unknown,
   panelDs: unknown,
@@ -260,51 +317,12 @@ function resolveTargetDatasource(
   promDatasourceVars: Set<string>,
   nonPromDatasourceVars: Set<string>
 ): { uid: string; type: string } | null {
-  const raw = targetDs ?? panelDs;
-  let candidateUid = '';
-
-  if (raw === null || raw === undefined || raw === '') {
-    // Org default datasource
-    try {
-      const def = getDataSourceSrv().getInstanceSettings(null);
-      if (def?.uid) {
-        candidateUid = def.uid;
-      }
-    } catch {
-      // Fallback to selected datasource below.
-    }
-    if (!candidateUid && selectedDatasourceUid) {
-      candidateUid = selectedDatasourceUid;
-    }
-  } else if (typeof raw === 'string') {
-    const trimmed = raw.trim();
-    if (ANY_VAR_TOKEN_RE.test(trimmed)) {
-      if (!isCompatibleDatasourceVar(trimmed, promDatasourceVars, nonPromDatasourceVars)) {
-        return null;
-      }
-      candidateUid = selectedDatasourceUid ?? '';
-    } else {
-      candidateUid = trimmed;
-    }
-  } else if (typeof raw === 'object') {
-    const rec = raw as { uid?: unknown; type?: unknown };
-    const uidStr = typeof rec.uid === 'string' ? rec.uid.trim() : '';
-    const explicitType = typeof rec.type === 'string' ? rec.type.trim() : undefined;
-    if (explicitType && !isPromCompatibleType(explicitType)) {
-      return null;
-    }
-    if (uidStr === '') {
-      candidateUid = selectedDatasourceUid ?? '';
-    } else if (ANY_VAR_TOKEN_RE.test(uidStr)) {
-      if (!isCompatibleDatasourceVar(uidStr, promDatasourceVars, nonPromDatasourceVars, explicitType)) {
-        return null;
-      }
-      candidateUid = selectedDatasourceUid ?? '';
-    } else {
-      candidateUid = uidStr;
-    }
-  }
-
+  const candidateUid = resolveCandidateDatasourceUid(
+    targetDs ?? panelDs,
+    selectedDatasourceUid,
+    promDatasourceVars,
+    nonPromDatasourceVars
+  );
   if (!candidateUid || !allowSet.has(candidateUid)) {
     return null;
   }
