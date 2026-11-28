@@ -679,7 +679,7 @@ func (s *RedisStore) FinishJob(ctx context.Context, params FinishJobParams) (Job
 	if params.Report != nil {
 		b, err := json.Marshal(params.Report)
 		if err != nil {
-			return JobSnapshot{}, fmt.Errorf("marshal report: %w", err)
+			return JobSnapshot{}, fmt.Errorf("%w: marshal report: %v", ErrStoreUnavailable, err)
 		}
 		hasReport = "1"
 		reportJSON = string(b)

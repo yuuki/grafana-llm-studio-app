@@ -279,7 +279,7 @@ async function main() {
   await fetchJSON(`${stubUrl}/_reset`, { method: 'POST' });
   console.log('\n--- Verifying status_report json_schema & json_object wire relay ---');
   const statusReportSchema = JSON.parse(fs.readFileSync('schemas/status-report.schema.json', 'utf8'));
-  const chatEndpoint = `${grafanaUrl}/api/plugins/grafana-llm-app/resources/openai/v1/chat/completions`;
+  const chatEndpoint = `${grafanaUrl}/api/plugins/grafana-llm-app/resources/llm/v1/chat/completions`;
   const statusUserPayload = JSON.stringify({
     task: 'analyze_operational_status',
     language: 'en',
@@ -313,6 +313,10 @@ async function main() {
     }),
   });
   assert.equal(repSchemaRes.ok, true, `status_report json_schema relay failed: HTTP ${repSchemaRes.status} ${repSchemaRes.text}`);
+  const parsedReport = JSON.parse(repSchemaRes.json?.choices?.[0]?.message?.content || '{}');
+  assert.equal(parsedReport.schemaVersion, '1.0');
+  assert.match(parsedReport.findings?.[0]?.id || '', /^f-[1-9][0-9]?$/);
+  assert.deepEqual(parsedReport.findings?.[0]?.evidenceIds, ['ev-alert-1']);
 
   const repObjRes = await fetchJSON(chatEndpoint, {
     method: 'POST',
@@ -323,7 +327,7 @@ async function main() {
     body: JSON.stringify({
       model: 'base',
       messages: [
-        { role: 'system', content: 'Return JSON matching JSON Schema.' },
+        { role: 'system', content: `Return JSON matching JSON Schema:\n${JSON.stringify(statusReportSchema)}` },
         { role: 'user', content: statusUserPayload },
       ],
       max_tokens: 2048,

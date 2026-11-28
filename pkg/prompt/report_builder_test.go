@@ -24,6 +24,43 @@ func TestRedactSecretsAndURLs(t *testing.T) {
 	if got := RedactSecrets(k8sPod); got != k8sPod {
 		t.Fatalf("short k8s pod name should not be redacted: got %q", got)
 	}
+
+	// H-4 regressions: password-only Redis URI, quoted KV secrets, truncated PEM key body,
+	// multi-cookie Cookie header, Authorization: Token, and X-Api-Key header.
+	bypasses := strings.Join([]string{
+		`redis://:s3cr3tpass@redis.internal:6379/0`,
+		`password="quotedSecret99" api_key='tok_live_987654'`,
+		"-----BEGIN RSA PRIVATE KEY-----\nMIIEpAIBAAKCAQEAtokenBodyTruncatedHere",
+		`Cookie: theme=dark; grafana_session=sessSecretValue999`,
+		`Authorization: Token myOpaqueToken12345`,
+		`X-Api-Key: customApiSecretKey789`,
+	}, "\n")
+	scrubbed := RedactSecretsAndURLs(bypasses)
+	for _, leak := range []string{
+		"s3cr3tpass",
+		"quotedSecret99",
+		"tok_live_987654",
+		"MIIEpAIBAAKCAQEA",
+		"sessSecretValue999",
+		"myOpaqueToken12345",
+		"customApiSecretKey789",
+	} {
+		if strings.Contains(scrubbed, leak) {
+			t.Fatalf("expected bypass secret %q to be redacted, got %q", leak, scrubbed)
+		}
+	}
+
+	// M-2 regression: Scope.LabelValue must also pass through RedactSecretsAndURLs.
+	san := SanitizeAnalyzePayload(ir.AnalyzeStatusPayload{
+		Window:       "1h",
+		BaselineMode: "preceding",
+		Language:     "en",
+		Scope:        &ir.ScopeFilter{LabelName: "service", LabelValue: "https://user:topsecret@prom.internal:9090"},
+		Evidence:     ir.ReportEvidenceBundle{CollectedAt: "2026-11-27T00:00:00Z"},
+	})
+	if san.Scope != nil && (strings.Contains(san.Scope.LabelValue, "topsecret") || strings.Contains(san.Scope.LabelValue, "https://")) {
+		t.Fatalf("expected Scope.LabelValue secret/URL to be redacted, got %q", san.Scope.LabelValue)
+	}
 }
 
 func TestBuildAnalyzeStatusMessagesSanitizesAndEnforcesLanguage(t *testing.T) {

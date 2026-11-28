@@ -23,6 +23,28 @@ export function escapeMarkdownInline(raw: string): string {
     .trim();
 }
 
+/**
+ * Formats an inline CommonMark/GFM code span without backslash escaping (backslashes are
+ * literal inside code spans). Chooses a backtick delimiter strictly longer than any run of
+ * backticks inside `raw`, and pads with spaces when the content starts/ends with a backtick
+ * or space.
+ */
+export function formatMarkdownCodeSpan(raw: string): string {
+  const flat = raw.replace(/[\r\n]+/g, ' ').trim();
+  const matches = flat.match(/`+/g);
+  let maxRun = 0;
+  if (matches) {
+    for (const m of matches) {
+      if (m.length > maxRun) {
+        maxRun = m.length;
+      }
+    }
+  }
+  const fence = '`'.repeat(maxRun + 1);
+  const needsPad = flat.startsWith('`') || flat.endsWith('`') || flat.startsWith(' ') || flat.endsWith(' ');
+  return needsPad ? `${fence} ${flat} ${fence}` : `${fence}${flat}${fence}`;
+}
+
 function getReportLabels(lang: ReportLanguage) {
   const res = LOCALE_RESOURCES[lang] ?? LOCALE_RESOURCES.en;
   return res.report.markdown;
@@ -48,10 +70,10 @@ export function formatStatusReportMarkdown(
     lines.push(`- **${labels.dashboard}:** ${escapeMarkdownInline(meta.dashboardTitle)}`);
   }
   if (meta.scopeText) {
-    lines.push(`- **${labels.scope}:** \`${escapeMarkdownInline(meta.scopeText)}\``);
+    lines.push(`- **${labels.scope}:** ${formatMarkdownCodeSpan(meta.scopeText)}`);
   }
   if (meta.generatedAt) {
-    lines.push(`- **${labels.generatedAt}:** ${escapeMarkdownInline(meta.generatedAt)}`);
+    lines.push(`- **${labels.generatedAt}:** ${formatMarkdownCodeSpan(meta.generatedAt)}`);
   }
   lines.push('');
 
@@ -79,7 +101,7 @@ export function formatStatusReportMarkdown(
     lines.push('');
     for (const item of report.timeline) {
       const refs = item.evidenceIds.map((id) => `\`${id}\``).join(', ');
-      lines.push(`- \`${escapeMarkdownInline(item.timestamp)}\` — ${escapeMarkdownInline(item.event)} (${refs})`);
+      lines.push(`- ${formatMarkdownCodeSpan(item.timestamp)} — ${escapeMarkdownInline(item.event)} (${refs})`);
     }
     lines.push('');
   }
@@ -135,18 +157,20 @@ export async function copyTextWithFallback(text: string): Promise<boolean> {
   if (typeof document === 'undefined' || !document.body) {
     return false;
   }
+  const ta = document.createElement('textarea');
+  ta.value = text;
+  ta.setAttribute('readonly', '');
+  ta.style.position = 'fixed';
+  ta.style.left = '-9999px';
+  document.body.appendChild(ta);
   try {
-    const ta = document.createElement('textarea');
-    ta.value = text;
-    ta.setAttribute('readonly', '');
-    ta.style.position = 'fixed';
-    ta.style.left = '-9999px';
-    document.body.appendChild(ta);
     ta.select();
-    const ok = typeof document.execCommand === 'function' ? document.execCommand('copy') : false;
-    document.body.removeChild(ta);
-    return ok;
+    return typeof document.execCommand === 'function' ? document.execCommand('copy') : false;
   } catch {
     return false;
+  } finally {
+    if (ta.parentNode) {
+      ta.parentNode.removeChild(ta);
+    }
   }
 }

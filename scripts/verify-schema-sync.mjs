@@ -246,6 +246,27 @@ for (const c of reportChecks) {
   assertExactSetEqual(c.label, c.schemaEnum, extractGoMapKeys(goReportValidate, c.goMap), 'pkg/ir/report_validate.go');
 }
 
+// Also verify AnalyzeStatusPayload input enum parity between TS and Go.
+const reportInputChecks = [
+  { label: 'analyze.window', tsConst: 'ALLOWED_REPORT_WINDOWS', goMap: 'allowedReportWindows' },
+  { label: 'analyze.baselineMode', tsConst: 'ALLOWED_BASELINE_MODES', goMap: 'allowedBaselineModes' },
+  { label: 'analyze.language', tsConst: 'ALLOWED_REPORT_LANGUAGES', goMap: 'allowedReportLanguages' },
+  { label: 'analyze.alert.state', tsConst: 'ALLOWED_ALERT_STATES', goMap: 'allowedAlertStates' },
+  { label: 'analyze.rule.state', tsConst: 'ALLOWED_RULE_STATES', goMap: 'allowedRuleStates' },
+  { label: 'analyze.rule.health', tsConst: 'ALLOWED_RULE_HEALTHS', goMap: 'allowedRuleHealths' },
+  { label: 'analyze.metric.queryStatus', tsConst: 'ALLOWED_METRIC_QUERY_STATUSES', goMap: 'allowedMetricQueryStatuses' },
+  { label: 'analyze.metric.trend', tsConst: 'ALLOWED_METRIC_TRENDS', goMap: 'allowedMetricTrends' },
+  { label: 'analyze.metric.thresholdBreached', tsConst: 'ALLOWED_THRESHOLD_BREACHES', goMap: 'allowedThresholdBreaches' },
+  { label: 'analyze.metric.anomalyHint', tsConst: 'ALLOWED_ANOMALY_HINTS', goMap: 'allowedAnomalyHints' },
+  { label: 'analyze.warning.code', tsConst: 'ALLOWED_COLLECTION_WARNING_CODES', goMap: 'allowedCollectionWarningCodes' },
+];
+
+for (const c of reportInputChecks) {
+  const tsValues = extractTsConstArray(tsReportTypes, c.tsConst);
+  const goValues = extractGoMapKeys(goReportValidate, c.goMap);
+  assertExactSetEqual(c.label, tsValues, goValues, 'pkg/ir/report_validate.go');
+}
+
 console.log(
-  `Bidirectional schema sync OK: ${checks.map((c) => `${c.label}(${c.irEnum.length})`).join(', ')}, patch.operations.op(${patchOpEnum.length}), status-report(${reportChecks.length} enums), datasourceRef/timeRange.to; go-openai compatibility verified.`
+  `Bidirectional schema sync OK: ${checks.map((c) => `${c.label}(${c.irEnum.length})`).join(', ')}, patch.operations.op(${patchOpEnum.length}), status-report(${reportChecks.length} output + ${reportInputChecks.length} input enums), datasourceRef/timeRange.to; go-openai compatibility verified.`
 );

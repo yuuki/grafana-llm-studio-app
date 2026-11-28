@@ -607,12 +607,23 @@ func (m *Manager) AnalyzeStatus(ctx context.Context, owner Owner, in ir.AnalyzeS
 			snap, _ := m.finishReportJobWithStage(ctx, owner, jobID, opToken, StatusCancelled, nil, "Status analysis was cancelled.", "Status analysis was cancelled.", &meta)
 			return snap, ErrJobCancelled
 		}
-		errMsg := fmt.Sprintf("LLM status analysis failed: %v", err)
+		redactedErr := prompt.RedactSecretsAndURLs(err.Error())
+		if redactedErr == "" {
+			redactedErr = "upstream LLM error"
+		}
+		errMsg := fmt.Sprintf("LLM status analysis failed: %s", redactedErr)
+		retErr := err
+		if !errors.Is(err, context.DeadlineExceeded) &&
+			!errors.Is(err, llm.ErrOutputTruncated) &&
+			!errors.Is(err, llm.ErrOutputRefused) &&
+			!errors.Is(err, llm.ErrLLMUnavailable) {
+			retErr = fmt.Errorf("%w: %s", llm.ErrLLMUnavailable, redactedErr)
+		}
 		snap, finishErr := m.finishReportJobWithStage(ctx, owner, jobID, opToken, StatusFailed, nil, "", errMsg, &meta)
 		if errors.Is(finishErr, ErrJobCancelled) {
 			return snap, ErrJobCancelled
 		}
-		return snap, err
+		return snap, retErr
 	}
 
 	m.setStatusIfToken(ctx, owner, jobID, opToken, StatusValidatingReport)
@@ -620,25 +631,26 @@ func (m *Manager) AnalyzeStatus(ctx context.Context, owner Owner, in ir.AnalyzeS
 
 	report, err := ir.DecodeStrictStatusReport(raw)
 	if err != nil {
-		errMsg := fmt.Sprintf("Status report JSON schema validation failed: %v", err)
+		errMsg := fmt.Sprintf("Status report JSON schema validation failed: %s", prompt.RedactSecretsAndURLs(err.Error()))
 		snap, finishErr := m.finishReportJobWithStage(ctx, owner, jobID, opToken, StatusFailed, nil, "", errMsg, &meta)
 		if errors.Is(finishErr, ErrJobCancelled) {
 			return snap, ErrJobCancelled
 		}
 		return snap, err
 	}
+
+	// Defense-in-depth: redact any secret-like strings before final validation & persistence
+	// so redaction never silently causes post-validation length overshoot.
+	prompt.RedactStatusReport(&report)
 
 	if err := ir.ValidateStatusReport(report, allowedEvidenceIDs); err != nil {
-		errMsg := fmt.Sprintf("Status report grounding or hygiene validation failed: %v", err)
+		errMsg := fmt.Sprintf("Status report grounding or hygiene validation failed: %s", prompt.RedactSecretsAndURLs(err.Error()))
 		snap, finishErr := m.finishReportJobWithStage(ctx, owner, jobID, opToken, StatusFailed, nil, "", errMsg, &meta)
 		if errors.Is(finishErr, ErrJobCancelled) {
 			return snap, ErrJobCancelled
 		}
 		return snap, err
 	}
-
-	// Defense-in-depth: redact any secret-like strings before persisting to JobStore.
-	prompt.RedactStatusReport(&report)
 
 	return m.finishReportJobWithStage(ctx, owner, jobID, opToken, StatusReady, &report, report.ExecutiveSummary, "", &meta)
 }

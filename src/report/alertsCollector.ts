@@ -191,26 +191,103 @@ function isAbortError(err: unknown): boolean {
   if (err instanceof DOMException && err.name === 'AbortError') {
     return true;
   }
+  if (typeof err === 'object' && (err as { cancelled?: unknown }).cancelled === true) {
+    return true;
+  }
   if (err instanceof Error && (err.name === 'AbortError' || err.message.toLowerCase().includes('abort'))) {
     return true;
   }
   return false;
 }
 
+/**
+ * Fetches JSON via Grafana's BackendSrv.fetch Observable with proper abortSignal + unsubscribe()
+ * so timeouts, Cancel clicks, org switches, and component unmount abort in-flight HTTP requests.
+ */
 async function fetchWithTimeout<T>(url: string, timeoutMs: number, externalSignal?: AbortSignal): Promise<T> {
   if (externalSignal?.aborted) {
     throw new DOMException('Aborted', 'AbortError');
   }
+  let timedOut = false;
+  let externallyAborted = false;
   const controller = new AbortController();
-  const onExternalAbort = () => controller.abort();
+  const timer = setTimeout(() => {
+    timedOut = true;
+    controller.abort(new Error('timeout'));
+  }, timeoutMs);
+  const onExternalAbort = () => {
+    externallyAborted = true;
+    controller.abort(externalSignal?.reason);
+  };
   externalSignal?.addEventListener('abort', onExternalAbort, { once: true });
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
+
   try {
-    return await getBackendSrv().get<T>(url, undefined, undefined, {
-      showErrorAlert: false,
-      showSuccessAlert: false,
-      signal: controller.signal,
-    } as Record<string, unknown>);
+    return await new Promise<T>((resolve, reject) => {
+      if (externalSignal?.aborted || externallyAborted) {
+        reject(new DOMException('Aborted', 'AbortError'));
+        return;
+      }
+      if (controller.signal.aborted) {
+        reject(new Error('timeout'));
+        return;
+      }
+      let settled = false;
+      let sub: { unsubscribe: () => void } | undefined;
+      const onAbort = () => {
+        if (settled) {
+          return;
+        }
+        settled = true;
+        sub?.unsubscribe();
+        controller.signal.removeEventListener('abort', onAbort);
+        if (externallyAborted || externalSignal?.aborted) {
+          reject(new DOMException('Aborted', 'AbortError'));
+        } else {
+          reject(new Error('timeout'));
+        }
+      };
+      controller.signal.addEventListener('abort', onAbort, { once: true });
+
+      sub = getBackendSrv()
+        .fetch<T>({
+          url,
+          method: 'GET',
+          showErrorAlert: false,
+          showSuccessAlert: false,
+          abortSignal: controller.signal,
+        })
+        .subscribe({
+          next: (res) => {
+            if (settled) {
+              return;
+            }
+            settled = true;
+            controller.signal.removeEventListener('abort', onAbort);
+            resolve(res.data);
+          },
+          error: (err) => {
+            if (settled) {
+              return;
+            }
+            settled = true;
+            controller.signal.removeEventListener('abort', onAbort);
+            if (externallyAborted || externalSignal?.aborted) {
+              reject(new DOMException('Aborted', 'AbortError'));
+            } else if (timedOut) {
+              reject(new Error('timeout'));
+            } else {
+              reject(err);
+            }
+          },
+          complete: () => {
+            if (!settled) {
+              settled = true;
+              controller.signal.removeEventListener('abort', onAbort);
+              reject(new Error('Empty response from Grafana Alerting API'));
+            }
+          },
+        });
+    });
   } finally {
     clearTimeout(timer);
     externalSignal?.removeEventListener('abort', onExternalAbort);
@@ -230,6 +307,9 @@ export async function collectGrafanaAlertingEvidence(
   const includeOrgCritical = options.includeOrgCriticalAlerts ?? true;
   const warnings: CollectionWarningItem[] = [];
   const pushWarning = (code: CollectionWarningItem['code'], message: string) => {
+    if (warnings.length >= 12) {
+      return;
+    }
     warnings.push({
       id: `ev-warn-${warnings.length + 1}`,
       code,
@@ -289,13 +369,14 @@ export async function collectGrafanaAlertingEvidence(
     }
   }
 
-  const coveredRuleUIDs = new Set<string>();
-  const coveredRuleNames = new Set<string>();
   let activeAlertsTotal = 0;
 
   interface RankedAlert {
     priority: number;
     startsAtMs: number;
+    rawRuleUid: string;
+    rawAlertName: string;
+    rawRuleName: string;
     item: Omit<AlertEvidenceItem, 'id'>;
   }
 
@@ -321,16 +402,6 @@ export async function collectGrafanaAlertingEvidence(
       }
     }
 
-    if (labels.__alert_rule_uid__) {
-      coveredRuleUIDs.add(labels.__alert_rule_uid__);
-    }
-    if (labels.rulename) {
-      coveredRuleNames.add(labels.rulename);
-    }
-    if (labels.alertname) {
-      coveredRuleNames.add(labels.alertname);
-    }
-
     let priority = 40;
     if (state === 'active' && matchesScope && isCriticalSeverity(severity)) {
       priority = 1;
@@ -344,12 +415,19 @@ export async function collectGrafanaAlertingEvidence(
       priority = 30;
     }
 
-    const startsAt = typeof raw.startsAt === 'string' && !Number.isNaN(Date.parse(raw.startsAt)) ? raw.startsAt : undefined;
-    const startsAtMs = startsAt ? Date.parse(startsAt) : 0;
+    const parsedStartsAt = typeof raw.startsAt === 'string' ? Date.parse(raw.startsAt) : Number.NaN;
+    const startsAtMs = Number.isFinite(parsedStartsAt) ? parsedStartsAt : 0;
+    const startsAt =
+      Number.isFinite(parsedStartsAt) && Math.abs(parsedStartsAt) <= 8.64e15
+        ? new Date(parsedStartsAt).toISOString()
+        : undefined;
 
     rankedAlerts.push({
       priority,
       startsAtMs,
+      rawRuleUid: labels.__alert_rule_uid__ ?? '',
+      rawAlertName: labels.alertname ?? '',
+      rawRuleName: labels.rulename ?? '',
       item: {
         alertName: trimRunes(alertName, 128),
         state,
@@ -377,25 +455,44 @@ export async function collectGrafanaAlertingEvidence(
     );
   }
 
-  const alerts: AlertEvidenceItem[] = rankedAlerts
-    .slice(0, MAX_ALERT_EVIDENCE_ITEMS)
-    .map((r, idx) => ({
-      id: `ev-alert-${idx + 1}`,
-      ...r.item,
-    }));
+  const keptAlerts = rankedAlerts.slice(0, MAX_ALERT_EVIDENCE_ITEMS);
+  const coveredRuleUIDs = new Set<string>();
+  const coveredRuleNames = new Set<string>();
+  for (const kept of keptAlerts) {
+    // Only deduplicate firing rules that are actually covered by a KEPT active alert.
+    if (kept.item.state !== 'active') {
+      continue;
+    }
+    if (kept.rawRuleUid) {
+      coveredRuleUIDs.add(kept.rawRuleUid);
+    }
+    if (kept.rawRuleName) {
+      coveredRuleNames.add(kept.rawRuleName);
+    }
+    if (kept.rawAlertName) {
+      coveredRuleNames.add(kept.rawAlertName);
+    }
+  }
+
+  const alerts: AlertEvidenceItem[] = keptAlerts.map((r, idx) => ({
+    id: `ev-alert-${idx + 1}`,
+    ...r.item,
+  }));
 
   // Extract abnormal alerting rules (skipping recording rules and deduplicating active alerts already covered).
   let totalRulesEvaluated = 0;
   let abnormalRulesTotal = 0;
+  let rulesResponseTruncated = false;
   const candidateRules: Array<{ priority: number; item: Omit<RuleEvidenceItem, 'id'> }> = [];
 
   const groups = rawRulesResp?.data?.groups ?? [];
   let inspected = 0;
-  for (const grp of groups) {
+  outerRulesLoop: for (const grp of groups) {
     const groupRules = grp.rules ?? [];
     for (const rule of groupRules) {
       if (inspected >= MAX_RULES_RESPONSE_ITEMS) {
-        break;
+        rulesResponseTruncated = true;
+        break outerRulesLoop;
       }
       inspected++;
       if ((rule.type ?? '').toLowerCase() === 'recording') {
@@ -414,10 +511,18 @@ export async function collectGrafanaAlertingEvidence(
 
       const ruleName = trimRunes(rule.name, 128) || 'UnnamedRule';
       const ruleUID = rule.labels?.__alert_rule_uid__ ?? '';
+      const instanceCoveredByUID = (rule.alerts ?? []).some((inst) => {
+        const instUID = inst.labels?.__alert_rule_uid__ ?? '';
+        return instUID !== '' && coveredRuleUIDs.has(instUID);
+      });
+      const hasAnyUID =
+        ruleUID !== '' || (rule.alerts ?? []).some((inst) => Boolean(inst.labels?.__alert_rule_uid__));
       const alreadyInAlertmanager =
-        (ruleUID !== '' && coveredRuleUIDs.has(ruleUID)) || coveredRuleNames.has(ruleName);
+        (ruleUID !== '' && coveredRuleUIDs.has(ruleUID)) ||
+        instanceCoveredByUID ||
+        (!hasAnyUID && coveredRuleNames.has(ruleName));
 
-      // Avoid double-counting healthy firing rules already covered by /v2/alerts,
+      // Avoid double-counting healthy firing rules already covered by kept active /v2/alerts,
       // while preserving error/nodata/pending/recovering rules and external-Alertmanager firing rules.
       if (state === 'firing' && health === 'ok' && alreadyInAlertmanager) {
         continue;
@@ -457,6 +562,13 @@ export async function collectGrafanaAlertingEvidence(
         },
       });
     }
+  }
+
+  if (rulesResponseTruncated) {
+    pushWarning(
+      'evidence_truncated',
+      `Inspected the first ${MAX_RULES_RESPONSE_ITEMS} Grafana alerting rules; remaining rules were omitted.`
+    );
   }
 
   candidateRules.sort((a, b) => a.priority - b.priority);

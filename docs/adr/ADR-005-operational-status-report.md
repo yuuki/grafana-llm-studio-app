@@ -46,7 +46,7 @@ Adding LLM-powered operational analysis introduces five concrete risks that must
 
 ### 4. Standalone Navigation Page & Dual-Version Routing
 - **Plugin Manifest (`src/plugin.json`):** Adds an independent navigation entry under `includes` (`path: "/a/yuuki-llmstudio-app/reports"`, `role: "Viewer"`, `addToNav: true`). Because Grafana reads `plugin.json` only at startup, deploying this feature requires restarting Grafana (explicitly noted in release notes and PR checklist). No changes are made to `id`, `type`, `executable`, or `iam.permissions`.
-- **Frontend Routing (`react-router`):** `package.json` declares `"react-router": "6.30.6"` directly (replacing unused `react-router-dom`), `scripts/verify-bundle.mjs` enforces `'react-router'` in `requiredExternals`, and `AppRoot` uses only the v6/v7 common subset (`Routes`, `Route`) with relative child routes (`path="reports"`) and `<PluginPage>`.
+- **Frontend Routing (`react-router`):** `package.json` declares `"react-router": "6.30.6"` directly (keeping `"react-router-dom": "6.30.6"` solely for `@grafana/scenes@9.3.0`'s `peerDependencies`), `scripts/verify-bundle.mjs` enforces `'react-router'` in `requiredExternals`, and `AppRoot` imports exclusively from `react-router` using only the v6/v7 common subset (`Routes`, `Route`) with relative child routes (`path="reports"`) and `<PluginPage>`.
 
 ## Consequences
 - **Positive:** Preserves all existing security boundaries (ADR-001 through ADR-004), keeps `AppConfig` and `iam.permissions` unchanged, prevents hallucinated citations and secret/URL leakage via defense-in-depth sanitization and fail-closed Go validation, works offline/air-gapped on vLLM, and connects safely into Dashboard Studio without exposing unvalidated PromQL.

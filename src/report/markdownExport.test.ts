@@ -1,6 +1,11 @@
 import { setStudioLocale } from '../i18n';
 import { StatusReportIR } from '../ir/reportTypes';
-import { copyTextWithFallback, escapeMarkdownInline, formatStatusReportMarkdown } from './markdownExport';
+import {
+  copyTextWithFallback,
+  escapeMarkdownInline,
+  formatMarkdownCodeSpan,
+  formatStatusReportMarkdown,
+} from './markdownExport';
 
 const SAMPLE_REPORT: StatusReportIR = {
   schemaVersion: '1.0',
@@ -9,7 +14,7 @@ const SAMPLE_REPORT: StatusReportIR = {
   executiveSummary: 'Checkout API 5xx rate spiked [click](http://bad) \n# injected',
   findings: [
     {
-      id: 'finding-1',
+      id: 'f-1',
       severity: 'critical',
       category: 'alert',
       title: 'HighErrorRate *firing*',
@@ -37,7 +42,7 @@ const SAMPLE_REPORT: StatusReportIR = {
     {
       priority: 'immediate',
       action: 'Check recent rollout',
-      relatedFindingIds: ['finding-1'],
+      relatedFindingIds: ['f-1'],
     },
   ],
   dataGaps: ['External Alertmanager not inspected'],
@@ -48,10 +53,13 @@ describe('report/markdownExport', () => {
     setStudioLocale('en');
   });
 
-  test('escapes Markdown control chars and flattens newlines against injection', () => {
+  test('escapes Markdown control chars and formats CommonMark code spans without corrupting underscores or backticks', () => {
     expect(escapeMarkdownInline('Hello [link](url)\n# Heading *bold*')).toBe(
       'Hello \\[link\\]\\(url\\) \\# Heading \\*bold\\*'
     );
+    expect(formatMarkdownCodeSpan('service=checkout_api')).toBe('`service=checkout_api`');
+    expect(formatMarkdownCodeSpan('foo`bar')).toBe('``foo`bar``');
+    expect(formatMarkdownCodeSpan('`leading`')).toBe('`` `leading` ``');
   });
 
   test('uses reportLanguage headings independent of active Grafana UI locale', () => {
@@ -60,7 +68,7 @@ describe('report/markdownExport', () => {
       window: '1h',
       baselineMode: 'preceding',
       dashboardTitle: 'Checkout Overview',
-      scopeText: 'service=checkout-api',
+      scopeText: 'service=checkout_api',
       generatedAt: '2026-11-27T00:15:00Z',
     });
 
@@ -68,6 +76,7 @@ describe('report/markdownExport', () => {
     expect(jaMd).toContain('## エグゼクティブサマリ');
     expect(jaMd).toContain('## 検出事項');
     expect(jaMd).toContain('## 推奨アクション');
+    expect(jaMd).toContain('`service=checkout_api`');
     expect(jaMd).toContain('`ev-alert-1`, `ev-metric-1`');
     expect(jaMd).toContain('\\[click\\]\\(http://bad\\)');
     expect(jaMd).not.toContain('\n# injected');

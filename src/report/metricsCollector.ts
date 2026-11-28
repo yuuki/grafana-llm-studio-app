@@ -1,4 +1,5 @@
 import { getBackendSrv } from '@grafana/runtime';
+import { extractApiError } from '../api/studioClient';
 import {
   AnomalyHint,
   BaselineMode,
@@ -57,6 +58,7 @@ interface GrafanaDSQueryResponse {
 }
 
 interface ParsedSeries {
+  fullLabelKey: string;
   labelKey: string;
   timestamps: number[];
   values: number[];
@@ -71,6 +73,7 @@ const WINDOW_CONFIG: Record<ReportWindow, { durationMs: number; intervalMs: numb
 
 const LOWER_IS_WORSE_RE = /(\bup\b|avail|healthy|ready|free|hit_ratio|cache_hit|success_rate)/i;
 const EPSILON_BASELINE = 1e-6;
+const MAX_DATE_MS = 8.64e15;
 
 function roundNum(v: number): number {
   if (!Number.isFinite(v)) {
@@ -86,16 +89,32 @@ function roundNum(v: number): number {
   return Math.round(v * 100000) / 100000;
 }
 
-function canonicalLabelString(labels: Record<string, string> | undefined, fallbackName: string): string {
+function fullCanonicalLabelString(labels: Record<string, string> | undefined, fallbackName: string): string {
   if (!labels || Object.keys(labels).length === 0) {
     return fallbackName || 'series';
   }
   const keys = Object.keys(labels).sort();
-  return keys.map((k) => `${k}=${labels[k]}`).join(', ').slice(0, 140);
+  return keys.map((k) => `${k}=${labels[k]}`).join(', ');
+}
+
+function parseFiniteNumericCell(rawV: unknown): number {
+  if (typeof rawV === 'number') {
+    return Number.isFinite(rawV) ? rawV : Number.NaN;
+  }
+  if (typeof rawV === 'string') {
+    const trimmed = rawV.trim();
+    if (trimmed === '') {
+      return Number.NaN;
+    }
+    const parsed = Number(trimmed);
+    return Number.isFinite(parsed) ? parsed : Number.NaN;
+  }
+  return Number.NaN;
 }
 
 /**
- * Parses both long and wide Grafana /api/ds/query frames, filtering strictly to finite numbers.
+ * Parses both long (string label columns + numeric column) and wide Grafana /api/ds/query frames,
+ * filtering strictly to finite numbers and rejecting empty/whitespace strings.
  */
 export function parseFramesToSeries(frames: GrafanaDataFrame[] | undefined): ParsedSeries[] {
   if (!Array.isArray(frames) || frames.length === 0) {
@@ -115,6 +134,14 @@ export function parseFramesToSeries(frames: GrafanaDataFrame[] | undefined): Par
     }
     const rawTimes = timeColIdx >= 0 ? columns[timeColIdx] ?? [] : [];
 
+    // Detect long-format frames: string label columns alongside numeric columns.
+    const stringColIndices: number[] = [];
+    for (let i = 0; i < columns.length; i++) {
+      if (i !== timeColIdx && fields[i]?.type === 'string') {
+        stringColIndices.push(i);
+      }
+    }
+
     for (let colIdx = 0; colIdx < columns.length; colIdx++) {
       if (colIdx === timeColIdx) {
         continue;
@@ -124,12 +151,51 @@ export function parseFramesToSeries(frames: GrafanaDataFrame[] | undefined): Par
         continue;
       }
       const rawVals = columns[colIdx] ?? [];
+
+      if (stringColIndices.length > 0 && (!fieldMeta?.labels || Object.keys(fieldMeta.labels).length === 0)) {
+        // Long DataFrame: partition rows by tuple of string label columns.
+        const grouped = new Map<string, { timestamps: number[]; values: number[] }>();
+        for (let i = 0; i < rawVals.length; i++) {
+          const num = parseFiniteNumericCell(rawVals[i]);
+          if (!Number.isFinite(num)) {
+            continue;
+          }
+          const labelPairs = stringColIndices
+            .map((si) => {
+              const colName = fields[si]?.name || `label_${si}`;
+              const cell = columns[si]?.[i];
+              return `${colName}=${cell === null || cell === undefined ? '' : String(cell)}`;
+            })
+            .sort();
+          const fullKey = labelPairs.join(', ') || fieldMeta?.name || frame.name || `series_${colIdx}`;
+          let bucket = grouped.get(fullKey);
+          if (!bucket) {
+            bucket = { timestamps: [], values: [] };
+            grouped.set(fullKey, bucket);
+          }
+          const rawT = rawTimes[i];
+          const ts = typeof rawT === 'number' && Number.isFinite(rawT) ? rawT : 0;
+          bucket.timestamps.push(ts);
+          bucket.values.push(num);
+        }
+        for (const [fullKey, bucket] of grouped.entries()) {
+          if (bucket.values.length > 0) {
+            series.push({
+              fullLabelKey: fullKey,
+              labelKey: fullKey.slice(0, 140),
+              timestamps: bucket.timestamps,
+              values: bucket.values,
+            });
+          }
+        }
+        continue;
+      }
+
       const timestamps: number[] = [];
       const values: number[] = [];
 
       for (let i = 0; i < rawVals.length; i++) {
-        const rawV = rawVals[i];
-        const num = typeof rawV === 'number' ? rawV : typeof rawV === 'string' ? Number(rawV) : NaN;
+        const num = parseFiniteNumericCell(rawVals[i]);
         if (!Number.isFinite(num)) {
           continue;
         }
@@ -140,8 +206,16 @@ export function parseFramesToSeries(frames: GrafanaDataFrame[] | undefined): Par
       }
 
       if (values.length > 0) {
-        const labelKey = canonicalLabelString(fieldMeta?.labels, fieldMeta?.name || frame.name || `series_${colIdx}`);
-        series.push({ labelKey, timestamps, values });
+        const fullLabelKey = fullCanonicalLabelString(
+          fieldMeta?.labels,
+          fieldMeta?.name || frame.name || `series_${colIdx}`
+        );
+        series.push({
+          fullLabelKey,
+          labelKey: fullLabelKey.slice(0, 140),
+          timestamps,
+          values,
+        });
       }
     }
   }
@@ -183,7 +257,8 @@ function computeWindowStats(s: ParsedSeries, expectedSteps: number): MetricWindo
   const missingRatio = Math.max(0, Math.min(1, roundNum(1 - n / expected)));
 
   const peakTs = s.timestamps[peakIdx];
-  const peakAt = peakTs > 0 ? new Date(peakTs).toISOString() : undefined;
+  const peakAt =
+    Number.isFinite(peakTs) && peakTs > 0 && peakTs <= MAX_DATE_MS ? new Date(peakTs).toISOString() : undefined;
 
   return {
     latest: roundNum(latest),
@@ -197,7 +272,7 @@ function computeWindowStats(s: ParsedSeries, expectedSteps: number): MetricWindo
   };
 }
 
-function classifyTrend(values: number[], avg: number, max: number): MetricTrend {
+function classifyTrend(values: number[], avg: number, minVal: number, maxVal: number): MetricTrend {
   if (values.length === 0) {
     return 'no_data';
   }
@@ -213,7 +288,7 @@ function classifyTrend(values: number[], avg: number, max: number): MetricTrend 
   const denom = Math.max(Math.abs(firstAvg), EPSILON_BASELINE);
   const relChange = (secondAvg - firstAvg) / denom;
 
-  if (Math.abs(avg) > EPSILON_BASELINE && max / Math.abs(avg) >= 2.5) {
+  if (Math.abs(avg) > EPSILON_BASELINE && maxVal / Math.abs(avg) >= 2.5) {
     return 'spiking';
   }
   if (relChange >= 0.2) {
@@ -222,7 +297,7 @@ function classifyTrend(values: number[], avg: number, max: number): MetricTrend 
   if (relChange <= -0.2) {
     return 'falling';
   }
-  const range = Math.max(...values) - Math.min(...values);
+  const range = maxVal - minVal;
   if (Math.abs(avg) > EPSILON_BASELINE && range / Math.abs(avg) >= 1.0) {
     return 'volatile';
   }
@@ -271,8 +346,8 @@ function evaluateThresholdBreach(stats: MetricWindowStats, thresholds?: RawPanel
     return 'none';
   }
   const rank: Record<ThresholdBreach, number> = { none: 0, warning: 1, critical: 2 };
-  const inverted = isInvertedThreshold(thresholds);
-  const candidates = [stats.latest ?? stats.avg, inverted ? stats.min : stats.max];
+  // Evaluate latest, min, and max so normal, inverted, and band (red -> green -> red) thresholds all work.
+  const candidates = [stats.latest ?? stats.avg, stats.min, stats.max];
   let worst: ThresholdBreach = 'none';
   for (const v of candidates) {
     const b = evaluateSingleThresholdValue(v, thresholds);
@@ -283,78 +358,173 @@ function evaluateThresholdBreach(stats: MetricWindowStats, thresholds?: RawPanel
   return worst;
 }
 
+function expandTimeRangeMacros(expr: string, fromMs: number, toMs: number): string {
+  return expr
+    .replace(/\$\{__from\}|\$__from\b/g, String(fromMs))
+    .replace(/\$\{__to\}|\$__to\b/g, String(toMs));
+}
+
+function extractDatasourceQueryError(err: unknown, refId: string): string {
+  if (err && typeof err === 'object') {
+    const rec = err as { data?: { results?: Record<string, { error?: unknown }> } };
+    const inner = rec.data?.results?.[refId]?.error;
+    if (typeof inner === 'string' && inner.trim() !== '') {
+      return inner.trim().slice(0, 240);
+    }
+  }
+  const extracted = extractApiError(err);
+  return (extracted || 'Datasource query failed').slice(0, 240);
+}
+
 async function runSingleRangeQuery(
   query: ExtractedReportQuery,
   fromMs: number,
   toMs: number,
   intervalMs: number,
   timeoutMs: number,
-  signal?: AbortSignal
+  outerSignal?: AbortSignal
 ): Promise<{ status: 'ok' | 'empty' | 'error' | 'timeout'; series: ParsedSeries[]; errorText?: string }> {
-  if (signal?.aborted) {
+  if (outerSignal?.aborted) {
     throw new DOMException('Aborted', 'AbortError');
   }
+
+  let timedOut = false;
+  let externallyAborted = false;
   const controller = new AbortController();
-  const onAbort = () => controller.abort();
-  signal?.addEventListener('abort', onAbort, { once: true });
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  const timer = setTimeout(() => {
+    timedOut = true;
+    controller.abort(new Error('timeout'));
+  }, timeoutMs);
+  const onOuterAbort = () => {
+    externallyAborted = true;
+    controller.abort(outerSignal?.reason);
+  };
+  outerSignal?.addEventListener('abort', onOuterAbort, { once: true });
+
+  const resolvedExpr = expandTimeRangeMacros(query.expr, fromMs, toMs);
 
   try {
-    const resp = await getBackendSrv().post<GrafanaDSQueryResponse>(
-      '/api/ds/query',
-      {
-        from: String(fromMs),
-        to: String(toMs),
-        queries: [
-          {
-            refId: query.refId,
-            expr: query.expr,
-            datasource: { uid: query.datasourceUid, type: query.datasourceType },
-            range: true,
-            instant: false,
-            intervalMs,
-            maxDataPoints: 100,
-          },
-        ],
-      },
-      {
-        showErrorAlert: false,
-        showSuccessAlert: false,
-        signal: controller.signal,
-      } as Record<string, unknown>
-    );
+    const resp = await new Promise<GrafanaDSQueryResponse>((resolve, reject) => {
+      if (outerSignal?.aborted || externallyAborted) {
+        reject(new DOMException('Aborted', 'AbortError'));
+        return;
+      }
+      if (controller.signal.aborted) {
+        reject(new Error('timeout'));
+        return;
+      }
+      let settled = false;
+      let sub: { unsubscribe: () => void } | undefined;
+      const onAbort = () => {
+        if (settled) {
+          return;
+        }
+        settled = true;
+        sub?.unsubscribe();
+        controller.signal.removeEventListener('abort', onAbort);
+        if (externallyAborted || outerSignal?.aborted) {
+          reject(new DOMException('Aborted', 'AbortError'));
+        } else {
+          reject(new Error('timeout'));
+        }
+      };
+      controller.signal.addEventListener('abort', onAbort, { once: true });
 
-    const refRes = resp?.results?.[query.refId];
-    if (refRes?.error) {
-      return { status: 'error', series: [], errorText: refRes.error.slice(0, 240) };
+      sub = getBackendSrv()
+        .fetch<GrafanaDSQueryResponse>({
+          url: '/api/ds/query',
+          method: 'POST',
+          showErrorAlert: false,
+          showSuccessAlert: false,
+          abortSignal: controller.signal,
+          data: {
+            from: String(fromMs),
+            to: String(toMs),
+            queries: [
+              {
+                refId: query.refId,
+                datasource: { uid: query.datasourceUid, type: query.datasourceType },
+                expr: resolvedExpr,
+                range: true,
+                instant: false,
+                intervalMs,
+                maxDataPoints: 60,
+              },
+            ],
+          },
+        })
+        .subscribe({
+          next: (res) => {
+            if (settled) {
+              return;
+            }
+            settled = true;
+            controller.signal.removeEventListener('abort', onAbort);
+            resolve(res.data);
+          },
+          error: (err) => {
+            if (settled) {
+              return;
+            }
+            settled = true;
+            controller.signal.removeEventListener('abort', onAbort);
+            if (externallyAborted || outerSignal?.aborted) {
+              reject(new DOMException('Aborted', 'AbortError'));
+            } else if (timedOut) {
+              reject(new Error('timeout'));
+            } else {
+              reject(err);
+            }
+          },
+          complete: () => {
+            if (!settled) {
+              settled = true;
+              controller.signal.removeEventListener('abort', onAbort);
+              resolve({});
+            }
+          },
+        });
+    });
+
+    const entry = resp?.results?.[query.refId];
+    if (!entry) {
+      return { status: 'empty', series: [] };
     }
-    const parsed = parseFramesToSeries(refRes?.frames);
+    if (entry.error) {
+      return { status: 'error', series: [], errorText: String(entry.error).slice(0, 240) };
+    }
+    const parsed = parseFramesToSeries(entry.frames);
     if (parsed.length === 0) {
       return { status: 'empty', series: [] };
     }
     return { status: 'ok', series: parsed };
   } catch (err) {
-    if (signal?.aborted) {
+    if (externallyAborted || outerSignal?.aborted) {
       throw new DOMException('Aborted', 'AbortError');
     }
     if (
+      timedOut ||
       (err instanceof DOMException && err.name === 'AbortError') ||
-      (err instanceof Error && err.name === 'AbortError')
+      (err instanceof Error && err.message === 'timeout') ||
+      (typeof err === 'object' && err !== null && (err as { cancelled?: unknown }).cancelled === true)
     ) {
-      return { status: 'timeout', series: [], errorText: `Query timed out after ${timeoutMs}ms` };
+      return { status: 'timeout', series: [], errorText: `Query timed out (${Math.round(timeoutMs / 1000)}s)` };
     }
-    const msg = err instanceof Error ? err.message : 'Datasource query failed';
-    return { status: 'error', series: [], errorText: msg.slice(0, 240) };
+    return {
+      status: 'error',
+      series: [],
+      errorText: extractDatasourceQueryError(err, query.refId),
+    };
   } finally {
     clearTimeout(timer);
-    signal?.removeEventListener('abort', onAbort);
+    outerSignal?.removeEventListener('abort', onOuterAbort);
   }
 }
 
 /**
- * Executes bounded current + optional baseline queries for extracted dashboard panels
- * under the logged-in user's Grafana session with an overall 25s deadline and
- * skips baseline queries whenever the current window errors or times out.
+ * Executes bounded browser-session range queries for extracted dashboard panels over the selected
+ * current window and optional baseline window, computing deterministic summary statistics and
+ * ranking anomalous series (including low-value outages like up == 0 and zero-baseline spikes).
  */
 export async function collectDashboardMetricEvidence(
   panels: ExtractedReportPanel[],
@@ -363,33 +533,27 @@ export async function collectDashboardMetricEvidence(
   if (panels.length === 0) {
     return { metrics: [], warnings: [], analyzedPanelCount: 0 };
   }
-  const winCfg = WINDOW_CONFIG[options.window];
-  const nowMs = options.nowMs ?? Date.now();
-  const currentFromMs = nowMs - winCfg.durationMs;
-  const currentToMs = nowMs;
-  const expectedSteps = Math.floor(winCfg.durationMs / winCfg.intervalMs) + 1;
 
+  const winCfg = WINDOW_CONFIG[options.window] ?? WINDOW_CONFIG['1h'];
   const maxConcurrency = Math.max(1, Math.min(options.maxConcurrency ?? 2, 4));
-  const perQueryTimeoutMs = Math.max(2000, Math.min(options.perQueryTimeoutMs ?? 10_000, 30_000));
+  const perQueryTimeoutMs = Math.max(2000, Math.min(options.perQueryTimeoutMs ?? 10_000, 20_000));
   const overallDeadlineMs = Math.max(5000, Math.min(options.overallDeadlineMs ?? 25_000, 60_000));
+  const nowMs = options.nowMs ?? Date.now();
+  const currentToMs = nowMs;
+  const currentFromMs = currentToMs - winCfg.durationMs;
+  const expectedSteps = Math.max(1, Math.floor(winCfg.durationMs / winCfg.intervalMs) + 1);
 
   const deadlineCtrl = new AbortController();
-  const onExternalAbort = () => deadlineCtrl.abort();
+  const onExternalAbort = () => deadlineCtrl.abort(options.signal?.reason);
+  if (options.signal?.aborted) {
+    throw new DOMException('Aborted', 'AbortError');
+  }
   options.signal?.addEventListener('abort', onExternalAbort, { once: true });
   let hitOverallDeadline = false;
   const deadlineTimer = setTimeout(() => {
     hitOverallDeadline = true;
-    deadlineCtrl.abort();
+    deadlineCtrl.abort(new Error('overall_deadline'));
   }, overallDeadlineMs);
-
-  const warnings: CollectionWarningItem[] = [];
-  const pushWarning = (code: CollectionWarningItem['code'], message: string) => {
-    warnings.push({
-      id: `ev-warn-${warnings.length + 1}`,
-      code,
-      message,
-    });
-  };
 
   interface RankedMetric {
     anomalyScore: number;
@@ -405,11 +569,11 @@ export async function collectDashboardMetricEvidence(
     if (deadlineCtrl.signal.aborted) {
       return;
     }
-    analyzedPanelCount++;
 
+    let panelQueried = false;
     for (const q of panel.queries) {
       if (deadlineCtrl.signal.aborted) {
-        return;
+        break;
       }
       let curRes;
       try {
@@ -425,8 +589,9 @@ export async function collectDashboardMetricEvidence(
         if (options.signal?.aborted) {
           throw err;
         }
-        return;
+        break;
       }
+      panelQueried = true;
 
       if (curRes.status === 'error' || curRes.status === 'timeout') {
         if (options.baselineMode !== 'none') {
@@ -448,6 +613,9 @@ export async function collectDashboardMetricEvidence(
       }
 
       if (curRes.status === 'empty') {
+        if (options.baselineMode !== 'none') {
+          baselineSkippedCount++;
+        }
         rankedItems.push({
           anomalyScore: 45,
           item: {
@@ -462,7 +630,8 @@ export async function collectDashboardMetricEvidence(
         continue;
       }
 
-      const baselineByLabel = new Map<string, MetricBaselineStats>();
+      // Current query succeeded: optionally fetch baseline window for comparison.
+      const baselineByFullLabel = new Map<string, MetricBaselineStats>();
       if (options.baselineMode !== 'none' && !deadlineCtrl.signal.aborted) {
         const baseFromMs =
           options.baselineMode === '24h_ago'
@@ -482,7 +651,7 @@ export async function collectDashboardMetricEvidence(
           if (baseRes.status === 'ok') {
             for (const bs of baseRes.series) {
               const bStats = computeWindowStats(bs, expectedSteps);
-              baselineByLabel.set(bs.labelKey, {
+              baselineByFullLabel.set(bs.fullLabelKey, {
                 avg: bStats.avg,
                 p95: bStats.p95,
                 max: bStats.max,
@@ -504,8 +673,8 @@ export async function collectDashboardMetricEvidence(
 
       for (const s of curRes.series) {
         const current = computeWindowStats(s, expectedSteps);
-        const baseline = baselineByLabel.get(s.labelKey);
-        const trend = classifyTrend(s.values, current.avg, current.max);
+        const baseline = baselineByFullLabel.get(s.fullLabelKey);
+        const trend = classifyTrend(s.values, current.avg, current.min, current.max);
         const thresholdBreached = evaluateThresholdBreach(current, panel.thresholds);
 
         let deltaPctAvg: number | undefined;
@@ -536,6 +705,10 @@ export async function collectDashboardMetricEvidence(
         } else if (lowerIsWorse && current.min === 0 && (baseline === undefined || baseline.avg > 0.5)) {
           anomalyHint = 'degraded';
           anomalyScore = 95;
+        } else if (baselineWasZero && Math.abs(current.avg) >= EPSILON_BASELINE) {
+          // Series went from 0 baseline to non-zero activity (e.g., 5xx errors emerging from 0/s).
+          anomalyHint = 'degraded';
+          anomalyScore = 88;
         } else if (deltaPctAvg !== undefined && Math.abs(deltaPctAvg) >= 50) {
           anomalyHint = Math.abs(deltaPctAvg) >= 100 ? 'degraded' : 'elevated';
           anomalyScore = Math.min(90, 50 + Math.abs(deltaPctAvg) / 5);
@@ -574,6 +747,10 @@ export async function collectDashboardMetricEvidence(
       perPanelCandidates.sort((a, b) => b.anomalyScore - a.anomalyScore);
       rankedItems.push(...perPanelCandidates.slice(0, 3));
     }
+
+    if (panelQueried) {
+      analyzedPanelCount++;
+    }
   };
 
   try {
@@ -583,6 +760,9 @@ export async function collectDashboardMetricEvidence(
           return;
         }
         const idx = cursor++;
+        if (idx >= panels.length) {
+          return;
+        }
         await processPanel(panels[idx]);
       }
     };
@@ -594,29 +774,28 @@ export async function collectDashboardMetricEvidence(
     options.signal?.removeEventListener('abort', onExternalAbort);
   }
 
-  if (options.signal?.aborted) {
-    throw new DOMException('Aborted', 'AbortError');
-  }
-
+  rankedItems.sort((a, b) => b.anomalyScore - a.anomalyScore);
+  const warnings: CollectionWarningItem[] = [];
   if (hitOverallDeadline) {
-    pushWarning(
-      'collection_timeout',
-      `Dashboard metric collection reached the ${Math.round(overallDeadlineMs / 1000)}s deadline; partial panel summaries were collected.`
-    );
+    warnings.push({
+      id: `ev-warn-${warnings.length + 1}`,
+      code: 'collection_timeout',
+      message: `Dashboard metric collection reached the ${Math.round(overallDeadlineMs / 1000)}s deadline; partial results included.`,
+    });
   }
   if (baselineSkippedCount > 0) {
-    pushWarning(
-      'baseline_skipped',
-      `Skipped ${baselineSkippedCount} baseline comparison query(s) after current-window errors or timeouts.`
-    );
+    warnings.push({
+      id: `ev-warn-${warnings.length + 1}`,
+      code: 'baseline_skipped',
+      message: `Baseline comparison was skipped for ${baselineSkippedCount} query/queries due to current-window failure or timeout.`,
+    });
   }
-
-  rankedItems.sort((a, b) => b.anomalyScore - a.anomalyScore);
   if (rankedItems.length > MAX_METRIC_EVIDENCE_ITEMS) {
-    pushWarning(
-      'evidence_truncated',
-      `Trimmed dashboard series summaries from ${rankedItems.length} to top ${MAX_METRIC_EVIDENCE_ITEMS} most anomalous series.`
-    );
+    warnings.push({
+      id: `ev-warn-${warnings.length + 1}`,
+      code: 'evidence_truncated',
+      message: `Truncated dashboard metric series from ${rankedItems.length} to top ${MAX_METRIC_EVIDENCE_ITEMS} anomalous items.`,
+    });
   }
 
   const metrics: MetricEvidenceItem[] = rankedItems

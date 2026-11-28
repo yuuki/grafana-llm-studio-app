@@ -13,9 +13,16 @@ import (
 // SanitizeAnalyzePayload returns a deeply sanitized, redacted, and rune-bounded copy of
 // an AnalyzeStatusPayload safe to serialize into an LLM prompt.
 func SanitizeAnalyzePayload(in ir.AnalyzeStatusPayload) ir.AnalyzeStatusPayload {
+	sanitizedScope := SanitizeScope(in.Scope)
+	if sanitizedScope != nil {
+		sanitizedScope.LabelValue = sanitizeReportInputText(sanitizedScope.LabelValue, 128)
+		if sanitizedScope.LabelValue == "" {
+			sanitizedScope = nil
+		}
+	}
 	out := ir.AnalyzeStatusPayload{
 		DatasourceUID:    SanitizeUntrustedText(in.DatasourceUID, 64),
-		Scope:            SanitizeScope(in.Scope),
+		Scope:            sanitizedScope,
 		Window:           in.Window,
 		BaselineMode:     in.BaselineMode,
 		Language:         in.Language,
@@ -151,10 +158,10 @@ func BuildAnalyzeStatusMessages(in ir.AnalyzeStatusPayload) ([]openai.ChatComple
 	sanitized := SanitizeAnalyzePayload(in)
 	evidenceJSON, err := json.Marshal(sanitized)
 	if err != nil {
-		return nil, fmt.Errorf("marshal sanitized analyze payload: %w", err)
+		return nil, fmt.Errorf("%w: marshal sanitized analyze payload: %v", ir.ErrInvalidAnalyzeRequest, err)
 	}
 	if len(evidenceJSON) > ir.MaxAnalyzePayloadBytes {
-		return nil, fmt.Errorf("sanitized analyze payload exceeds %d bytes (%d bytes)", ir.MaxAnalyzePayloadBytes, len(evidenceJSON))
+		return nil, fmt.Errorf("%w: sanitized analyze payload exceeds %d bytes (%d bytes)", ir.ErrInvalidAnalyzeRequest, ir.MaxAnalyzePayloadBytes, len(evidenceJSON))
 	}
 
 	langInstruction := "Write all natural-language text fields (executiveSummary, timeline.event, findings.title/detail, hypotheses, recommendedActions.action, dataGaps, suggestedInvestigationIntent) in English."

@@ -32,6 +32,12 @@ var (
 	// proseHTMLTagPattern matches actual HTML/XML tag syntax (<div, </script>, <img src=...>)
 	// without falsely rejecting operational comparisons like "p95 < 50ms -> > 500ms".
 	proseHTMLTagPattern = regexp.MustCompile(`(?i)<\s*/?\s*[a-z][a-z0-9-]*[\s/>]`)
+	// proseDataURIPattern matches data: URIs (data:text/html,..., data:;base64,..., data:,...)
+	// without falsely rejecting benign SRE prose such as "Missing data: logs not collected".
+	proseDataURIPattern = regexp.MustCompile(`(?i)\bdata:(?:[a-z0-9.+-]+/[a-z0-9.+-]+|[^ \t\r\n]*,)`)
+	// proseEventAttrPattern matches actual DOM/HTML event handler attributes (onclick=, onerror=,
+	// onload=, ononline=, etc.) without falsely rejecting benign SRE labels like "oncall=payments".
+	proseEventAttrPattern = regexp.MustCompile(`(?i)\bon(?:abort|afterprint|animation\w*|auxclick|before\w+|blur|canplay\w*|change|click|close|contextmenu|copy|cuechange|cut|dblclick|drag\w*|drop|durationchange|emptied|ended|error|focus\w*|formdata|gotpointercapture|hashchange|input|invalid|key\w+|load\w*|lostpointercapture|message\w*|mouse\w*|offline|online|page\w*|paste|pause|play\w*|pointer\w*|popstate|progress|ratechange|reset|resize|scroll\w*|search|seek\w*|select\w*|slotchange|stalled|storage|submit|suspend|timeupdate|toggle|touch\w+|transition\w+|unload|volumechange|waiting|wheel)\s*=`)
 
 	allowedReportSchemaVersions = map[string]bool{
 		"1.0": true,
@@ -159,11 +165,13 @@ var (
 		"<iframe",
 		"<svg",
 		"<object",
+		"<!--",
 		"javascript:",
 		"vbscript:",
-		"data:",
 		"http://",
 		"https://",
+		"ftp://",
+		"file://",
 	}
 )
 
@@ -303,6 +311,9 @@ func ValidateStatusReport(report StatusReportIR, allowedEvidenceIDs map[string]b
 			issues = append(issues, err.Error())
 		}
 		issues = append(issues, validateEvidenceIDRefs(prefix+".evidenceIds", h.EvidenceIDs, allowedEvidenceIDs)...)
+		if h.VerificationSteps == nil {
+			issues = append(issues, fmt.Sprintf("%s.verificationSteps array is required", prefix))
+		}
 		if len(h.VerificationSteps) > MaxReportHypSteps {
 			issues = append(issues, fmt.Sprintf("%s.verificationSteps has %d items (max %d)", prefix, len(h.VerificationSteps), MaxReportHypSteps))
 		}
@@ -323,6 +334,9 @@ func ValidateStatusReport(report StatusReportIR, allowedEvidenceIDs map[string]b
 		}
 		if err := validateReportProse(prefix+".action", act.Action, 1, MaxReportActionRunes); err != nil {
 			issues = append(issues, err.Error())
+		}
+		if act.RelatedFindingIds == nil {
+			issues = append(issues, fmt.Sprintf("%s.relatedFindingIds array is required", prefix))
 		}
 		if len(act.RelatedFindingIds) > MaxReportRelatedFindings {
 			issues = append(issues, fmt.Sprintf("%s.relatedFindingIds has %d items (max %d)", prefix, len(act.RelatedFindingIds), MaxReportRelatedFindings))
@@ -402,8 +416,11 @@ func validateReportProse(field, val string, minRunes, maxRunes int) error {
 	if err := checkForbiddenRunes(field, val); err != nil {
 		return err
 	}
-	if proseHTMLTagPattern.MatchString(val) || eventAttrPattern.MatchString(val) {
+	if proseHTMLTagPattern.MatchString(val) || proseEventAttrPattern.MatchString(val) {
 		return fmt.Errorf("%s must not contain HTML markup or event handlers", field)
+	}
+	if proseDataURIPattern.MatchString(val) {
+		return fmt.Errorf("%s contains forbidden data: URI scheme", field)
 	}
 	lower := strings.ToLower(val)
 	for _, frag := range forbiddenReportProseSchemes {
@@ -412,6 +429,15 @@ func validateReportProse(field, val string, minRunes, maxRunes int) error {
 		}
 	}
 	return nil
+}
+
+func hasVisibleText(s string) bool {
+	for _, r := range s {
+		if !unicode.IsControl(r) && !unicode.IsSpace(r) {
+			return true
+		}
+	}
+	return false
 }
 
 // ValidateAnalyzePayload validates pre-flight invariants on AnalyzeStatusPayload and returns
@@ -449,7 +475,7 @@ func ValidateAnalyzePayload(p AnalyzeStatusPayload) (map[string]bool, error) {
 	}
 
 	if p.DashboardContext != nil {
-		if utf8.RuneCountInString(strings.TrimSpace(p.DashboardContext.Title)) == 0 || utf8.RuneCountInString(p.DashboardContext.Title) > MaxTitleLen {
+		if !hasVisibleText(p.DashboardContext.Title) || utf8.RuneCountInString(p.DashboardContext.Title) > MaxTitleLen {
 			return nil, fmt.Errorf("%w: dashboardContext.title must be 1..%d runes", ErrInvalidAnalyzeRequest, MaxTitleLen)
 		}
 		if p.DashboardContext.UID != "" && utf8.RuneCountInString(p.DashboardContext.UID) > 64 {
@@ -457,6 +483,9 @@ func ValidateAnalyzePayload(p AnalyzeStatusPayload) (map[string]bool, error) {
 		}
 		if p.DashboardContext.PanelCount < 0 || p.DashboardContext.AnalyzedPanelCount < 0 {
 			return nil, fmt.Errorf("%w: dashboardContext panel counts must be non-negative", ErrInvalidAnalyzeRequest)
+		}
+		if p.DashboardContext.AnalyzedPanelCount > p.DashboardContext.PanelCount {
+			return nil, fmt.Errorf("%w: dashboardContext.analyzedPanelCount (%d) exceeds panelCount (%d)", ErrInvalidAnalyzeRequest, p.DashboardContext.AnalyzedPanelCount, p.DashboardContext.PanelCount)
 		}
 	}
 
@@ -493,7 +522,7 @@ func ValidateAnalyzePayload(p AnalyzeStatusPayload) (map[string]bool, error) {
 		if err := registerID(prefix+".id", a.ID, alertEvidenceIDPattern); err != nil {
 			return nil, fmt.Errorf("%w: %v", ErrInvalidAnalyzeRequest, err)
 		}
-		if strings.TrimSpace(a.AlertName) == "" || utf8.RuneCountInString(a.AlertName) > 128 {
+		if !hasVisibleText(a.AlertName) || utf8.RuneCountInString(a.AlertName) > 128 {
 			return nil, fmt.Errorf("%w: %s.alertName must be 1..128 runes", ErrInvalidAnalyzeRequest, prefix)
 		}
 		if !allowedAlertStates[a.State] {
@@ -520,7 +549,7 @@ func ValidateAnalyzePayload(p AnalyzeStatusPayload) (map[string]bool, error) {
 		if err := registerID(prefix+".id", r.ID, ruleEvidenceIDPattern); err != nil {
 			return nil, fmt.Errorf("%w: %v", ErrInvalidAnalyzeRequest, err)
 		}
-		if strings.TrimSpace(r.RuleName) == "" || utf8.RuneCountInString(r.RuleName) > 128 {
+		if !hasVisibleText(r.RuleName) || utf8.RuneCountInString(r.RuleName) > 128 {
 			return nil, fmt.Errorf("%w: %s.ruleName must be 1..128 runes", ErrInvalidAnalyzeRequest, prefix)
 		}
 		if !allowedRuleStates[r.State] {
@@ -539,7 +568,7 @@ func ValidateAnalyzePayload(p AnalyzeStatusPayload) (map[string]bool, error) {
 		if err := registerID(prefix+".id", m.ID, metricEvidenceIDPat); err != nil {
 			return nil, fmt.Errorf("%w: %v", ErrInvalidAnalyzeRequest, err)
 		}
-		if strings.TrimSpace(m.PanelTitle) == "" || utf8.RuneCountInString(m.PanelTitle) > MaxTitleLen {
+		if !hasVisibleText(m.PanelTitle) || utf8.RuneCountInString(m.PanelTitle) > MaxTitleLen {
 			return nil, fmt.Errorf("%w: %s.panelTitle must be 1..%d runes", ErrInvalidAnalyzeRequest, prefix, MaxTitleLen)
 		}
 		if !allowedMetricQueryStatuses[m.QueryStatus] {

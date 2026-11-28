@@ -42,6 +42,7 @@ export interface DashboardExtractionOptions {
   maxPanels?: number;
 }
 
+// Built-in variables preserved for Grafana's Prometheus backend or expanded by metricsCollector.ts.
 const BUILTIN_VAR_NAMES = new Set([
   '__rate_interval',
   '__interval',
@@ -53,17 +54,29 @@ const BUILTIN_VAR_NAMES = new Set([
   '__to',
 ]);
 
-const DS_VAR_PATTERN = /^\$(?:\{)?(?:DS_[A-Za-z0-9_]+|datasource|prometheus)(?:\})?$/i;
-const VAR_REF_PATTERN = /\$\{([a-zA-Z_][a-zA-Z0-9_]*)(?::([a-zA-Z]+))?\}|\$([a-zA-Z_][a-zA-Z0-9_]*)/g;
-const PRIORITY_TITLE_RE = /(error|5xx|4xx|fail|latency|duration|p95|p99|cpu|mem|sat|avail|up|health|queue|timeout|drop|restart)/i;
+const GENERIC_PROM_DS_VAR_RE = /^\$(?:\{)?(DS_[A-Za-z0-9_]+|datasource|prometheus)(?:\})?$/i;
+const ANY_VAR_TOKEN_RE = /^\$(?:\{)?([a-zA-Z_][a-zA-Z0-9_]*)(?:\})?$/;
+const NON_PROM_DS_NAME_RE = /(loki|tempo|jaeger|zipkin|elastic|opensearch|postgres|mysql|mssql|clickhouse|cloudwatch|influx|graphite|bigquery|datadog|splunk|azure|stackdriver|cloudmonitoring|sql)/i;
+const VAR_REF_PATTERN =
+  /\$\{([a-zA-Z_][a-zA-Z0-9_]*)(?::([a-zA-Z]+))?\}|\$([a-zA-Z_][a-zA-Z0-9_]*)|\[\[([a-zA-Z_][a-zA-Z0-9_]*)(?::([a-zA-Z]+))?\]\]/g;
+const PRIORITY_TITLE_RE =
+  /(error|5xx|4xx|fail|latency|duration|p95|p99|cpu|mem|sat|avail|up|health|queue|timeout|drop|restart)/i;
 
 function isPromCompatibleType(dsType: string): boolean {
   const lower = (dsType || '').toLowerCase();
   return lower === 'prometheus' || lower.includes('victoriametrics');
 }
 
+function stripControlChars(v: string): string {
+  return v.replace(/[\x00-\x1f\x7f]/g, '');
+}
+
+function escapePromQLString(v: string): string {
+  return stripControlChars(v).replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+}
+
 function escapeRegexLiteral(v: string): string {
-  return v.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  return stripControlChars(v).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
 function collectRawPanels(rawDashboard: Record<string, unknown>): Array<Record<string, unknown>> {
@@ -87,11 +100,19 @@ function collectRawPanels(rawDashboard: Record<string, unknown>): Array<Record<s
   return out;
 }
 
-function extractConcreteVariableDefaults(
+interface ExtractedVariables {
+  values: Map<string, string>;
+  promDatasourceVars: Set<string>;
+  nonPromDatasourceVars: Set<string>;
+}
+
+function extractDashboardVariables(
   rawDashboard: Record<string, unknown>,
   scope?: ScopeFilter
-): Map<string, string> {
-  const vars = new Map<string, string>();
+): ExtractedVariables {
+  const values = new Map<string, string>();
+  const promDatasourceVars = new Set<string>();
+  const nonPromDatasourceVars = new Set<string>();
   const templating = rawDashboard.templating as { list?: unknown[] } | undefined;
   const list = Array.isArray(templating?.list) ? templating.list : [];
 
@@ -101,21 +122,30 @@ function extractConcreteVariableDefaults(
     }
     const v = entry as Record<string, unknown>;
     const name = typeof v.name === 'string' ? v.name.trim() : '';
-    if (!name || v.type === 'datasource') {
+    if (!name) {
+      continue;
+    }
+    if (v.type === 'datasource') {
+      const dsQuery = typeof v.query === 'string' ? v.query.trim() : '';
+      if (isPromCompatibleType(dsQuery)) {
+        promDatasourceVars.add(name);
+      } else if (dsQuery) {
+        nonPromDatasourceVars.add(name);
+      }
       continue;
     }
     const current = v.current as { value?: unknown } | undefined;
     const rawVal = current?.value;
     if (typeof rawVal === 'string' && rawVal.trim() !== '' && rawVal !== '$__all') {
-      vars.set(name, rawVal.trim());
+      values.set(name, rawVal.trim());
     } else if (Array.isArray(rawVal) && rawVal.length > 0 && typeof rawVal[0] === 'string' && rawVal[0] !== '$__all') {
-      vars.set(name, rawVal[0].trim());
+      values.set(name, rawVal[0].trim());
     } else if (Array.isArray(v.options)) {
       for (const opt of v.options) {
         if (opt && typeof opt === 'object') {
           const ov = (opt as { value?: unknown }).value;
           if (typeof ov === 'string' && ov.trim() !== '' && ov !== '$__all') {
-            vars.set(name, ov.trim());
+            values.set(name, ov.trim());
             break;
           }
         }
@@ -125,9 +155,9 @@ function extractConcreteVariableDefaults(
 
   // Override matching variable with user's active scope so dashboard queries align with alert scope.
   if (scope?.labelName && scope.labelValue) {
-    vars.set(scope.labelName, scope.labelValue);
+    values.set(scope.labelName, scope.labelValue);
   }
-  return vars;
+  return { values, promDatasourceVars, nonPromDatasourceVars };
 }
 
 function resolveExprVariables(
@@ -136,23 +166,34 @@ function resolveExprVariables(
 ): { resolved: string; unresolved: string[] } {
   const unresolved: string[] = [];
   VAR_REF_PATTERN.lastIndex = 0;
-  const resolved = expr.replace(VAR_REF_PATTERN, (match, bracedName?: string, fmt?: string, bareName?: string) => {
-    const name = bracedName || bareName || '';
-    if (!name || BUILTIN_VAR_NAMES.has(name)) {
-      return match;
-    }
-    const val = varValues.get(name);
-    if (val === undefined) {
-      if (!unresolved.includes(name)) {
-        unresolved.push(name);
+  const resolved = expr.replace(
+    VAR_REF_PATTERN,
+    (
+      match,
+      bracedName?: string,
+      bracedFmt?: string,
+      bareName?: string,
+      bracketName?: string,
+      bracketFmt?: string
+    ) => {
+      const name = bracedName || bareName || bracketName || '';
+      const fmt = bracedFmt || bracketFmt || '';
+      if (!name || BUILTIN_VAR_NAMES.has(name)) {
+        return match;
       }
-      return match;
+      const val = varValues.get(name);
+      if (val === undefined) {
+        if (!unresolved.includes(name)) {
+          unresolved.push(name);
+        }
+        return match;
+      }
+      if (fmt === 'regex') {
+        return escapePromQLString(escapeRegexLiteral(val));
+      }
+      return escapePromQLString(val);
     }
-    if (fmt === 'regex') {
-      return escapeRegexLiteral(val);
-    }
-    return val;
-  });
+  );
   return { resolved, unresolved };
 }
 
@@ -182,15 +223,45 @@ function extractRawThresholds(panel: Record<string, unknown>): RawPanelThreshold
   return steps.length > 0 ? { mode, steps } : undefined;
 }
 
+function isCompatibleDatasourceVar(
+  rawRef: string,
+  promDatasourceVars: Set<string>,
+  nonPromDatasourceVars: Set<string>,
+  explicitType?: string
+): boolean {
+  const m = ANY_VAR_TOKEN_RE.exec(rawRef.trim());
+  if (!m) {
+    return false;
+  }
+  const varName = m[1];
+  if (nonPromDatasourceVars.has(varName)) {
+    return false;
+  }
+  if (promDatasourceVars.has(varName)) {
+    return true;
+  }
+  if (explicitType && !isPromCompatibleType(explicitType)) {
+    return false;
+  }
+  if (!GENERIC_PROM_DS_VAR_RE.test(rawRef.trim())) {
+    return false;
+  }
+  if (NON_PROM_DS_NAME_RE.test(varName)) {
+    return false;
+  }
+  return true;
+}
+
 function resolveTargetDatasource(
   targetDs: unknown,
   panelDs: unknown,
   selectedDatasourceUid: string | undefined,
-  allowSet: Set<string>
+  allowSet: Set<string>,
+  promDatasourceVars: Set<string>,
+  nonPromDatasourceVars: Set<string>
 ): { uid: string; type: string } | null {
   const raw = targetDs ?? panelDs;
   let candidateUid = '';
-  let candidateType = '';
 
   if (raw === null || raw === undefined || raw === '') {
     // Org default datasource
@@ -198,7 +269,6 @@ function resolveTargetDatasource(
       const def = getDataSourceSrv().getInstanceSettings(null);
       if (def?.uid) {
         candidateUid = def.uid;
-        candidateType = def.type || 'prometheus';
       }
     } catch {
       // Fallback to selected datasource below.
@@ -207,21 +277,31 @@ function resolveTargetDatasource(
       candidateUid = selectedDatasourceUid;
     }
   } else if (typeof raw === 'string') {
-    if (DS_VAR_PATTERN.test(raw.trim())) {
+    const trimmed = raw.trim();
+    if (ANY_VAR_TOKEN_RE.test(trimmed)) {
+      if (!isCompatibleDatasourceVar(trimmed, promDatasourceVars, nonPromDatasourceVars)) {
+        return null;
+      }
       candidateUid = selectedDatasourceUid ?? '';
     } else {
-      candidateUid = raw.trim();
+      candidateUid = trimmed;
     }
   } else if (typeof raw === 'object') {
     const rec = raw as { uid?: unknown; type?: unknown };
     const uidStr = typeof rec.uid === 'string' ? rec.uid.trim() : '';
-    if (uidStr === '' || DS_VAR_PATTERN.test(uidStr)) {
+    const explicitType = typeof rec.type === 'string' ? rec.type.trim() : undefined;
+    if (explicitType && !isPromCompatibleType(explicitType)) {
+      return null;
+    }
+    if (uidStr === '') {
+      candidateUid = selectedDatasourceUid ?? '';
+    } else if (ANY_VAR_TOKEN_RE.test(uidStr)) {
+      if (!isCompatibleDatasourceVar(uidStr, promDatasourceVars, nonPromDatasourceVars, explicitType)) {
+        return null;
+      }
       candidateUid = selectedDatasourceUid ?? '';
     } else {
       candidateUid = uidStr;
-    }
-    if (typeof rec.type === 'string') {
-      candidateType = rec.type;
     }
   }
 
@@ -229,26 +309,30 @@ function resolveTargetDatasource(
     return null;
   }
 
-  if (!candidateType) {
-    try {
-      const settings = getDataSourceSrv().getInstanceSettings(candidateUid);
-      candidateType = settings?.type || 'prometheus';
-    } catch {
-      candidateType = 'prometheus';
+  // Always verify authoritative datasource type via DataSourceSrv (fail closed).
+  let resolvedType = '';
+  try {
+    const settings = getDataSourceSrv().getInstanceSettings(candidateUid);
+    if (!settings?.type) {
+      return null;
     }
-  }
-  if (!isPromCompatibleType(candidateType)) {
+    resolvedType = settings.type;
+  } catch {
     return null;
   }
-  return { uid: candidateUid, type: candidateType };
+  if (!isPromCompatibleType(resolvedType)) {
+    return null;
+  }
+  return { uid: candidateUid, type: resolvedType };
 }
 
 /**
  * Dedicated read-only extractor for Operational Status Reports.
  * Unlike convertGrafanaDashboardToIR (which enforces Studio's strict editable IR v1.1 subset),
  * this preserves Grafana built-in time variables ($__rate_interval, $__interval, $__range),
- * resolves default/template datasources against allowedDatasourceUids, prioritizes anomaly-rich
- * panels up to REPORT_MAX_PANELS, and never throws on zero compatible panels.
+ * resolves default/template datasources against allowedDatasourceUids (fail-closed),
+ * escapes interpolated variable values safely for PromQL, prioritizes anomaly-rich panels
+ * up to REPORT_MAX_PANELS, and never throws on zero compatible panels.
  */
 export function extractDashboardReportQueries(
   rawDashboard: Record<string, unknown>,
@@ -261,7 +345,10 @@ export function extractDashboardReportQueries(
   const maxPanels = Math.max(1, Math.min(options.maxPanels ?? REPORT_MAX_PANELS, REPORT_MAX_PANELS));
   const allowSet = new Set(options.allowedDatasourceUids);
   const rawPanels = collectRawPanels(rawDashboard);
-  const varValues = extractConcreteVariableDefaults(rawDashboard, options.scope);
+  const { values: varValues, promDatasourceVars, nonPromDatasourceVars } = extractDashboardVariables(
+    rawDashboard,
+    options.scope
+  );
   const warnings: string[] = [];
 
   interface ScoredPanel {
@@ -294,7 +381,14 @@ export function extractDashboardReportQueries(
       if (!expr) {
         continue;
       }
-      const ds = resolveTargetDatasource(target.datasource, p.datasource, options.selectedDatasourceUid, allowSet);
+      const ds = resolveTargetDatasource(
+        target.datasource,
+        p.datasource,
+        options.selectedDatasourceUid,
+        allowSet,
+        promDatasourceVars,
+        nonPromDatasourceVars
+      );
       if (!ds) {
         continue;
       }
@@ -320,7 +414,8 @@ export function extractDashboardReportQueries(
     }
 
     const fc = p.fieldConfig as { defaults?: { unit?: unknown } } | undefined;
-    const unit = typeof fc?.defaults?.unit === 'string' && fc.defaults.unit.trim() !== '' ? fc.defaults.unit.trim() : undefined;
+    const unit =
+      typeof fc?.defaults?.unit === 'string' && fc.defaults.unit.trim() !== '' ? fc.defaults.unit.trim() : undefined;
     const thresholds = extractRawThresholds(p);
 
     let score = 0;
@@ -355,9 +450,7 @@ export function extractDashboardReportQueries(
   });
 
   if (scored.length > maxPanels) {
-    warnings.push(
-      `Analyzed top ${maxPanels} prioritized panels out of ${scored.length} compatible panels.`
-    );
+    warnings.push(`Analyzed top ${maxPanels} prioritized panels out of ${scored.length} compatible panels.`);
   }
   if (skippedPanelCount > 0) {
     warnings.push(

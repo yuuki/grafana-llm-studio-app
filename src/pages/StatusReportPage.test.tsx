@@ -140,7 +140,7 @@ function makeReportSnapshot(): JobSnapshot {
       executiveSummary: 'Checkout API is experiencing elevated 5xx errors.',
       findings: [
         {
-          id: 'finding-1',
+          id: 'f-1',
           severity: 'critical',
           category: 'alert',
           title: 'HighErrorRate firing',
@@ -154,7 +154,7 @@ function makeReportSnapshot(): JobSnapshot {
         {
           priority: 'immediate',
           action: 'Check recent checkout-api deployment',
-          relatedFindingIds: ['finding-1'],
+          relatedFindingIds: ['f-1'],
         },
       ],
       dataGaps: [],
@@ -216,10 +216,11 @@ describe('StatusReportPage', () => {
     mockCopyText.mockResolvedValue(true);
   });
 
-  test('1-click alerts-only flow analyzes, redacts secrets, copies Markdown, and hands off to Studio', async () => {
+  test('1-click alerts-only flow analyzes, redacts secrets, copies Markdown with immutable report language, and hands off to Studio', async () => {
     render(<StatusReportPage />);
 
     await waitFor(() => expect(mockFetchPublicConfig).toHaveBeenCalled());
+    await waitFor(() => expect((screen.getByTestId('report-analyze-button') as HTMLButtonElement).disabled).toBe(false));
 
     const scopeInput = screen.getByPlaceholderText('e.g., checkout-api');
     fireEvent.change(scopeInput, { target: { value: 'checkout-api' } });
@@ -240,7 +241,9 @@ describe('StatusReportPage', () => {
     // Click citation jump button
     fireEvent.click(screen.getByTestId('cite-ev-alert-1'));
 
-    // Copy Markdown
+    // Even if the user changes the Language dropdown after generation, Copy Markdown MUST keep
+    // the analyzed report's language ('en') from collectedPayload (FE M-2).
+    fireEvent.change(screen.getByLabelText('Report Language'), { target: { value: 'ja' } });
     fireEvent.click(screen.getByText('Copy Markdown'));
     await waitFor(() => expect(mockCopyText).toHaveBeenCalledTimes(1));
     expect(mockCopyText.mock.calls[0][0]).toContain('# Operational Status & Incident Analysis Report');

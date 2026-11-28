@@ -14,6 +14,15 @@ import (
 	"github.com/yuuki/grafana-llm-studio-app/pkg/llm"
 )
 
+type errReportClient struct {
+	llm.MockClient
+	err error
+}
+
+func (c *errReportClient) AnalyzeStatus(_ context.Context, _ llm.AnalyzeStatusRequest) ([]byte, llm.CompletionMeta, error) {
+	return nil, llm.CompletionMeta{ProviderMode: "stub"}, c.err
+}
+
 func sampleAnalyzePayload() ir.AnalyzeStatusPayload {
 	return ir.AnalyzeStatusPayload{
 		DatasourceUID: "prom-main",
@@ -245,6 +254,66 @@ func runReportStoreSuite(t *testing.T, makeStore func(t *testing.T) jobs.JobStor
 		badDS.DatasourceUID = "untrusted-prom"
 		if _, err := mgr.AnalyzeStatus(context.Background(), alice, badDS); !errors.Is(err, jobs.ErrDatasourceDenied) {
 			t.Fatalf("expected ErrDatasourceDenied for untrusted datasourceUid, got %v", err)
+		}
+	})
+
+	t.Run("upstream_llm_error_classified_502_and_redacted", func(t *testing.T) {
+		store := makeStore(t)
+		defer func() { _ = store.Close() }()
+
+		failingClient := &errReportClient{
+			err: errors.New("upstream https://llm.internal/v1 failed with glsa_1234567890abcdef1234"),
+		}
+		mgr := jobs.NewManager(failingClient, jobs.Config{
+			AllowedDSUIDs: []string{"prom-main"},
+			Store:         store,
+		})
+		defer mgr.Close()
+
+		snap, err := mgr.AnalyzeStatus(context.Background(), alice, sampleAnalyzePayload())
+		if !errors.Is(err, llm.ErrLLMUnavailable) {
+			t.Fatalf("expected llm.ErrLLMUnavailable (502 classification), got %v", err)
+		}
+		if snap.Status != jobs.StatusFailed {
+			t.Fatalf("expected failed status, got %q", snap.Status)
+		}
+		if strings.Contains(snap.ErrorMessage, "glsa_123456") || strings.Contains(snap.ErrorMessage, "https://llm.internal") {
+			t.Fatalf("expected error message persisted in JobStore to be redacted, got %q", snap.ErrorMessage)
+		}
+	})
+
+	t.Run("mock_client_clamps_long_alert_panel_warning_names", func(t *testing.T) {
+		store := makeStore(t)
+		defer func() { _ = store.Close() }()
+
+		mgr := jobs.NewManager(&llm.MockClient{}, jobs.Config{
+			AllowedDSUIDs: []string{"prom-main"},
+			Store:         store,
+		})
+		defer mgr.Close()
+
+		longPayload := sampleAnalyzePayload()
+		longPayload.Evidence.Alerts[0].AlertName = strings.Repeat("AlertNameLong", 9) // 117 runes
+		longPayload.Evidence.Metrics = []ir.MetricEvidenceItem{{
+			ID:                "ev-metric-1",
+			PanelTitle:        strings.Repeat("PanelTitleX", 10), // 110 runes
+			QueryStatus:       "ok",
+			Trend:             "rising",
+			ThresholdBreached: "critical",
+			AnomalyHint:       "degraded",
+		}}
+		longPayload.CollectionWarnings = []ir.CollectionWarningItem{{
+			ID:      "ev-warn-1",
+			Code:    "dashboard_partial",
+			Message: strings.Repeat("W", 195), // > MaxReportDataGapRunes (160)
+		}}
+
+		snap, err := mgr.AnalyzeStatus(context.Background(), alice, longPayload)
+		if err != nil {
+			t.Fatalf("expected MockClient to clamp long names cleanly without 502, got %v", err)
+		}
+		if snap.Status != jobs.StatusReady || snap.StatusReport == nil {
+			t.Fatalf("expected ready status report, got %#v", snap)
 		}
 	})
 }

@@ -380,7 +380,6 @@
     },
     "errors": {
       "loadConfigFailed": "Failed to load plugin configuration: {{message}}",
-      "loadDashboardsFailed": "Failed to list dashboards: {{message}}",
       "collectionFailed": "Evidence collection failed: {{message}}",
       "analyzeFailed": "Status report generation failed: {{message}}",
       "noSources": "No alerting or dashboard metric sources succeeded. Check permissions or select a dashboard."

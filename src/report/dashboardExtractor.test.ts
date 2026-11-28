@@ -25,12 +25,14 @@ describe('report/dashboardExtractor', () => {
     });
   });
 
-  test('preserves $__rate_interval, resolves null default & ${DS_PROM} datasources, interpolates scope vars, and keeps raw thresholds', () => {
+  test('preserves $__rate_interval, escapes PromQL & :regex variables safely, resolves legacy [[var]] and custom datasource vars, and rejects non-Prom ${DS_LOKI}', () => {
     const rawDashboard = {
       title: 'Checkout Production',
       templating: {
         list: [
-          { name: 'env', type: 'custom', current: { value: 'prod' } },
+          { name: 'prom_ds', type: 'datasource', query: 'prometheus' },
+          { name: 'loki_ds', type: 'datasource', query: 'loki' },
+          { name: 'env', type: 'custom', current: { value: 'prod"injection' } },
           { name: 'service', type: 'query', current: { value: 'old-svc' } },
         ],
       },
@@ -55,7 +57,7 @@ describe('report/dashboardExtractor', () => {
           targets: [
             {
               refId: 'A',
-              expr: 'sum(rate(http_requests_total{service="$service",env="$env",status=~"5.."}[$__rate_interval]))',
+              expr: 'sum(rate(http_requests_total{service="$service",env="[[env]]",status=~"5.."}[$__rate_interval]))',
             },
           ],
         },
@@ -68,20 +70,34 @@ describe('report/dashboardExtractor', () => {
               id: 3,
               type: 'stat',
               title: 'P95 Latency',
-              datasource: { uid: '${DS_PROMETHEUS}', type: 'prometheus' },
+              datasource: { uid: '$prom_ds', type: 'prometheus' },
               targets: [
                 {
                   refId: 'A',
-                  expr: 'histogram_quantile(0.95, sum(rate(http_request_duration_seconds_bucket{service="${service:regex}"}[$__rate_interval])) by (le))',
+                  expr: 'histogram_quantile(0.95, sum(rate(http_request_duration_seconds_bucket{service=~"${service:regex}"}[$__rate_interval])) by (le))',
                 },
               ],
             },
             {
               id: 4,
               type: 'logs',
-              title: 'Loki Logs (Unsupported)',
-              datasource: { uid: 'loki-main', type: 'loki' },
+              title: 'Loki Logs (String DS_LOKI must NOT map to Prometheus)',
+              datasource: '${DS_LOKI}',
               targets: [{ refId: 'A', expr: '{app="checkout"}' }],
+            },
+            {
+              id: 5,
+              type: 'logs',
+              title: 'Loki Templated Var',
+              datasource: '$loki_ds',
+              targets: [{ refId: 'A', expr: '{app="checkout"}' }],
+            },
+            {
+              id: 6,
+              type: 'timeseries',
+              title: 'Unknown DS (Must Fail Closed)',
+              datasource: { uid: 'unknown-uid', type: 'prometheus' },
+              targets: [{ refId: 'A', expr: 'up' }],
             },
           ],
         },
@@ -90,31 +106,25 @@ describe('report/dashboardExtractor', () => {
 
     const res = extractDashboardReportQueries(rawDashboard, {
       selectedDatasourceUid: 'prom-main',
-      allowedDatasourceUids: ['prom-default', 'prom-main'],
+      allowedDatasourceUids: ['prom-default', 'prom-main', 'unknown-uid'],
       scope: { labelName: 'service', labelValue: 'checkout.api' },
     });
 
     expect(res.dashboardTitle).toBe('Checkout Production');
     expect(res.panels).toHaveLength(2);
-    expect(res.skippedPanelCount).toBe(1);
+    expect(res.skippedPanelCount).toBe(3);
 
     const errPanel = res.panels.find((p) => p.title === 'HTTP Error Rate')!;
     expect(errPanel.queries[0].datasourceUid).toBe('prom-default');
     expect(errPanel.queries[0].expr).toContain('service="checkout.api"');
-    expect(errPanel.queries[0].expr).toContain('env="prod"');
+    // Quote in templating variable MUST be escaped for PromQL string safety (H-1)
+    expect(errPanel.queries[0].expr).toContain('env="prod\\"injection"');
     expect(errPanel.queries[0].expr).toContain('[$__rate_interval]');
-    expect(errPanel.thresholds).toEqual({
-      mode: 'absolute',
-      steps: [
-        { value: null, color: 'green' },
-        { value: 0.05, color: 'red' },
-      ],
-    });
 
     const p95Panel = res.panels.find((p) => p.title === 'P95 Latency')!;
     expect(p95Panel.queries[0].datasourceUid).toBe('prom-main');
-    expect(p95Panel.queries[0].expr).toContain('service="checkout\\.api"');
-    expect(p95Panel.queries[0].expr).toContain('[$__rate_interval]');
+    // :regex inside double-quoted PromQL string requires double-backslash escape (H-1)
+    expect(p95Panel.queries[0].expr).toContain('service=~"checkout\\\\.api"');
   });
 
   test('never throws when a dashboard has zero compatible or allowlisted panels', () => {

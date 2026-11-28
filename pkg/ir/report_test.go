@@ -261,4 +261,91 @@ func TestValidateAnalyzePayload(t *testing.T) {
 	if _, err := ValidateAnalyzePayload(badScope); !errors.Is(err, ErrInvalidAnalyzeRequest) {
 		t.Fatalf("expected ErrInvalidAnalyzeRequest for __name__ scope, got %v", err)
 	}
+
+	// L-4: AnalyzedPanelCount > PanelCount rejected
+	badDash := healthyPayload
+	badDash.DashboardContext = &ReportDashboardContext{Title: "Prod", PanelCount: 2, AnalyzedPanelCount: 3}
+	if _, err := ValidateAnalyzePayload(badDash); !errors.Is(err, ErrInvalidAnalyzeRequest) {
+		t.Fatalf("expected ErrInvalidAnalyzeRequest when analyzedPanelCount > panelCount, got %v", err)
+	}
+
+	// L-4: Control-only alertName rejected
+	ctrlAlert := healthyPayload
+	ctrlAlert.Evidence.Alerts = []AlertEvidenceItem{{ID: "ev-alert-1", AlertName: "\x01\x02", State: "active"}}
+	if _, err := ValidateAnalyzePayload(ctrlAlert); !errors.Is(err, ErrInvalidAnalyzeRequest) {
+		t.Fatalf("expected ErrInvalidAnalyzeRequest for control-only alertName, got %v", err)
+	}
+}
+
+func TestStatusReport_AdversarialRegressions(t *testing.T) {
+	allowed := map[string]bool{"ev-alert-1": true}
+
+	// H-3: Omitted or null nested required arrays (verificationSteps / relatedFindingIds) MUST be rejected.
+	omittedStepsJSON := `{
+		"schemaVersion":"1.0","overallStatus":"degraded","confidence":"high",
+		"executiveSummary":"Degraded.",
+		"timeline":[],
+		"findings":[{"id":"f-1","category":"alert","severity":"warning","title":"Alert","detail":"Active.","evidenceIds":["ev-alert-1"]}],
+		"hypotheses":[{"title":"Cause","likelihood":"high","rationale":"Matches alert.","evidenceIds":["ev-alert-1"]}],
+		"recommendedActions":[{"priority":"immediate","action":"Check pods","relatedFindingIds":["f-1"]}],
+		"dataGaps":[]
+	}`
+	rep, err := DecodeStrictStatusReport([]byte(omittedStepsJSON))
+	if err != nil {
+		t.Fatalf("unexpected decode error: %v", err)
+	}
+	if err := ValidateStatusReport(rep, allowed); !errors.Is(err, ErrInvalidReportIR) {
+		t.Fatalf("expected ErrInvalidReportIR for omitted verificationSteps, got %v", err)
+	}
+
+	nullRelatedJSON := `{
+		"schemaVersion":"1.0","overallStatus":"degraded","confidence":"high",
+		"executiveSummary":"Degraded.",
+		"timeline":[],
+		"findings":[{"id":"f-1","category":"alert","severity":"warning","title":"Alert","detail":"Active.","evidenceIds":["ev-alert-1"]}],
+		"hypotheses":[],
+		"recommendedActions":[{"priority":"immediate","action":"Check pods","relatedFindingIds":null}],
+		"dataGaps":[]
+	}`
+	rep2, err := DecodeStrictStatusReport([]byte(nullRelatedJSON))
+	if err != nil {
+		t.Fatalf("unexpected decode error: %v", err)
+	}
+	if err := ValidateStatusReport(rep2, allowed); !errors.Is(err, ErrInvalidReportIR) {
+		t.Fatalf("expected ErrInvalidReportIR for null relatedFindingIds, got %v", err)
+	}
+
+	// H-5 & L-4: Benign SRE prose ("Missing data: ...", "oncall=payments") MUST PASS,
+	// while data: URIs, HTML comments, and DOM event attrs MUST FAIL.
+	benign := StatusReportIR{
+		SchemaVersion:    "1.0",
+		OverallStatus:    "degraded",
+		Confidence:       "medium",
+		ExecutiveSummary: "Missing data: traces unavailable; oncall=payments notified (p95 < 50ms -> > 500ms).",
+		Timeline:         []ReportTimelineItem{},
+		Findings: []ReportFinding{{
+			ID: "f-1", Category: "alert", Severity: "warning", Title: "No data: metric gap",
+			Detail: "Insufficient data: scrape returned 0 samples.", EvidenceIDs: []string{"ev-alert-1"},
+		}},
+		Hypotheses:         []ReportHypothesis{},
+		RecommendedActions: []ReportAction{{Priority: "short_term", Action: "Check scrape target", RelatedFindingIds: []string{"f-1"}}},
+		DataGaps:           []string{"Missing data: external Alertmanager not queried."},
+	}
+	if err := ValidateStatusReport(benign, allowed); err != nil {
+		t.Fatalf("expected benign SRE prose with 'data:' and 'oncall=' to pass, got %v", err)
+	}
+
+	for _, bad := range []string{
+		"Click data:text/html,<script>alert(1)</script>",
+		"Inline data:;base64,PHNjcmlwdD4=",
+		"Comment <!-- hidden -->",
+		"Handler onclick=alert(1)",
+		"File file:///etc/passwd",
+	} {
+		r := benign.Clone()
+		r.ExecutiveSummary = bad
+		if err := ValidateStatusReport(r, allowed); !errors.Is(err, ErrInvalidReportIR) {
+			t.Fatalf("expected ErrInvalidReportIR for %q, got %v", bad, err)
+		}
+	}
 }

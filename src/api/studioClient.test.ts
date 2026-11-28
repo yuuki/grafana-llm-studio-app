@@ -532,7 +532,7 @@ describe('studioClient optional SSE streaming and graceful fallback', () => {
         executiveSummary: 'All systems healthy.',
         findings: [
           {
-            id: 'finding-1',
+            id: 'f-1',
             severity: 'info',
             category: 'alert',
             title: 'No alerts',

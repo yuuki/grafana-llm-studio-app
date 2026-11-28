@@ -208,7 +208,7 @@ function buildResponseContent(reqBody) {
         ],
         findings: [
           {
-            id: 'finding-1',
+            id: 'f-1',
             category: 'alert',
             severity: 'critical',
             title: 'HighErrorRate firing',
@@ -229,7 +229,7 @@ function buildResponseContent(reqBody) {
           {
             priority: 'immediate',
             action: 'Inspect recent checkout-api rollout',
-            relatedFindingIds: ['finding-1'],
+            relatedFindingIds: ['f-1'],
           },
         ],
         dataGaps: ['Only Grafana Unified Alerting evidence provided'],

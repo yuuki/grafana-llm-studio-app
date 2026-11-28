@@ -111,6 +111,7 @@ export const StatusReportPage: React.FC = () => {
   const abortRef = useRef<AbortController | null>(null);
   const inFlightJobIdRef = useRef<string | null>(null);
   const opSeqRef = useRef<number>(0);
+  const prevOrgIdRef = useRef<number>(currentOrgId);
   const prevContextKeyRef = useRef<string>(`${currentOrgId}:`);
   const evidenceCardRefs = useRef<Record<string, HTMLDivElement | null>>({});
 
@@ -132,10 +133,19 @@ export const StatusReportPage: React.FC = () => {
 
   // Strict browser state clearing on org or datasource switch (ADR-002 / ADR-005).
   useEffect(() => {
+    const orgChanged = prevOrgIdRef.current !== currentOrgId;
     const key = `${currentOrgId}:${selectedDsUid}`;
-    if (prevContextKeyRef.current !== key) {
+    if (orgChanged || prevContextKeyRef.current !== key) {
+      prevOrgIdRef.current = currentOrgId;
       prevContextKeyRef.current = key;
       resetReportState();
+      if (orgChanged) {
+        setPublicCfg(null);
+        setDashboards([]);
+        setSelectedDashboardUid('');
+        setScopeLabelValue('');
+        setUserFocus('');
+      }
     }
   }, [currentOrgId, selectedDsUid, resetReportState]);
 
@@ -180,6 +190,9 @@ export const StatusReportPage: React.FC = () => {
         }
       } catch {
         // Non-fatal: alerts-only mode remains usable even without dashboard search access.
+        if (active) {
+          setDashboards([]);
+        }
       }
     })();
     return () => {
@@ -221,6 +234,7 @@ export const StatusReportPage: React.FC = () => {
           return;
         }
         inFlightJobIdRef.current = null;
+        setLiveStage(null);
         setJob(snap);
         setPendingPayload(null);
         setBusyState('idle');
@@ -229,6 +243,7 @@ export const StatusReportPage: React.FC = () => {
           return;
         }
         inFlightJobIdRef.current = null;
+        setLiveStage(null);
         if (ctrl.signal.aborted) {
           setBusyState('idle');
           return;
@@ -241,6 +256,9 @@ export const StatusReportPage: React.FC = () => {
   );
 
   const handleCollectAndMaybeAnalyze = useCallback(async () => {
+    if (!publicCfg) {
+      return;
+    }
     opSeqRef.current += 1;
     const opSeq = opSeqRef.current;
     abortRef.current?.abort();
@@ -248,10 +266,13 @@ export const StatusReportPage: React.FC = () => {
     abortRef.current = ctrl;
 
     setBusyState('collecting');
+    setLiveStage(null);
     setUiError(null);
     setCopyNotice(null);
     setJob(null);
     setPendingPayload(null);
+    setCollectedPayload(null);
+    setRedactionCount(0);
     setHighlightedEvidenceId(null);
 
     try {
@@ -265,12 +286,13 @@ export const StatusReportPage: React.FC = () => {
       const warnings: CollectionWarningItem[] = [...alertRes.warnings];
       let metrics = [] as AnalyzeStatusPayload['evidence']['metrics'];
       let dashboardContext: AnalyzeStatusPayload['dashboardContext'];
+      let queriedDatasourceUid = selectedDsUid;
 
       if (selectedDashboardUid) {
         const fetched = await fetchExistingDashboardByUid(selectedDashboardUid, ctrl.signal);
         const extracted = extractDashboardReportQueries(fetched.rawDashboard, {
           selectedDatasourceUid: selectedDsUid || undefined,
-          allowedDatasourceUids: publicCfg?.allowedDatasourceUids ?? [],
+          allowedDatasourceUids: publicCfg.allowedDatasourceUids,
           scope: activeScope,
         });
 
@@ -293,11 +315,12 @@ export const StatusReportPage: React.FC = () => {
             });
           }
         } else {
+          queriedDatasourceUid = extracted.panels[0]?.queries[0]?.datasourceUid || selectedDsUid;
           const metricRes = await collectDashboardMetricEvidence(extracted.panels, {
             window: windowVal,
             baselineMode,
-            maxConcurrency: publicCfg?.maxConcurrentQueries ?? 2,
-            perQueryTimeoutMs: (publicCfg?.validationTimeoutSeconds ?? 10) * 1000,
+            maxConcurrency: publicCfg.maxConcurrentQueries ?? 2,
+            perQueryTimeoutMs: (publicCfg.validationTimeoutSeconds ?? 10) * 1000,
             signal: ctrl.signal,
           });
           metrics = metricRes.metrics;
@@ -329,12 +352,16 @@ export const StatusReportPage: React.FC = () => {
       }
 
       const rawPayload: AnalyzeStatusPayload = {
-        ...(selectedDsUid && (metrics.length > 0 || dashboardContext) ? { datasourceUid: selectedDsUid } : {}),
+        ...(queriedDatasourceUid && (metrics.length > 0 || dashboardContext)
+          ? { datasourceUid: queriedDatasourceUid }
+          : {}),
         ...(activeScope ? { scope: activeScope } : {}),
         window: windowVal,
         baselineMode,
         language: reportLanguage,
-        ...(userFocus.trim() ? { userFocus: Array.from(userFocus.trim()).slice(0, MAX_ANALYZE_FOCUS_RUNES).join('') } : {}),
+        ...(userFocus.trim()
+          ? { userFocus: Array.from(userFocus.trim()).slice(0, MAX_ANALYZE_FOCUS_RUNES).join('') }
+          : {}),
         ...(dashboardContext ? { dashboardContext } : {}),
         collectionStatus: alertRes.collectionStatus,
         evidence: {
@@ -362,6 +389,7 @@ export const StatusReportPage: React.FC = () => {
       if (opSeqRef.current !== opSeq) {
         return;
       }
+      setLiveStage(null);
       if (ctrl.signal.aborted) {
         setBusyState('idle');
         return;
@@ -398,26 +426,39 @@ export const StatusReportPage: React.FC = () => {
 
   const handleCancel = useCallback(async () => {
     setBusyState('cancelling');
+    setLiveStage(null);
     opSeqRef.current += 1;
+    const cancelOpSeq = opSeqRef.current;
     abortRef.current?.abort();
     abortRef.current = null;
     const activeJobId = inFlightJobIdRef.current;
     inFlightJobIdRef.current = null;
     if (activeJobId) {
+      const cancelCtrl = new AbortController();
+      const cancelTimer = setTimeout(() => cancelCtrl.abort(), 5000);
       try {
-        await cancelDraftJob(activeJobId);
+        await cancelDraftJob(activeJobId, cancelCtrl.signal);
       } catch {
-        // Best-effort backend cancel.
+        // Best-effort bounded backend cancel.
+      } finally {
+        clearTimeout(cancelTimer);
       }
     }
-    setBusyState('idle');
+    if (opSeqRef.current === cancelOpSeq) {
+      setBusyState('idle');
+    }
   }, []);
 
   const handleJumpToEvidence = useCallback((evidenceId: string) => {
     setHighlightedEvidenceId(evidenceId);
     const el = evidenceCardRefs.current[evidenceId];
-    if (el && typeof el.scrollIntoView === 'function') {
-      el.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+    if (el) {
+      if (typeof el.scrollIntoView === 'function') {
+        el.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+      }
+      if (typeof el.focus === 'function') {
+        el.focus({ preventScroll: true });
+      }
     }
   }, []);
 
@@ -427,15 +468,19 @@ export const StatusReportPage: React.FC = () => {
     if (!report) {
       return '';
     }
-    return formatStatusReportMarkdown(report, reportLanguage, {
+    const snapLang = collectedPayload?.language ?? reportLanguage;
+    const snapWindow = collectedPayload?.window ?? windowVal;
+    const snapBaseline = collectedPayload?.baselineMode ?? baselineMode;
+    const snapScope = collectedPayload?.scope;
+    return formatStatusReportMarkdown(report, snapLang, {
       generatedAt: job?.updatedAt,
-      window: windowVal,
-      baselineMode,
+      window: snapWindow,
+      baselineMode: snapBaseline,
       dashboardTitle: collectedPayload?.dashboardContext?.title,
-      datasourceUid: selectedDsUid || undefined,
-      scopeText: activeScope ? `${activeScope.labelName}=${activeScope.labelValue}` : undefined,
+      datasourceUid: collectedPayload?.datasourceUid || selectedDsUid || undefined,
+      scopeText: snapScope ? `${snapScope.labelName}=${snapScope.labelValue}` : undefined,
     });
-  }, [activeScope, baselineMode, collectedPayload?.dashboardContext?.title, job?.updatedAt, report, reportLanguage, selectedDsUid, windowVal]);
+  }, [baselineMode, collectedPayload, job, report, reportLanguage, selectedDsUid, windowVal]);
 
   const handleCopyMarkdown = useCallback(async () => {
     const md = buildMarkdown();
@@ -451,31 +496,39 @@ export const StatusReportPage: React.FC = () => {
     if (!md) {
       return;
     }
-    downloadBlob(`status-report-${windowVal}.md`, md, 'text/markdown;charset=utf-8');
-  }, [buildMarkdown, windowVal]);
+    const snapWindow = collectedPayload?.window ?? windowVal;
+    downloadBlob(`status-report-${snapWindow}.md`, md, 'text/markdown;charset=utf-8');
+  }, [buildMarkdown, collectedPayload, windowVal]);
 
   const handleExportJson = useCallback(() => {
     if (!report) {
       return;
     }
-    downloadBlob(`status-report-${windowVal}.json`, JSON.stringify(report, null, 2), 'application/json;charset=utf-8');
-  }, [report, windowVal]);
+    const snapWindow = collectedPayload?.window ?? windowVal;
+    downloadBlob(
+      `status-report-${snapWindow}.json`,
+      JSON.stringify(report, null, 2),
+      'application/json;charset=utf-8'
+    );
+  }, [collectedPayload, report, windowVal]);
 
   const handleInvestigateInStudio = useCallback(() => {
     if (!report?.suggestedInvestigationIntent) {
       return;
     }
     const params = new URLSearchParams();
-    if (selectedDsUid) {
-      params.set('datasource', selectedDsUid);
+    const handoffDs = collectedPayload?.datasourceUid || selectedDsUid;
+    const handoffScope = collectedPayload?.scope ?? activeScope;
+    if (handoffDs) {
+      params.set('datasource', handoffDs);
     }
-    if (activeScope) {
-      params.set('scopeLabel', activeScope.labelName);
-      params.set('scopeValue', activeScope.labelValue);
+    if (handoffScope) {
+      params.set('scopeLabel', handoffScope.labelName);
+      params.set('scopeValue', handoffScope.labelValue);
     }
     params.set('intent', report.suggestedInvestigationIntent);
     locationService.push(`/a/yuuki-llmstudio-app?${params.toString()}`);
-  }, [activeScope, report, selectedDsUid]);
+  }, [activeScope, collectedPayload, report, selectedDsUid]);
 
   const isBusy = busyState !== 'idle';
 
@@ -537,7 +590,10 @@ export const StatusReportPage: React.FC = () => {
               inputId="report-dashboard-select"
               options={dashboardOptions}
               value={selectedDashboardUid}
-              onChange={(v) => setSelectedDashboardUid(v.value ?? '')}
+              onChange={(v) => {
+                setSelectedDashboardUid(v.value ?? '');
+                setPendingPayload(null);
+              }}
               disabled={isBusy}
             />
           </Field>
@@ -547,7 +603,10 @@ export const StatusReportPage: React.FC = () => {
               inputId="report-datasource-select"
               options={dsOptions}
               value={selectedDsUid}
-              onChange={(v) => setSelectedDsUid(v.value ?? '')}
+              onChange={(v) => {
+                setSelectedDsUid(v.value ?? '');
+                setPendingPayload(null);
+              }}
               disabled={isBusy || dsOptions.length === 0}
             />
           </Field>
@@ -562,7 +621,12 @@ export const StatusReportPage: React.FC = () => {
                 { label: '24h', value: '24h' as ReportWindow },
               ]}
               value={windowVal}
-              onChange={(v) => v.value && setWindowVal(v.value)}
+              onChange={(v) => {
+                if (v.value) {
+                  setWindowVal(v.value);
+                  setPendingPayload(null);
+                }
+              }}
               disabled={isBusy}
             />
           </Field>
@@ -576,7 +640,12 @@ export const StatusReportPage: React.FC = () => {
                 { label: t('report.controls.baselineNone'), value: 'none' as BaselineMode },
               ]}
               value={baselineMode}
-              onChange={(v) => v.value && setBaselineMode(v.value)}
+              onChange={(v) => {
+                if (v.value) {
+                  setBaselineMode(v.value);
+                  setPendingPayload(null);
+                }
+              }}
               disabled={isBusy}
             />
           </Field>
@@ -586,7 +655,12 @@ export const StatusReportPage: React.FC = () => {
               inputId="report-scope-label-select"
               options={SCOPE_LABELS.map((l) => ({ label: l, value: l }))}
               value={scopeLabelName}
-              onChange={(v) => v.value && setScopeLabelName(v.value)}
+              onChange={(v) => {
+                if (v.value) {
+                  setScopeLabelName(v.value);
+                  setPendingPayload(null);
+                }
+              }}
               disabled={isBusy}
             />
           </Field>
@@ -596,7 +670,10 @@ export const StatusReportPage: React.FC = () => {
               id="report-scope-value-input"
               value={scopeLabelValue}
               placeholder={t('report.controls.scopeValuePlaceholder')}
-              onChange={(e) => setScopeLabelValue(e.currentTarget.value)}
+              onChange={(e) => {
+                setScopeLabelValue(e.currentTarget.value);
+                setPendingPayload(null);
+              }}
               disabled={isBusy}
             />
           </Field>
@@ -609,7 +686,12 @@ export const StatusReportPage: React.FC = () => {
                 { label: t('report.controls.languageEn'), value: 'en' as ReportLanguage },
               ]}
               value={reportLanguage}
-              onChange={(v) => v.value && setReportLanguage(v.value)}
+              onChange={(v) => {
+                if (v.value) {
+                  setReportLanguage(v.value);
+                  setPendingPayload(null);
+                }
+              }}
               disabled={isBusy}
             />
           </Field>
@@ -620,7 +702,10 @@ export const StatusReportPage: React.FC = () => {
               rows={2}
               value={userFocus}
               placeholder={t('report.controls.focusPlaceholder')}
-              onChange={(e) => setUserFocus(e.currentTarget.value)}
+              onChange={(e) => {
+                setUserFocus(e.currentTarget.value);
+                setPendingPayload(null);
+              }}
               disabled={isBusy}
             />
           </Field>
@@ -630,7 +715,10 @@ export const StatusReportPage: React.FC = () => {
           <Checkbox
             label={t('report.controls.includeOrgCritical')}
             value={includeOrgCritical}
-            onChange={(e) => setIncludeOrgCritical(e.currentTarget.checked)}
+            onChange={(e) => {
+              setIncludeOrgCritical(e.currentTarget.checked);
+              setPendingPayload(null);
+            }}
             disabled={isBusy}
           />
           <Checkbox
@@ -643,7 +731,7 @@ export const StatusReportPage: React.FC = () => {
             <Button
               variant="primary"
               onClick={handleCollectAndMaybeAnalyze}
-              disabled={isBusy}
+              disabled={isBusy || !publicCfg}
               data-testid="report-analyze-button"
             >
               {busyState === 'collecting'
@@ -676,7 +764,7 @@ export const StatusReportPage: React.FC = () => {
         <div
           style={{
             display: 'grid',
-            gridTemplateColumns: 'minmax(320px, 1fr) minmax(420px, 1.4fr)',
+            gridTemplateColumns: 'repeat(auto-fit, minmax(320px, 1fr))',
             gap: '16px',
             alignItems: 'start',
           }}
@@ -723,7 +811,11 @@ export const StatusReportPage: React.FC = () => {
                       <Button
                         variant="secondary"
                         size="sm"
-                        onClick={() => setPendingPayload(null)}
+                        onClick={() => {
+                          setPendingPayload(null);
+                          setCollectedPayload(null);
+                          setRedactionCount(0);
+                        }}
                         disabled={isBusy}
                       >
                         {t('report.controls.discardPreviewButton')}
@@ -741,6 +833,8 @@ export const StatusReportPage: React.FC = () => {
                         ref={(el) => {
                           evidenceCardRefs.current[w.id] = el;
                         }}
+                        tabIndex={-1}
+                        aria-current={highlightedEvidenceId === w.id ? 'true' : undefined}
                         style={{
                           padding: '8px',
                           marginBottom: '6px',
@@ -767,6 +861,8 @@ export const StatusReportPage: React.FC = () => {
                         ref={(el) => {
                           evidenceCardRefs.current[a.id] = el;
                         }}
+                        tabIndex={-1}
+                        aria-current={highlightedEvidenceId === a.id ? 'true' : undefined}
                         data-testid={`evidence-card-${a.id}`}
                         style={{
                           padding: '8px',
@@ -1032,11 +1128,14 @@ export const StatusReportPage: React.FC = () => {
                         </div>
                         <p style={{ margin: '6px 0' }}>{h.rationale}</p>
                         {h.verificationSteps.length > 0 && (
-                          <ul style={{ margin: '4px 0 6px 18px' }}>
-                            {h.verificationSteps.map((step, sIdx) => (
-                              <li key={sIdx}>{step}</li>
-                            ))}
-                          </ul>
+                          <div style={{ margin: '4px 0 6px' }}>
+                            <div style={{ fontSize: '12px', fontWeight: 600 }}>{t('report.result.verificationSteps')}</div>
+                            <ul style={{ margin: '4px 0 0 18px' }}>
+                              {h.verificationSteps.map((step, sIdx) => (
+                                <li key={sIdx}>{step}</li>
+                              ))}
+                            </ul>
+                          </div>
                         )}
                         <div style={{ display: 'flex', gap: '6px', flexWrap: 'wrap' }}>
                           {h.evidenceIds.map((evId) => (

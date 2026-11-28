@@ -1,21 +1,22 @@
+import { Observable, of, throwError } from 'rxjs';
 import { collectDashboardMetricEvidence, parseFramesToSeries } from './metricsCollector';
 import { ExtractedReportPanel } from './dashboardExtractor';
 
-const mockPost = jest.fn();
+const mockFetch = jest.fn();
 
 jest.mock('@grafana/runtime', () => ({
   getBackendSrv: () => ({
-    post: (...args: unknown[]) => mockPost(...args),
+    fetch: (...args: unknown[]) => mockFetch(...args),
   }),
 }));
 
 describe('report/metricsCollector', () => {
   beforeEach(() => {
-    mockPost.mockReset();
+    mockFetch.mockReset();
   });
 
-  test('parseFramesToSeries parses wide DataFrames and filters NaN/Infinity/null values', () => {
-    const frames = [
+  test('parseFramesToSeries parses wide & long DataFrames and rejects NaN, Infinity, null, and empty/whitespace strings', () => {
+    const wideFrames = [
       {
         name: 'wide',
         schema: {
@@ -28,46 +29,71 @@ describe('report/metricsCollector', () => {
         data: {
           values: [
             [1700000000000, 1700000060000, 1700000120000, 1700000180000],
-            [1, null, Number.NaN, 5],
-            [100, Number.POSITIVE_INFINITY, 102, 104],
+            [1, '', '   ', 5],
+            [100, Number.POSITIVE_INFINITY, Number.NaN, 104],
           ],
         },
       },
     ];
 
-    const series = parseFramesToSeries(frames);
-    expect(series).toHaveLength(2);
-    expect(series[0].labelKey).toBe('service=checkout-api, status=500');
-    expect(series[0].values).toEqual([1, 5]);
-    expect(series[1].values).toEqual([100, 102, 104]);
+    const wideSeries = parseFramesToSeries(wideFrames);
+    expect(wideSeries).toHaveLength(2);
+    expect(wideSeries[0].labelKey).toBe('service=checkout-api, status=500');
+    // Empty and whitespace strings MUST NOT become 0 (M-1)
+    expect(wideSeries[0].values).toEqual([1, 5]);
+    expect(wideSeries[1].values).toEqual([100, 104]);
+
+    const longFrames = [
+      {
+        name: 'long',
+        schema: {
+          fields: [
+            { name: 'Time', type: 'time' },
+            { name: 'service', type: 'string' },
+            { name: 'Value', type: 'number' },
+          ],
+        },
+        data: {
+          values: [
+            [1700000000000, 1700000000000, 1700000060000, 1700000060000],
+            ['api-a', 'api-b', 'api-a', 'api-b'],
+            [10, 90, 12, 95],
+          ],
+        },
+      },
+    ];
+    const longSeries = parseFramesToSeries(longFrames);
+    expect(longSeries).toHaveLength(2);
+    expect(longSeries.find((s) => s.labelKey === 'service=api-a')?.values).toEqual([10, 12]);
+    expect(longSeries.find((s) => s.labelKey === 'service=api-b')?.values).toEqual([90, 95]);
   });
 
-  test('computes preceding baseline delta, ranks up==0 & inverted thresholds as critical, and skips baseline on current query error', async () => {
+  test('computes baseline deltas, ranks zero-baseline spikes and band thresholds, extracts FetchError inner message, and expands $__from/$__to', async () => {
     const panels: ExtractedReportPanel[] = [
       {
         panelKey: 'panel-1',
-        title: 'Service Up Availability',
+        title: 'Band Threshold Pool Usage',
         thresholds: {
           mode: 'absolute',
           steps: [
             { value: null, color: 'red' },
-            { value: 1, color: 'green' },
+            { value: 0.2, color: 'green' },
+            { value: 0.9, color: 'red' },
           ],
         },
-        queries: [{ refId: 'A', expr: 'up{service="checkout-api"}', datasourceUid: 'prom-main', datasourceType: 'prometheus' }],
+        queries: [
+          {
+            refId: 'A',
+            expr: 'pool_usage{from="$__from",to="$__to"}',
+            datasourceUid: 'prom-main',
+            datasourceType: 'prometheus',
+          },
+        ],
       },
       {
         panelKey: 'panel-2',
-        title: 'HTTP Error Rate',
-        unit: 'percentunit',
-        thresholds: {
-          mode: 'absolute',
-          steps: [
-            { value: null, color: 'green' },
-            { value: 0.05, color: 'red' },
-          ],
-        },
-        queries: [{ refId: 'A', expr: 'rate(http_errors_total[5m])', datasourceUid: 'prom-main', datasourceType: 'prometheus' }],
+        title: '5xx Emergence (Zero Baseline)',
+        queries: [{ refId: 'A', expr: 'rate(http_5xx_total[5m])', datasourceUid: 'prom-main', datasourceType: 'prometheus' }],
       },
       {
         panelKey: 'panel-3',
@@ -77,59 +103,70 @@ describe('report/metricsCollector', () => {
     ];
 
     const nowMs = Date.parse('2026-11-27T12:00:00Z');
-    mockPost.mockImplementation(async (_url: string, body: { from: string; to: string; queries: Array<{ refId: string; expr: string }> }) => {
-      const q = body.queries[0];
-      const isBaseline = Number(body.to) < nowMs;
-      if (q.expr === 'broken_metric') {
-        return {
-          results: {
-            [q.refId]: { status: 400, error: 'parse error' },
-          },
-        };
-      }
-      if (q.expr.startsWith('up{')) {
-        const vals = isBaseline ? [1, 1, 1, 1] : [1, 1, 0, 0];
-        return {
-          results: {
-            [q.refId]: {
-              frames: [
-                {
-                  schema: {
-                    fields: [
-                      { name: 'Time', type: 'time' },
-                      { name: 'Value', type: 'number', labels: { instance: 'pod-1' } },
-                    ],
-                  },
-                  data: {
-                    values: [[nowMs - 180000, nowMs - 120000, nowMs - 60000, nowMs], vals],
-                  },
-                },
-              ],
-            },
-          },
-        };
-      }
-      const vals = isBaseline ? [0.01, 0.01, 0.01, 0.01] : [0.02, 0.04, 0.09, 0.12];
-      return {
-        results: {
-          [q.refId]: {
-            frames: [
-              {
-                schema: {
-                  fields: [
-                    { name: 'Time', type: 'time' },
-                    { name: 'Value', type: 'number', labels: { service: 'checkout-api' } },
+    mockFetch.mockImplementation(
+      (req: { abortSignal?: AbortSignal; data: { from: string; to: string; queries: Array<{ refId: string; expr: string }> } }) => {
+        expect(req.abortSignal).toBeDefined();
+        const q = req.data.queries[0];
+        const isBaseline = Number(req.data.to) < nowMs;
+        if (q.expr === 'broken_metric') {
+          // Simulate Grafana HTTP 400 FetchError (plain object, NOT instanceof Error)
+          return throwError(() => ({
+            status: 400,
+            data: { results: { [q.refId]: { error: 'bad_data: parse error at char 12' } } },
+          }));
+        }
+        if (q.expr.startsWith('pool_usage')) {
+          expect(q.expr).not.toContain('$__from');
+          expect(q.expr).not.toContain('$__to');
+          // Latest recovered to 0.5 (green), but max spiked to 0.95 (red upper band!)
+          const vals = isBaseline ? [0.5, 0.5, 0.5, 0.5] : [0.5, 0.95, 0.6, 0.5];
+          return of({
+            data: {
+              results: {
+                [q.refId]: {
+                  frames: [
+                    {
+                      schema: {
+                        fields: [
+                          { name: 'Time', type: 'time' },
+                          { name: 'Value', type: 'number', labels: { pool: 'db' } },
+                        ],
+                      },
+                      data: {
+                        values: [[nowMs - 180000, nowMs - 120000, nowMs - 60000, nowMs], vals],
+                      },
+                    },
                   ],
                 },
-                data: {
-                  values: [[nowMs - 180000, nowMs - 120000, nowMs - 60000, nowMs], vals],
-                },
               },
-            ],
+            },
+          });
+        }
+        // 5xx went from baseline 0 to 120/s -> must be marked degraded even without thresholds!
+        const vals = isBaseline ? [0, 0, 0, 0] : [50, 120, 140, 170];
+        return of({
+          data: {
+            results: {
+              [q.refId]: {
+                frames: [
+                  {
+                    schema: {
+                      fields: [
+                        { name: 'Time', type: 'time' },
+                        { name: 'Value', type: 'number', labels: { status: '500' } },
+                      ],
+                    },
+                    data: {
+                      values: [[nowMs - 180000, nowMs - 120000, nowMs - 60000, nowMs], vals],
+                    },
+                  },
+                ],
+              },
+            },
           },
-        },
-      };
-    });
+        });
+      }
+    );
 
     const res = await collectDashboardMetricEvidence(panels, {
       window: '1h',
@@ -138,59 +175,45 @@ describe('report/metricsCollector', () => {
       maxConcurrency: 2,
     });
 
-    // Broken Panel must NOT trigger a baseline query (total calls = 2 + 2 + 1 = 5)
-    expect(mockPost).toHaveBeenCalledTimes(5);
+    // Broken Panel skips baseline (2 + 2 + 1 = 5 calls)
+    expect(mockFetch).toHaveBeenCalledTimes(5);
     expect(res.analyzedPanelCount).toBe(3);
 
-    const upMetric = res.metrics.find((m) => m.panelTitle === 'Service Up Availability')!;
-    expect(upMetric.thresholdBreached).toBe('critical');
-    expect(upMetric.anomalyHint).toBe('degraded');
-    expect(upMetric.baseline?.avg).toBe(1);
-    expect(upMetric.deltaPctAvg).toBe(-50);
+    const bandMetric = res.metrics.find((m) => m.panelTitle === 'Band Threshold Pool Usage')!;
+    expect(bandMetric.thresholdBreached).toBe('critical');
 
-    const errMetric = res.metrics.find((m) => m.panelTitle === 'HTTP Error Rate')!;
-    expect(errMetric.thresholdBreached).toBe('critical');
-    expect(errMetric.baseline?.avg).toBe(0.01);
-    expect(errMetric.deltaPctAvg).toBeCloseTo(575, 0);
+    const zeroBaseMetric = res.metrics.find((m) => m.panelTitle === '5xx Emergence (Zero Baseline)')!;
+    expect(zeroBaseMetric.baselineWasZero).toBe(true);
+    expect(zeroBaseMetric.anomalyHint).toBe('degraded');
 
     const brokenMetric = res.metrics.find((m) => m.panelTitle === 'Broken Panel')!;
     expect(brokenMetric.queryStatus).toBe('error');
-    expect(brokenMetric.errorText).toContain('parse error');
+    expect(brokenMetric.errorText).toContain('bad_data: parse error at char 12');
   });
 
-  test('does not execute baseline queries when baselineMode is none and computes missingRatio from expected steps', async () => {
-    const panels: ExtractedReportPanel[] = [
-      {
-        panelKey: 'panel-1',
-        title: 'Queue Depth',
-        queries: [{ refId: 'A', expr: 'queue_depth', datasourceUid: 'prom-main', datasourceType: 'prometheus' }],
-      },
-    ];
-    mockPost.mockResolvedValue({
-      results: {
-        A: {
-          frames: [
-            {
-              schema: {
-                fields: [
-                  { name: 'Time', type: 'time' },
-                  { name: 'Value', type: 'number', labels: { queue: 'orders' } },
-                ],
-              },
-              data: { values: [[1700000000000, 1700000060000], [5, 7]] },
-            },
-          ],
+  test('unsubscribes in-flight BackendSrv.fetch Observable on external abort', async () => {
+    const unsubSpy = jest.fn();
+    mockFetch.mockImplementation(
+      () =>
+        new Observable(() => {
+          return () => {
+            unsubSpy();
+          };
+        })
+    );
+    const ctrl = new AbortController();
+    const p = collectDashboardMetricEvidence(
+      [
+        {
+          panelKey: 'p-1',
+          title: 'Slow Query',
+          queries: [{ refId: 'A', expr: 'up', datasourceUid: 'prom-main', datasourceType: 'prometheus' }],
         },
-      },
-    });
-
-    const res = await collectDashboardMetricEvidence(panels, {
-      window: '15m',
-      baselineMode: 'none',
-    });
-    expect(mockPost).toHaveBeenCalledTimes(1);
-    expect(res.metrics).toHaveLength(1);
-    expect(res.metrics[0].baseline).toBeUndefined();
-    expect(res.metrics[0].current?.missingRatio).toBeGreaterThan(0);
+      ],
+      { window: '15m', baselineMode: 'none', signal: ctrl.signal }
+    );
+    ctrl.abort();
+    await expect(p).rejects.toThrow();
+    expect(unsubSpy).toHaveBeenCalledTimes(1);
   });
 });

@@ -613,6 +613,14 @@ func (m *MockClient) AnalyzeStatus(ctx context.Context, req AnalyzeStatusRequest
 
 	var firstAlertID, firstMetricID string
 
+	clampRunes := func(s string, maxRunes int) string {
+		r := []rune(strings.TrimSpace(s))
+		if len(r) <= maxRunes {
+			return string(r)
+		}
+		return strings.TrimSpace(string(r[:maxRunes]))
+	}
+
 	for _, a := range p.Evidence.Alerts {
 		if a.State != "active" {
 			continue
@@ -638,7 +646,7 @@ func (m *MockClient) AnalyzeStatus(ctx context.Context, req AnalyzeStatusRequest
 			}
 			timeline = append(timeline, ir.ReportTimelineItem{
 				Timestamp:   ts,
-				Event:       evt,
+				Event:       clampRunes(evt, ir.MaxReportEventRunes),
 				EvidenceIDs: []string{a.ID},
 			})
 		}
@@ -649,7 +657,7 @@ func (m *MockClient) AnalyzeStatus(ctx context.Context, req AnalyzeStatusRequest
 				title = fmt.Sprintf("発火中アラート: %s", a.AlertName)
 				detail = fmt.Sprintf("アラート %s が発火中です (深刻度=%s)。", a.AlertName, sev)
 			}
-			fid := addFinding("alert", sev, title, detail, []string{a.ID})
+			fid := addFinding("alert", sev, clampRunes(title, ir.MaxReportFindingTitleRunes), clampRunes(detail, ir.MaxReportFindingDetailRunes), []string{a.ID})
 			if len(actions) < 2 {
 				act := fmt.Sprintf("Investigate active alert %s and confirm customer impact.", a.AlertName)
 				if isJA {
@@ -661,7 +669,7 @@ func (m *MockClient) AnalyzeStatus(ctx context.Context, req AnalyzeStatusRequest
 				}
 				actions = append(actions, ir.ReportAction{
 					Priority:          prio,
-					Action:            act,
+					Action:            clampRunes(act, ir.MaxReportActionRunes),
 					RelatedFindingIds: []string{fid},
 				})
 			}
@@ -681,7 +689,7 @@ func (m *MockClient) AnalyzeStatus(ctx context.Context, req AnalyzeStatusRequest
 					title = fmt.Sprintf("アラートルール %s の状態異常 (%s)", r.RuleName, r.Health)
 					detail = fmt.Sprintf("ルール %s が health=%s (state=%s) を返しています。", r.RuleName, r.Health, r.State)
 				}
-				addFinding("monitoring_gap", "warning", title, detail, []string{r.ID})
+				addFinding("monitoring_gap", "warning", clampRunes(title, ir.MaxReportFindingTitleRunes), clampRunes(detail, ir.MaxReportFindingDetailRunes), []string{r.ID})
 			}
 		}
 	}
@@ -707,7 +715,7 @@ func (m *MockClient) AnalyzeStatus(ctx context.Context, req AnalyzeStatusRequest
 				}
 				timeline = append(timeline, ir.ReportTimelineItem{
 					Timestamp:   metric.Current.PeakAt,
-					Event:       evt,
+					Event:       clampRunes(evt, ir.MaxReportEventRunes),
 					EvidenceIDs: []string{metric.ID},
 				})
 			}
@@ -718,7 +726,7 @@ func (m *MockClient) AnalyzeStatus(ctx context.Context, req AnalyzeStatusRequest
 					title = fmt.Sprintf("パフォーマンス異常: %s", metric.PanelTitle)
 					detail = fmt.Sprintf("パネル %s (status=%s, trend=%s, threshold=%s) で異常が検知されました。", metric.PanelTitle, metric.QueryStatus, metric.Trend, metric.ThresholdBreached)
 				}
-				fid := addFinding("performance", sev, title, detail, []string{metric.ID})
+				fid := addFinding("performance", sev, clampRunes(title, ir.MaxReportFindingTitleRunes), clampRunes(detail, ir.MaxReportFindingDetailRunes), []string{metric.ID})
 				if len(actions) < ir.MaxReportActions {
 					act := fmt.Sprintf("Inspect %s trend and compare against recent changes.", metric.PanelTitle)
 					if isJA {
@@ -726,7 +734,7 @@ func (m *MockClient) AnalyzeStatus(ctx context.Context, req AnalyzeStatusRequest
 					}
 					actions = append(actions, ir.ReportAction{
 						Priority:          "short_term",
-						Action:            act,
+						Action:            clampRunes(act, ir.MaxReportActionRunes),
 						RelatedFindingIds: []string{fid},
 					})
 				}
@@ -736,13 +744,15 @@ func (m *MockClient) AnalyzeStatus(ctx context.Context, req AnalyzeStatusRequest
 
 	for _, w := range p.CollectionWarnings {
 		if len(dataGaps) < ir.MaxReportDataGaps {
-			dataGaps = append(dataGaps, w.Message)
+			if msg := clampRunes(w.Message, ir.MaxReportDataGapRunes); msg != "" {
+				dataGaps = append(dataGaps, msg)
+			}
 		}
 		if w.Code == "alerting_forbidden" || w.Code == "alerting_unavailable" {
 			confidence = "medium"
 			if len(findings) < ir.MaxReportFindings {
 				title := "Alerting telemetry partially unavailable"
-				detail := w.Message
+				detail := clampRunes(w.Message, ir.MaxReportFindingDetailRunes)
 				if isJA {
 					title = "アラート情報の一部が未取得"
 				}

@@ -410,7 +410,7 @@ func (a *App) handleImport(w http.ResponseWriter, r *http.Request) {
 		Catalog:       req.Catalog,
 	})
 	if err != nil {
-		writeJobError(w, err, snap)
+		writeJobErrorForContext(r.Context(), w, err, snap)
 		return
 	}
 	writeJSON(w, http.StatusOK, snap)
@@ -447,7 +447,7 @@ func (a *App) handleJobAction(w http.ResponseWriter, r *http.Request) {
 	case action == "" && r.Method == http.MethodGet:
 		snap, err := a.jobManager.GetContext(r.Context(), owner, jobID)
 		if err != nil {
-			writeJobError(w, err, snap)
+			writeJobErrorForContext(r.Context(), w, err, snap)
 			return
 		}
 		writeJSON(w, http.StatusOK, snap)
@@ -475,7 +475,7 @@ func (a *App) handleJobAction(w http.ResponseWriter, r *http.Request) {
 	case action == "undo" && r.Method == http.MethodPost:
 		snap, err := a.jobManager.UndoContext(r.Context(), owner, jobID)
 		if err != nil {
-			writeJobError(w, err, snap)
+			writeJobErrorForContext(r.Context(), w, err, snap)
 			return
 		}
 		writeJSON(w, http.StatusOK, snap)
@@ -483,7 +483,7 @@ func (a *App) handleJobAction(w http.ResponseWriter, r *http.Request) {
 	case action == "cancel" && r.Method == http.MethodPost:
 		snap, err := a.jobManager.CancelContext(r.Context(), owner, jobID)
 		if err != nil {
-			writeJobError(w, err, snap)
+			writeJobErrorForContext(r.Context(), w, err, snap)
 			return
 		}
 		writeJSON(w, http.StatusOK, snap)
@@ -560,10 +560,6 @@ func decodeBoundedJSON(body io.Reader, dst any) error {
 	return nil
 }
 
-func buildJobErrorPayload(err error, snap jobs.JobSnapshot) (int, map[string]any) {
-	return buildJobErrorPayloadForContext(context.Background(), err, snap)
-}
-
 func buildJobErrorPayloadForContext(ctx context.Context, err error, snap jobs.JobSnapshot) (int, map[string]any) {
 	status := http.StatusBadRequest
 	errMsg := err.Error()
@@ -603,11 +599,6 @@ func buildJobErrorPayloadForContext(ctx context.Context, err error, snap jobs.Jo
 		payload["job"] = snap
 	}
 	return status, payload
-}
-
-func writeJobError(w http.ResponseWriter, err error, snap jobs.JobSnapshot) {
-	status, payload := buildJobErrorPayload(err, snap)
-	writeJSON(w, status, payload)
 }
 
 func writeJobErrorForContext(ctx context.Context, w http.ResponseWriter, err error, snap jobs.JobSnapshot) {

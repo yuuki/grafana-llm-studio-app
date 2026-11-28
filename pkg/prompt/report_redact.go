@@ -8,7 +8,8 @@ import (
 )
 
 var (
-	reAuthHeader   = regexp.MustCompile(`(?i)\b(authorization\s*:\s*(?:bearer|basic)\s+|cookie\s*:\s*)[^\s;,\]"']+`)
+	reAuthHeader   = regexp.MustCompile(`(?i)\b(authorization\s*:\s*(?:(?:bearer|basic|token|apikey|digest)\s+)?|x-(?:api-key|auth-token)\s*:\s*)[^\s;,\]"']+`)
+	reCookieHeader = regexp.MustCompile(`(?i)\b(cookie\s*:\s*)[^\r\n"']+`)
 	reBearerInline = regexp.MustCompile(`(?i)\b(bearer|basic)\s+[A-Za-z0-9._~+/=-]{12,}`)
 	reGrafanaToken = regexp.MustCompile(`\bgl(?:sa|c)_[A-Za-z0-9_-]{16,}\b`)
 	reGitHubToken  = regexp.MustCompile(`\b(?:gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,})\b`)
@@ -17,11 +18,11 @@ var (
 	reOpenAIKey    = regexp.MustCompile(`\bsk-(?:proj-)?[A-Za-z0-9_-]{20,}\b`)
 	reJWT          = regexp.MustCompile(`\beyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b`)
 	rePEMBlock     = regexp.MustCompile(`-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z0-9 ]*PRIVATE KEY-----`)
-	rePEMHeader    = regexp.MustCompile(`-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----`)
-	reCredURI      = regexp.MustCompile(`(?i)\b(?:https?|postgres(?:ql)?|rediss?|mysql|mongodb(?:\+srv)?|amqps?)://[^:\s/@"'<>]+:[^@\s/"'<>]+@[^\s"'<>]+`)
+	rePEMHeader    = regexp.MustCompile(`-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----(?:(?:\r?\n|[ \t]+)[A-Za-z0-9+/=]{16,})*`)
+	reCredURI      = regexp.MustCompile(`(?i)\b(?:https?|postgres(?:ql)?|rediss?|mysql|mongodb(?:\+srv)?|amqps?)://[^:\s/@"'<>]*:[^@\s/"'<>]+@[^\s"'<>]+`)
 	reQuerySecret  = regexp.MustCompile(`(?i)([?&](?:token|access_token|api_?key|secret|password|passwd|sig|x-amz-signature)=)[^&\s"'<>]+`)
 	reJSONSecret   = regexp.MustCompile(`(?i)("(?:token|access_token|api_?key|password|passwd|client_secret|private_key)"\s*:\s*")[^"]+(")`)
-	reKVSecret     = regexp.MustCompile(`(?i)\b((?:password|passwd|api_?key|access_key|client_secret|access_token|auth_token)\s*=\s*)[^\s,;'"&]+`)
+	reKVSecret     = regexp.MustCompile(`(?i)\b((?:password|passwd|api_?key|access_key|client_secret|access_token|auth_token)\s*=\s*)(?:"[^"]*"|'[^']*'|[^\s,;'"&]+)`)
 	reHTTPURL      = regexp.MustCompile(`(?i)\bhttps?://[^\s"'<>()]+`)
 )
 
@@ -36,6 +37,7 @@ func RedactSecrets(in string) string {
 	out = rePEMBlock.ReplaceAllString(out, "[REDACTED_KEY]")
 	out = rePEMHeader.ReplaceAllString(out, "[REDACTED_KEY]")
 	out = reCredURI.ReplaceAllString(out, "[REDACTED_URI]")
+	out = reCookieHeader.ReplaceAllString(out, "${1}[REDACTED]")
 	out = reAuthHeader.ReplaceAllString(out, "${1}[REDACTED]")
 	out = reBearerInline.ReplaceAllString(out, "${1} [REDACTED]")
 	out = reGrafanaToken.ReplaceAllString(out, "[REDACTED]")

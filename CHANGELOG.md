@@ -16,7 +16,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Upgrade Notes
 - **Grafana Restart Required:** `src/plugin.json` adds a new navigation entry (`/a/yuuki-llmstudio-app/reports`). Restart Grafana after upgrading so the updated `plugin.json` is reloaded.
-- **PostgreSQL `JobStore` (DML-only roles):** If running `jobStoreBackend: "postgres"` with a least-privilege DML-only database role that cannot execute `ALTER TABLE`, pre-apply the additive columns `ALTER TABLE <prefix>jobs ADD COLUMN IF NOT EXISTS job_kind TEXT NOT NULL DEFAULT 'dashboard';` and `ALTER TABLE <prefix>jobs ADD COLUMN IF NOT EXISTS report_json BYTEA;` before using `/jobs/analyze` (existing dashboard jobs continue working without migration).
+- **PostgreSQL `JobStore` (DML-only roles):** If running `jobStoreBackend: "postgres"` with a least-privilege DML-only database role that cannot execute `ALTER TABLE`, pre-apply the additive columns `ALTER TABLE <prefix>jobs ADD COLUMN IF NOT EXISTS job_kind TEXT NOT NULL DEFAULT '';` and `ALTER TABLE <prefix>jobs ADD COLUMN IF NOT EXISTS report_json TEXT NOT NULL DEFAULT '';` before using `/jobs/analyze` (existing dashboard jobs continue working without migration).
 
 ## [0.1.0-rc.1] - 2026-11-26
 

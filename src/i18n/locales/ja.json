@@ -380,7 +380,6 @@
     },
     "errors": {
       "loadConfigFailed": "プラグイン設定の読み込みに失敗しました: {{message}}",
-      "loadDashboardsFailed": "ダッシュボード一覧の取得に失敗しました: {{message}}",
       "collectionFailed": "エビデンス収集に失敗しました: {{message}}",
       "analyzeFailed": "分析レポートの生成に失敗しました: {{message}}",
       "noSources": "アラートおよびダッシュボード指標の取得がいずれも成功しませんでした。権限または対象ダッシュボードを確認してください。"
