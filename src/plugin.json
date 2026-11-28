@@ -38,6 +38,13 @@
       "role": "Viewer",
       "addToNav": true,
       "defaultNav": true
+    },
+    {
+      "type": "page",
+      "name": "Status Report",
+      "path": "/a/yuuki-llmstudio-app/reports",
+      "role": "Viewer",
+      "addToNav": true
     }
   ],
   "dependencies": {

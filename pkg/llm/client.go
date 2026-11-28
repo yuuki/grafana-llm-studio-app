@@ -59,10 +59,16 @@ type RepairRequest struct {
 	DialectRules []string
 }
 
+// AnalyzeStatusRequest carries inputs for grounded operational StatusReportIR generation.
+type AnalyzeStatusRequest struct {
+	Payload ir.AnalyzeStatusPayload
+}
+
 // Client abstracts LLM inference behind either grafana-llm-app (production) or explicit dev mock.
 type Client interface {
 	Enabled(ctx context.Context) (bool, error)
 	GenerateIR(ctx context.Context, req GenerateRequest) ([]byte, CompletionMeta, error)
 	GeneratePatch(ctx context.Context, req PatchRequest) ([]byte, CompletionMeta, error)
 	RepairPanels(ctx context.Context, req RepairRequest) ([]byte, CompletionMeta, error)
+	AnalyzeStatus(ctx context.Context, req AnalyzeStatusRequest) ([]byte, CompletionMeta, error)
 }

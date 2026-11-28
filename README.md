@@ -29,6 +29,7 @@ Instead of letting an LLM author raw Grafana Dashboard JSON directly, the LLM pr
   - **Right pane:** Live `@grafana/scenes` preview (auto-refresh disabled; mounted explicitly after dry-run validation passes), IR JSON inspector, and Foundation SDK JSON inspector.
 - **Preview-to-Save Parity:** A single normalization layer (`NormalizedDashboardSpec`) feeds both `@grafana/scenes` (preview) and `@grafana/grafana-foundation-sdk` (saved/exported Classic Dashboard JSON).
 - **Create-Only Dashboard Saving:** Uses Grafana's Kubernetes-style Dashboard API (`POST /apis/dashboard.grafana.app/v1beta1/...`) with freshly app-generated UIDs and in-flight locks; on `409 Conflict`, it never falls back to `PUT` or overwrites existing dashboards.
+- **Operational Status & Incident Analysis Report (`/a/yuuki-llmstudio-app/reports`):** On-demand, evidence-grounded LLM analysis of Grafana Unified Alerting states and optional dashboard performance metrics (current window vs. preceding/24h baseline) collected exclusively in the browser session, with client & server secret/URL redaction, opt-in preview-before-send, fail-closed `ev-*` citation checks, localized Markdown/JSON export, and 1-click **"Investigate in Studio"** handoff. *(Note: upgrading requires restarting Grafana so the new `plugin.json` navigation entry is loaded; for Japanese reports or reasoning models, setting `maxOutputTokens >= 4096` is recommended.)*
 
 ## Architecture
 
@@ -239,6 +240,7 @@ GitHub Actions runs the same checks: `.github/workflows/ci.yml` (lint, unit test
 ## Documentation & ADRs
 
 - [Architecture, Auth Boundaries & MVP Scope](docs/architecture.md)
+- [Operational Status Report Detailed Design](docs/status-report-design.md)
 - [Version Compatibility Matrix & Model Verification](docs/compatibility.md)
 - [Multi-Architecture Releases, Plugin Signing & Catalog Submission Guide](docs/plugin-signing-and-publishing.md)
 - [Internet OpenAI & OpenAI-Compatible APIs Guide](docs/openai-compatible-apis.md)
@@ -248,9 +250,11 @@ GitHub Actions runs the same checks: `.github/workflows/ci.yml` (lint, unit test
   - [ADR-002: Auth Boundaries & Grafana OSS RBAC Scope](docs/adr/ADR-002-auth-boundaries-and-oss-rbac.md)
   - [ADR-003: Lightweight IR, Dual Adapters & Create-Only Save API](docs/adr/ADR-003-ir-and-dual-adapters.md)
   - [ADR-004: Non-Streaming Structured Output & Optional SSE Stage-Progress Streaming](docs/adr/ADR-004-non-streaming-mvp-and-sse-deferral.md)
+  - [ADR-005: On-Demand Operational Status & Incident Analysis Report](docs/adr/ADR-005-operational-status-report.md)
 - Canonical Schemas:
   - [`schemas/dashboard-ir.schema.json`](schemas/dashboard-ir.schema.json)
   - [`schemas/dashboard-patch.schema.json`](schemas/dashboard-patch.schema.json)
+  - [`schemas/status-report.schema.json`](schemas/status-report.schema.json)
 
 ## License
 

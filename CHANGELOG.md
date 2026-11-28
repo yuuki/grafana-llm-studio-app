@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **Operational Status & Incident Analysis Report (`/a/yuuki-llmstudio-app/reports`):** On-demand, evidence-grounded LLM status and incident analysis page routed via `POST /api/plugins/yuuki-llmstudio-app/resources/jobs/analyze` (ADR-005):
+  - Collects Grafana Unified Alerting states (`/api/alertmanager/grafana/api/v2/alerts` and `/api/prometheus/grafana/api/v1/rules?limit_alerts=20`) and optional read-only dashboard metric summaries (current window `15m`/`1h`/`6h`/`24h` vs. `preceding`/`24h_ago`/`none` baseline) strictly in the browser under the logged-in user's Grafana session.
+  - Redacts high-confidence secrets and URLs both client-side (with an opt-in **"Preview collected evidence before sending to LLM"** gate) and server-side within a 24 KiB UTF-8 payload cap.
+  - Enforces strict `StatusReportIR` v1.0 (`schemas/status-report.schema.json`) decoding and fail-closed `ev-*` citation validation in the Go backend without auto-repair loops; raw input evidence is never persisted in `JobStore`.
+  - Supports bilingual (`en` / `ja`) reports, clickable `ev-*` citation-to-evidence highlighting, deterministic localized Markdown & JSON export, and 1-click **"Investigate in Studio"** handoff pre-filling datasource, scope, and investigation intent.
+
+### Upgrade Notes
+- **Grafana Restart Required:** `src/plugin.json` adds a new navigation entry (`/a/yuuki-llmstudio-app/reports`). Restart Grafana after upgrading so the updated `plugin.json` is reloaded.
+- **PostgreSQL `JobStore` (DML-only roles):** If running `jobStoreBackend: "postgres"` with a least-privilege DML-only database role that cannot execute `ALTER TABLE`, pre-apply the additive columns `ALTER TABLE <prefix>jobs ADD COLUMN IF NOT EXISTS job_kind TEXT NOT NULL DEFAULT 'dashboard';` and `ALTER TABLE <prefix>jobs ADD COLUMN IF NOT EXISTS report_json BYTEA;` before using `/jobs/analyze` (existing dashboard jobs continue working without migration).
+
 ## [0.1.0-rc.1] - 2026-11-26
 
 ### Added

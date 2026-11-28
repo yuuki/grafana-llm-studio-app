@@ -1,5 +1,6 @@
 import { BackendSrvRequest, config, getBackendSrv } from '@grafana/runtime';
 import {
+  AnalyzeStatusPayload,
   DashboardIR,
   ImportSource,
   JobOperation,
@@ -14,10 +15,10 @@ import {
 
 const PLUGIN_RESOURCE_BASE = '/api/plugins/yuuki-llmstudio-app/resources';
 const MAX_SSE_BUFFER_CHARS = 2 * 1024 * 1024;
-const STREAM_DROP_RECOVERY_MAX_ATTEMPTS = 5;
-const STREAM_DROP_RECOVERY_DELAY_MS = 1000;
+const STREAM_DROP_RECOVERY_MAX_ATTEMPTS = 15;
+const STREAM_DROP_RECOVERY_DELAY_MS = 2000;
 
-const VALID_JOB_OPERATIONS = new Set<JobOperation>(['generate', 'patch', 'repair']);
+const VALID_JOB_OPERATIONS = new Set<JobOperation>(['generate', 'patch', 'repair', 'analyze']);
 
 const GENERIC_HTTP_ERROR_LABELS = new Set([
   'bad request',
@@ -353,7 +354,13 @@ function fetchWithAbort<T>(req: BackendSrvRequest, signal?: AbortSignal): Promis
 }
 
 function isActiveJobStatus(status: JobSnapshot['status']): boolean {
-  return status === 'generating' || status === 'validating_ir' || status === 'repairing';
+  return (
+    status === 'generating' ||
+    status === 'validating_ir' ||
+    status === 'repairing' ||
+    status === 'analyzing' ||
+    status === 'validating_report'
+  );
 }
 
 async function recoverJobAfterStreamDrop(
@@ -735,6 +742,14 @@ export async function generateDraft(
   options?: JobStreamOptions
 ): Promise<JobSnapshot> {
   return postJobWithOptionalSse('/jobs/generate', req, signal, options);
+}
+
+export async function analyzeStatus(
+  req: AnalyzeStatusPayload,
+  signal?: AbortSignal,
+  options?: JobStreamOptions
+): Promise<JobSnapshot> {
+  return postJobWithOptionalSse('/jobs/analyze', req, signal, options);
 }
 
 export async function importDraft(

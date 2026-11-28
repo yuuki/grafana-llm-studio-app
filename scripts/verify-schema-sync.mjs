@@ -15,8 +15,13 @@ const irSchema = JSON.parse(
 const patchSchema = JSON.parse(
   fs.readFileSync(path.join(root, 'schemas/dashboard-patch.schema.json'), 'utf8')
 );
+const reportSchema = JSON.parse(
+  fs.readFileSync(path.join(root, 'schemas/status-report.schema.json'), 'utf8')
+);
 const tsTypes = fs.readFileSync(path.join(root, 'src/ir/types.ts'), 'utf8');
+const tsReportTypes = fs.readFileSync(path.join(root, 'src/ir/reportTypes.ts'), 'utf8');
 const goValidate = fs.readFileSync(path.join(root, 'pkg/ir/validate.go'), 'utf8');
+const goReportValidate = fs.readFileSync(path.join(root, 'pkg/ir/report_validate.go'), 'utf8');
 
 function assertGoOpenAICompatible(node, trail = '$') {
   if (!node || typeof node !== 'object') {
@@ -25,6 +30,11 @@ function assertGoOpenAICompatible(node, trail = '$') {
   if ('oneOf' in node || 'anyOf' in node) {
     throw new Error(
       `Unsupported keyword oneOf/anyOf at ${trail} breaks grafana-llm-app (go-openai jsonschema.Definition)`
+    );
+  }
+  if ('const' in node || 'format' in node) {
+    throw new Error(
+      `Unsupported keyword const/format at ${trail} is silently dropped by grafana-llm-app (go-openai jsonschema.Definition)`
     );
   }
   if (Array.isArray(node.type)) {
@@ -184,6 +194,58 @@ const patchOpEnum = patchOpProps.op.enum;
 assertExactSetEqual('patch.operations.op', patchOpEnum, extractTsConstArray(tsTypes, 'ALLOWED_PATCH_OPS'), 'src/ir/types.ts');
 assertExactSetEqual('patch.operations.op', patchOpEnum, extractGoMapKeys(goValidate, 'allowedPatchOps'), 'pkg/ir/validate.go');
 
+// Verify status-report.schema.json go-openai compatibility and enum sync across TS and Go.
+assertGoOpenAICompatible(reportSchema, 'status-report');
+const reportChecks = [
+  {
+    label: 'report.schemaVersion',
+    schemaEnum: reportSchema.properties.schemaVersion.enum,
+    tsConst: 'ALLOWED_REPORT_SCHEMA_VERSIONS',
+    goMap: 'allowedReportSchemaVersions',
+  },
+  {
+    label: 'report.overallStatus',
+    schemaEnum: reportSchema.properties.overallStatus.enum,
+    tsConst: 'ALLOWED_REPORT_OVERALL_STATUSES',
+    goMap: 'allowedReportOverallStatuses',
+  },
+  {
+    label: 'report.confidence',
+    schemaEnum: reportSchema.properties.confidence.enum,
+    tsConst: 'ALLOWED_REPORT_CONFIDENCES',
+    goMap: 'allowedReportConfidences',
+  },
+  {
+    label: 'report.findings.category',
+    schemaEnum: reportSchema.properties.findings.items.properties.category.enum,
+    tsConst: 'ALLOWED_REPORT_FINDING_CATEGORIES',
+    goMap: 'allowedReportFindingCategories',
+  },
+  {
+    label: 'report.findings.severity',
+    schemaEnum: reportSchema.properties.findings.items.properties.severity.enum,
+    tsConst: 'ALLOWED_REPORT_FINDING_SEVERITIES',
+    goMap: 'allowedReportFindingSeverities',
+  },
+  {
+    label: 'report.hypotheses.likelihood',
+    schemaEnum: reportSchema.properties.hypotheses.items.properties.likelihood.enum,
+    tsConst: 'ALLOWED_REPORT_LIKELIHOODS',
+    goMap: 'allowedReportLikelihoods',
+  },
+  {
+    label: 'report.recommendedActions.priority',
+    schemaEnum: reportSchema.properties.recommendedActions.items.properties.priority.enum,
+    tsConst: 'ALLOWED_REPORT_ACTION_PRIORITIES',
+    goMap: 'allowedReportActionPriorities',
+  },
+];
+
+for (const c of reportChecks) {
+  assertExactSetEqual(c.label, c.schemaEnum, extractTsConstArray(tsReportTypes, c.tsConst), 'src/ir/reportTypes.ts');
+  assertExactSetEqual(c.label, c.schemaEnum, extractGoMapKeys(goReportValidate, c.goMap), 'pkg/ir/report_validate.go');
+}
+
 console.log(
-  `Bidirectional schema sync OK: ${checks.map((c) => `${c.label}(${c.irEnum.length})`).join(', ')}, patch.operations.op(${patchOpEnum.length}), datasourceRef/timeRange.to; go-openai compatibility verified.`
+  `Bidirectional schema sync OK: ${checks.map((c) => `${c.label}(${c.irEnum.length})`).join(', ')}, patch.operations.op(${patchOpEnum.length}), status-report(${reportChecks.length} enums), datasourceRef/timeRange.to; go-openai compatibility verified.`
 );

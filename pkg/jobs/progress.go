@@ -9,6 +9,7 @@ const (
 	OperationGenerate = "generate"
 	OperationPatch    = "patch"
 	OperationRepair   = "repair"
+	OperationAnalyze  = "analyze"
 )
 
 // StageEvent represents an application-level workflow stage transition during a job operation.

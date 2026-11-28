@@ -574,3 +574,271 @@ func assignCompactGrid(panels []ir.PanelIR) {
 		}
 	}
 }
+
+func (m *MockClient) AnalyzeStatus(ctx context.Context, req AnalyzeStatusRequest) ([]byte, CompletionMeta, error) {
+	if err := m.waitDelay(ctx); err != nil {
+		return nil, CompletionMeta{ProviderMode: "mock"}, err
+	}
+	p := req.Payload
+	isJA := p.Language == "ja"
+
+	overallStatus := "healthy"
+	confidence := "high"
+	timeline := make([]ir.ReportTimelineItem, 0, 4)
+	findings := make([]ir.ReportFinding, 0, 4)
+	hypotheses := make([]ir.ReportHypothesis, 0, 2)
+	actions := make([]ir.ReportAction, 0, 3)
+	dataGaps := make([]string, 0, 4)
+
+	if isJA {
+		dataGaps = append(dataGaps, "ログおよび分散トレースは本レポートの収集対象外です。")
+	} else {
+		dataGaps = append(dataGaps, "Logs and distributed traces are not included in this report.")
+	}
+
+	nextFindingNum := 1
+	addFinding := func(category, severity, title, detail string, evIDs []string) string {
+		id := fmt.Sprintf("f-%d", nextFindingNum)
+		nextFindingNum++
+		findings = append(findings, ir.ReportFinding{
+			ID:          id,
+			Category:    category,
+			Severity:    severity,
+			Title:       title,
+			Detail:      detail,
+			EvidenceIDs: evIDs,
+		})
+		return id
+	}
+
+	var firstAlertID, firstMetricID string
+
+	for _, a := range p.Evidence.Alerts {
+		if a.State != "active" {
+			continue
+		}
+		if firstAlertID == "" {
+			firstAlertID = a.ID
+		}
+		sev := "warning"
+		if strings.EqualFold(a.Severity, "critical") || strings.EqualFold(a.Severity, "page") || strings.EqualFold(a.Severity, "error") {
+			sev = "critical"
+			overallStatus = "critical"
+		} else if overallStatus == "healthy" {
+			overallStatus = "degraded"
+		}
+		if len(timeline) < ir.MaxReportTimelineItems {
+			ts := a.StartsAt
+			if ts == "" {
+				ts = p.Evidence.CollectedAt
+			}
+			evt := fmt.Sprintf("Alert %s active (%s).", a.AlertName, sev)
+			if isJA {
+				evt = fmt.Sprintf("アラート %s が発火中 (%s)。", a.AlertName, sev)
+			}
+			timeline = append(timeline, ir.ReportTimelineItem{
+				Timestamp:   ts,
+				Event:       evt,
+				EvidenceIDs: []string{a.ID},
+			})
+		}
+		if len(findings) < 3 {
+			title := fmt.Sprintf("Active alert: %s", a.AlertName)
+			detail := fmt.Sprintf("Alert %s is active (severity=%s).", a.AlertName, sev)
+			if isJA {
+				title = fmt.Sprintf("発火中アラート: %s", a.AlertName)
+				detail = fmt.Sprintf("アラート %s が発火中です (深刻度=%s)。", a.AlertName, sev)
+			}
+			fid := addFinding("alert", sev, title, detail, []string{a.ID})
+			if len(actions) < 2 {
+				act := fmt.Sprintf("Investigate active alert %s and confirm customer impact.", a.AlertName)
+				if isJA {
+					act = fmt.Sprintf("発火中アラート %s の影響範囲と原因を確認してください。", a.AlertName)
+				}
+				prio := "short_term"
+				if sev == "critical" {
+					prio = "immediate"
+				}
+				actions = append(actions, ir.ReportAction{
+					Priority:          prio,
+					Action:            act,
+					RelatedFindingIds: []string{fid},
+				})
+			}
+		}
+	}
+
+	for _, r := range p.Evidence.Rules {
+		if r.Health == "error" || r.Health == "nodata" {
+			if overallStatus == "healthy" {
+				overallStatus = "degraded"
+			}
+			confidence = "medium"
+			if len(findings) < 5 {
+				title := fmt.Sprintf("Alert rule %s health is %s", r.RuleName, r.Health)
+				detail := fmt.Sprintf("Rule %s reported health=%s (state=%s).", r.RuleName, r.Health, r.State)
+				if isJA {
+					title = fmt.Sprintf("アラートルール %s の状態異常 (%s)", r.RuleName, r.Health)
+					detail = fmt.Sprintf("ルール %s が health=%s (state=%s) を返しています。", r.RuleName, r.Health, r.State)
+				}
+				addFinding("monitoring_gap", "warning", title, detail, []string{r.ID})
+			}
+		}
+	}
+
+	for _, metric := range p.Evidence.Metrics {
+		if metric.AnomalyHint == "degraded" || metric.AnomalyHint == "elevated" || metric.ThresholdBreached != "none" || metric.QueryStatus == "error" || metric.QueryStatus == "timeout" {
+			if firstMetricID == "" {
+				firstMetricID = metric.ID
+			}
+			sev := "warning"
+			if metric.ThresholdBreached == "critical" || metric.AnomalyHint == "degraded" {
+				sev = "critical"
+				if overallStatus != "critical" {
+					overallStatus = "degraded"
+				}
+			} else if overallStatus == "healthy" {
+				overallStatus = "degraded"
+			}
+			if len(timeline) < ir.MaxReportTimelineItems && metric.Current != nil && metric.Current.PeakAt != "" {
+				evt := fmt.Sprintf("Metric %s peaked at %.2f.", metric.PanelTitle, metric.Current.Max)
+				if isJA {
+					evt = fmt.Sprintf("メトリクス %s が最大値 %.2f を記録しました。", metric.PanelTitle, metric.Current.Max)
+				}
+				timeline = append(timeline, ir.ReportTimelineItem{
+					Timestamp:   metric.Current.PeakAt,
+					Event:       evt,
+					EvidenceIDs: []string{metric.ID},
+				})
+			}
+			if len(findings) < ir.MaxReportFindings {
+				title := fmt.Sprintf("Performance anomaly: %s", metric.PanelTitle)
+				detail := fmt.Sprintf("Panel %s status=%s trend=%s threshold=%s.", metric.PanelTitle, metric.QueryStatus, metric.Trend, metric.ThresholdBreached)
+				if isJA {
+					title = fmt.Sprintf("パフォーマンス異常: %s", metric.PanelTitle)
+					detail = fmt.Sprintf("パネル %s (status=%s, trend=%s, threshold=%s) で異常が検知されました。", metric.PanelTitle, metric.QueryStatus, metric.Trend, metric.ThresholdBreached)
+				}
+				fid := addFinding("performance", sev, title, detail, []string{metric.ID})
+				if len(actions) < ir.MaxReportActions {
+					act := fmt.Sprintf("Inspect %s trend and compare against recent changes.", metric.PanelTitle)
+					if isJA {
+						act = fmt.Sprintf("%s の推移と直近の変更・デプロイとの相関を確認してください。", metric.PanelTitle)
+					}
+					actions = append(actions, ir.ReportAction{
+						Priority:          "short_term",
+						Action:            act,
+						RelatedFindingIds: []string{fid},
+					})
+				}
+			}
+		}
+	}
+
+	for _, w := range p.CollectionWarnings {
+		if len(dataGaps) < ir.MaxReportDataGaps {
+			dataGaps = append(dataGaps, w.Message)
+		}
+		if w.Code == "alerting_forbidden" || w.Code == "alerting_unavailable" {
+			confidence = "medium"
+			if len(findings) < ir.MaxReportFindings {
+				title := "Alerting telemetry partially unavailable"
+				detail := w.Message
+				if isJA {
+					title = "アラート情報の一部が未取得"
+				}
+				addFinding("monitoring_gap", "info", title, detail, []string{w.ID})
+			}
+		}
+	}
+
+	if firstAlertID != "" && firstMetricID != "" {
+		if isJA {
+			hypotheses = append(hypotheses, ir.ReportHypothesis{
+				Title:             "サービス負荷増または依存先遅延によるエラー・レイテンシ悪化",
+				Likelihood:        "medium",
+				Rationale:         "発火中アラートと同一ウィンドウ内でダッシュボード指標の悪化が確認されています。",
+				EvidenceIDs:       []string{firstAlertID, firstMetricID},
+				VerificationSteps: []string{"直近のリリース差分と下流依存先のレイテンシを確認する"},
+			})
+		} else {
+			hypotheses = append(hypotheses, ir.ReportHypothesis{
+				Title:             "Service saturation or downstream latency degradation",
+				Likelihood:        "medium",
+				Rationale:         "Active alerting correlates with elevated dashboard performance metrics in the same window.",
+				EvidenceIDs:       []string{firstAlertID, firstMetricID},
+				VerificationSteps: []string{"Check recent deployment changes and downstream dependency latency."},
+			})
+		}
+	} else if firstAlertID != "" {
+		if isJA {
+			hypotheses = append(hypotheses, ir.ReportHypothesis{
+				Title:             "対象サービスにおける障害または閾値逸脱",
+				Likelihood:        "medium",
+				Rationale:         "アクティブなアラートが継続して発火しています。",
+				EvidenceIDs:       []string{firstAlertID},
+				VerificationSteps: []string{"対象サービスのダッシュボードとエラーログを確認する"},
+			})
+		} else {
+			hypotheses = append(hypotheses, ir.ReportHypothesis{
+				Title:             "Ongoing service fault or threshold breach",
+				Likelihood:        "medium",
+				Rationale:         "One or more active Grafana alerts are currently firing.",
+				EvidenceIDs:       []string{firstAlertID},
+				VerificationSteps: []string{"Inspect service RED metrics and recent deployment history."},
+			})
+		}
+	}
+
+	var summary string
+	if overallStatus == "healthy" {
+		if isJA {
+			summary = fmt.Sprintf("直近 %s の分析では発火中アラートや重大なパフォーマンス異常は検出されませんでした。", p.Window)
+		} else {
+			summary = fmt.Sprintf("No active alerts or significant performance anomalies were detected over the last %s.", p.Window)
+		}
+	} else {
+		if isJA {
+			summary = fmt.Sprintf("直近 %s の分析で状態は %s と判定されました（検出事項 %d 件）。", p.Window, overallStatus, len(findings))
+		} else {
+			summary = fmt.Sprintf("Operational status over the last %s is %s with %d grounded finding(s).", p.Window, overallStatus, len(findings))
+		}
+	}
+
+	intent := ""
+	if overallStatus != "healthy" {
+		scopeSuffix := ""
+		if p.Scope != nil && p.Scope.LabelValue != "" {
+			scopeSuffix = " for " + p.Scope.LabelValue
+		}
+		if isJA {
+			intent = fmt.Sprintf("エラー率、p95 レイテンシ、リクエスト数の調査ダッシュボードを作成%s", scopeSuffix)
+		} else {
+			intent = fmt.Sprintf("Show error rate, p95 latency, and request rate investigation panels%s", scopeSuffix)
+		}
+	}
+
+	report := ir.StatusReportIR{
+		SchemaVersion:                ir.StatusReportSchemaVersion,
+		OverallStatus:                overallStatus,
+		Confidence:                   confidence,
+		ExecutiveSummary:             summary,
+		Timeline:                     timeline,
+		Findings:                     findings,
+		Hypotheses:                   hypotheses,
+		RecommendedActions:           actions,
+		DataGaps:                     dataGaps,
+		SuggestedInvestigationIntent: intent,
+	}
+
+	raw, err := json.Marshal(report)
+	if err != nil {
+		return nil, CompletionMeta{ProviderMode: "mock"}, err
+	}
+	return raw, CompletionMeta{
+		FinishReason:     "stop",
+		PromptTokens:     240,
+		CompletionTokens: 160,
+		Model:            "mock-deterministic-report-v1",
+		ProviderMode:     "mock",
+	}, nil
+}

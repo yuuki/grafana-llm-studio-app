@@ -86,12 +86,15 @@
         "generating": "Calling LLM for structured IR...",
         "repairing": "Calling LLM for syntax-only repair...",
         "validating_ir": "Validating IR schema & query safety...",
+        "analyzing": "Analyzing operational evidence with LLM...",
+        "validating_report": "Validating report schema & evidence grounding...",
         "awaiting_preview": "Draft validated — ready for preview",
         "ready": "Ready",
         "insufficient_metrics": "Insufficient metrics in selected scope",
         "cancelled": "Operation cancelled",
         "failed": "Operation failed"
-      }
+      },
+      "handoffNotice": "Pre-filled from Status Report. Click \"Fetch Scoped Metrics\" first to ground dashboard generation in your allowlisted datasource."
     },
     "validation": {
       "heading": "Validation Results (Dry-Run: last 5m / maxDataPoints=10)",
@@ -303,6 +306,103 @@
   "validator": {
     "errors": {
       "timeout": "Validation query timed out ({{seconds}}s)"
+    }
+  },
+  "report": {
+    "pageTitle": "Operational Status Report",
+    "pageSubtitle": "Evidence-grounded LLM analysis of Grafana Alerting and dashboard performance metrics (user session only).",
+    "controls": {
+      "dashboardLabel": "Dashboard (Optional — leave empty for Alerts-only)",
+      "dashboardAlertsOnly": "Alerts only (no dashboard metrics)",
+      "datasourceLabel": "Datasource (Optional for Alerts-only; required for Dashboard metrics)",
+      "scopeLabel": "Scope Filter Label (Optional)",
+      "scopeValueLabel": "Scope Value (Optional)",
+      "scopeValuePlaceholder": "e.g., checkout-api",
+      "windowLabel": "Analysis Window",
+      "baselineLabel": "Baseline Comparison",
+      "baselinePreceding": "Preceding period (default)",
+      "baseline24h": "24 hours ago",
+      "baselineNone": "None (single window)",
+      "languageLabel": "Report Language",
+      "languageEn": "English (en)",
+      "languageJa": "Japanese (ja)",
+      "focusLabel": "Focus / Question (Optional)",
+      "focusPlaceholder": "e.g., Focus on 5xx errors and recent latency spikes",
+      "includeOrgCritical": "Include org-wide critical alerts even when scope is set",
+      "previewBeforeSend": "Preview collected evidence before sending to LLM",
+      "analyzeButton": "Collect & Analyze",
+      "collectPreviewButton": "Collect Evidence Preview",
+      "sendToLlmButton": "Send to LLM & Generate Report",
+      "discardPreviewButton": "Discard Preview",
+      "cancelButton": "Cancel",
+      "collecting": "Collecting evidence...",
+      "analyzing": "Analyzing...",
+      "cancelling": "Cancelling..."
+    },
+    "evidence": {
+      "heading": "Collected Evidence",
+      "empty": "Click \"Collect & Analyze\" to gather Grafana Alerting states and optional dashboard metric summaries.",
+      "summaryBadges": "Alerts: {{alerts}} | Abnormal Rules: {{rules}} | Metrics: {{metrics}} | Redacted: {{redacted}}",
+      "previewReady": "Evidence collected and sanitized (<= 24 KiB). Review below and click \"Send to LLM & Generate Report\" to continue.",
+      "warningsHeading": "Collection Warnings",
+      "alertsHeading": "Grafana Alerts",
+      "rulesHeading": "Alerting Rule States",
+      "metricsHeading": "Dashboard Metric Summaries",
+      "statusNotesHeading": "Status Notes",
+      "deltaLabel": "vs baseline avg {{delta}}%"
+    },
+    "result": {
+      "heading": "Analysis Report",
+      "empty": "Run an analysis to view the structured operational status report grounded in ev-* citations.",
+      "overallStatus": "Overall Status",
+      "confidence": "Confidence",
+      "copyMarkdown": "Copy Markdown",
+      "copiedMarkdown": "Markdown copied to clipboard.",
+      "copyFailed": "Failed to copy Markdown to clipboard.",
+      "downloadMarkdown": "Download .md",
+      "exportJson": "Export JSON",
+      "investigateInStudio": "Investigate in Studio",
+      "executiveSummary": "Executive Summary",
+      "findings": "Findings",
+      "noFindings": "No operational findings reported.",
+      "timeline": "Timeline",
+      "hypotheses": "Root-Cause Hypotheses",
+      "verificationSteps": "Verification Steps",
+      "recommendedActions": "Recommended Actions",
+      "dataGaps": "Data Gaps & Blind Spots",
+      "suggestedIntentLabel": "Suggested Studio Investigation:"
+    },
+    "status": {
+      "healthy": "Healthy",
+      "degraded": "Degraded",
+      "critical": "Critical",
+      "insufficient_data": "Insufficient Data"
+    },
+    "errors": {
+      "loadConfigFailed": "Failed to load plugin configuration: {{message}}",
+      "loadDashboardsFailed": "Failed to list dashboards: {{message}}",
+      "collectionFailed": "Evidence collection failed: {{message}}",
+      "analyzeFailed": "Status report generation failed: {{message}}",
+      "noSources": "No alerting or dashboard metric sources succeeded. Check permissions or select a dashboard."
+    },
+    "markdown": {
+      "title": "Operational Status & Incident Analysis Report",
+      "status": "Status",
+      "confidence": "Confidence",
+      "window": "Window",
+      "baseline": "Baseline",
+      "dashboard": "Dashboard",
+      "scope": "Scope",
+      "generatedAt": "Generated At",
+      "executiveSummary": "Executive Summary",
+      "findings": "Findings",
+      "none": "None",
+      "evidence": "Evidence",
+      "timeline": "Timeline",
+      "hypotheses": "Hypotheses",
+      "verify": "Verify",
+      "recommendedActions": "Recommended Actions",
+      "dataGaps": "Data Gaps"
     }
   }
 }

@@ -396,6 +396,130 @@ func TestGrafanaLLMApp_To_VLLM_Contract(t *testing.T) {
 	})
 }
 
+func TestGrafanaLLMApp_StatusReport_Contract(t *testing.T) {
+	sampleReport := ir.StatusReportIR{
+		SchemaVersion:    "1.0",
+		OverallStatus:    "degraded",
+		Confidence:       "medium",
+		ExecutiveSummary: "HighErrorRate firing on checkout-api with p95 > 500ms.",
+		Timeline: []ir.ReportTimelineItem{
+			{Timestamp: "2026-11-27T13:05:00Z", Event: "Alert fired", EvidenceIDs: []string{"ev-alert-1"}},
+		},
+		Findings: []ir.ReportFinding{
+			{
+				ID:          "f-1",
+				Category:    "alert",
+				Severity:    "critical",
+				Title:       "HighErrorRate",
+				Detail:      "Active alert on checkout-api.",
+				EvidenceIDs: []string{"ev-alert-1"},
+			},
+		},
+		Hypotheses:         []ir.ReportHypothesis{},
+		RecommendedActions: []ir.ReportAction{{Priority: "immediate", Action: "Inspect rollout", RelatedFindingIds: []string{"f-1"}}},
+		DataGaps:           []string{"Logs not collected."},
+	}
+	reportBytes, _ := json.Marshal(sampleReport)
+
+	var seenSchemaName string
+	var seenFormatType string
+
+	grafanaSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/plugins/grafana-llm-app/health":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"details":{"llmProvider":{"configured":true,"ok":true}}}`))
+		case "/api/plugins/grafana-llm-app/resources/llm/v1/chat/completions":
+			// Mirror real grafana-llm-app unmarshaling into go-openai ChatCompletionRequest.
+			var incoming struct {
+				openai.ChatCompletionRequest
+				Model string `json:"model"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&incoming); err != nil {
+				http.Error(w, `{"error":"unmarshal failed: `+err.Error()+`"}`, http.StatusBadRequest)
+				return
+			}
+			if incoming.ResponseFormat != nil {
+				seenFormatType = string(incoming.ResponseFormat.Type)
+				if incoming.ResponseFormat.JSONSchema != nil {
+					seenSchemaName = incoming.ResponseFormat.JSONSchema.Name
+				}
+			}
+			resp := openai.ChatCompletionResponse{
+				ID:    "chatcmpl-report-test",
+				Model: "test-model",
+				Choices: []openai.ChatCompletionChoice{{
+					Index:        0,
+					Message:      openai.ChatCompletionMessage{Role: "assistant", Content: string(reportBytes)},
+					FinishReason: openai.FinishReasonStop,
+				}},
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(resp)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer grafanaSrv.Close()
+
+	reqPayload := llm.AnalyzeStatusRequest{
+		Payload: ir.AnalyzeStatusPayload{
+			Window:       "1h",
+			BaselineMode: "preceding",
+			Language:     "en",
+			CollectionStatus: ir.ReportCollectionStatus{
+				AlertsChecked: true,
+				RulesChecked:  true,
+			},
+			Evidence: ir.ReportEvidenceBundle{
+				CollectedAt: "2026-11-27T13:10:00Z",
+				Alerts: []ir.AlertEvidenceItem{
+					{ID: "ev-alert-1", AlertName: "HighErrorRate", State: "active", Severity: "critical"},
+				},
+			},
+		},
+	}
+
+	for _, mode := range []string{llm.StructuredOutputJSONSchema, llm.StructuredOutputJSONObject} {
+		t.Run(mode, func(t *testing.T) {
+			seenSchemaName = ""
+			seenFormatType = ""
+			cli, err := llm.NewGrafanaLLMClient(llm.GrafanaLLMConfig{
+				GrafanaURL:           grafanaSrv.URL,
+				ServiceAccountToken:  "glsa_report_test_token",
+				ModelTier:            llmclient.ModelBase,
+				StructuredOutputMode: mode,
+				MaxOutputTokens:      2048,
+				RequestTimeout:       5 * time.Second,
+				MaxTransportRetries:  1,
+			})
+			if err != nil {
+				t.Fatalf("NewGrafanaLLMClient failed: %v", err)
+			}
+			raw, meta, err := cli.AnalyzeStatus(context.Background(), reqPayload)
+			if err != nil {
+				t.Fatalf("AnalyzeStatus (%s) failed: %v", mode, err)
+			}
+			if meta.FinishReason != "stop" {
+				t.Fatalf("expected finishReason stop, got %q", meta.FinishReason)
+			}
+			if seenFormatType != mode {
+				t.Fatalf("expected response_format.type %q, got %q", mode, seenFormatType)
+			}
+			if mode == llm.StructuredOutputJSONSchema && seenSchemaName != "status_report" {
+				t.Fatalf("expected schema name status_report, got %q", seenSchemaName)
+			}
+			decoded, err := ir.DecodeStrictStatusReport(raw)
+			if err != nil {
+				t.Fatalf("DecodeStrictStatusReport failed: %v", err)
+			}
+			if err := ir.ValidateStatusReport(decoded, map[string]bool{"ev-alert-1": true}); err != nil {
+				t.Fatalf("ValidateStatusReport failed: %v", err)
+			}
+		})
+	}
+}
+
 func containsSubstring(haystack, needle string) bool {
 	return len(needle) == 0 || (len(haystack) >= len(needle) && indexOf(haystack, needle) >= 0)
 }

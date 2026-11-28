@@ -141,6 +141,14 @@ func (c *GrafanaLLMClient) RepairPanels(ctx context.Context, req RepairRequest) 
 	return c.callStructured(ctx, msgs, "dashboard_patch", schemas.DashboardPatchSchemaJSON)
 }
 
+func (c *GrafanaLLMClient) AnalyzeStatus(ctx context.Context, req AnalyzeStatusRequest) ([]byte, CompletionMeta, error) {
+	msgs, err := prompt.BuildAnalyzeStatusMessages(req.Payload)
+	if err != nil {
+		return nil, CompletionMeta{ProviderMode: "grafana-llm-app"}, err
+	}
+	return c.callStructured(ctx, msgs, "status_report", schemas.StatusReportSchemaJSON)
+}
+
 func (c *GrafanaLLMClient) callStructured(
 	ctx context.Context,
 	messages []openai.ChatCompletionMessage,

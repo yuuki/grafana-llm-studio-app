@@ -390,6 +390,9 @@ func (s *stubLLMClient) GeneratePatch(ctx context.Context, r llm.PatchRequest) (
 func (s *stubLLMClient) RepairPanels(ctx context.Context, r llm.RepairRequest) ([]byte, llm.CompletionMeta, error) {
 	return s.repFn(ctx, r)
 }
+func (s *stubLLMClient) AnalyzeStatus(_ context.Context, _ llm.AnalyzeStatusRequest) ([]byte, llm.CompletionMeta, error) {
+	return nil, llm.CompletionMeta{ProviderMode: "stub"}, nil
+}
 
 func TestRunnerDetectsTruncationAndQueryOnlyGuardViolation(t *testing.T) {
 	stub := &stubLLMClient{

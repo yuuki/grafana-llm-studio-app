@@ -1,3 +1,6 @@
+import type { StatusReportIR } from './reportTypes';
+export * from './reportTypes';
+
 export const ALLOWED_SCHEMA_VERSIONS = ['1.0', '1.1'] as const;
 export type IRSchemaVersion = (typeof ALLOWED_SCHEMA_VERSIONS)[number];
 export const IR_SCHEMA_VERSION: IRSchemaVersion = '1.1';
@@ -179,10 +182,14 @@ export type JobStatus =
   | 'validating_ir'
   | 'awaiting_preview'
   | 'repairing'
+  | 'analyzing'
+  | 'validating_report'
   | 'ready'
   | 'insufficient_metrics'
   | 'cancelled'
   | 'failed';
+
+export type JobKind = 'dashboard' | 'report';
 
 export interface CompletionMeta {
   finishReason: string;
@@ -194,12 +201,14 @@ export interface CompletionMeta {
 
 export interface JobSnapshot {
   jobId: string;
+  jobKind?: JobKind;
   status: JobStatus;
   datasourceUid: string;
   queryKind?: QueryKind;
   scope?: ScopeFilter;
   importSource?: ImportSource;
   currentIR?: DashboardIR;
+  statusReport?: StatusReportIR;
   lastDiff?: DiffEntry[];
   summary?: string;
   warnings?: string[];
@@ -211,7 +220,7 @@ export interface JobSnapshot {
   updatedAt: string;
 }
 
-export type JobOperation = 'generate' | 'patch' | 'repair';
+export type JobOperation = 'generate' | 'patch' | 'repair' | 'analyze';
 
 export interface JobStageEvent {
   jobId?: string;

@@ -40,6 +40,7 @@ type stubLLM struct {
 	onGenerate func(ctx context.Context, req llm.GenerateRequest) ([]byte, llm.CompletionMeta, error)
 	onPatch    func(ctx context.Context, req llm.PatchRequest) ([]byte, llm.CompletionMeta, error)
 	onRepair   func(ctx context.Context, req llm.RepairRequest) ([]byte, llm.CompletionMeta, error)
+	onAnalyze  func(ctx context.Context, req llm.AnalyzeStatusRequest) ([]byte, llm.CompletionMeta, error)
 }
 
 func (s *stubLLM) Enabled(_ context.Context) (bool, error) { return true, nil }
@@ -51,6 +52,12 @@ func (s *stubLLM) GeneratePatch(ctx context.Context, req llm.PatchRequest) ([]by
 }
 func (s *stubLLM) RepairPanels(ctx context.Context, req llm.RepairRequest) ([]byte, llm.CompletionMeta, error) {
 	return s.onRepair(ctx, req)
+}
+func (s *stubLLM) AnalyzeStatus(ctx context.Context, req llm.AnalyzeStatusRequest) ([]byte, llm.CompletionMeta, error) {
+	if s.onAnalyze != nil {
+		return s.onAnalyze(ctx, req)
+	}
+	return nil, llm.CompletionMeta{ProviderMode: "stub"}, nil
 }
 
 func TestManager_CrossUserAndOrgIsolation(t *testing.T) {

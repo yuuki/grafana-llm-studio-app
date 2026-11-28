@@ -1,5 +1,6 @@
 import { of } from 'rxjs';
 import {
+  analyzeStatus,
   extractApiError,
   generateDraft,
   patchDraft,
@@ -517,5 +518,82 @@ describe('studioClient optional SSE streaming and graceful fallback', () => {
     expect(res).toEqual(snap);
     expect(stages).toHaveLength(1);
     expect(stages[0].stage).toBe('generating');
+  });
+
+  test('analyzeStatus streams analyzing/validating_report SSE stages and recovers via GET /jobs/{id} if stream drops', async () => {
+    const readyReportSnap = makeSnapshot({
+      jobId: 'job-report-1',
+      jobKind: 'report',
+      status: 'ready',
+      statusReport: {
+        schemaVersion: '1.0',
+        overallStatus: 'healthy',
+        confidence: 'high',
+        executiveSummary: 'All systems healthy.',
+        findings: [
+          {
+            id: 'finding-1',
+            severity: 'info',
+            category: 'alert',
+            title: 'No alerts',
+            detail: 'Zero active alerts.',
+            evidenceIds: ['ev-status-1'],
+          },
+        ],
+        timeline: [],
+        hypotheses: [],
+        recommendedActions: [],
+        dataGaps: [],
+      },
+    });
+    const stages: JobStageEvent[] = [];
+
+    const droppingStream = makeMockReadableStream(
+      [
+        'event: stage\ndata: {"jobId":"job-report-1","operation":"analyze","stage":"analyzing","timestamp":"2026-11-27T00:00:00Z"}\n\n',
+      ],
+      new Error('network reset')
+    );
+
+    globalThis.fetch = jest.fn().mockResolvedValueOnce({
+      ok: true,
+      status: 200,
+      statusText: 'OK',
+      headers: new Headers({ 'Content-Type': 'text/event-stream' }),
+      body: droppingStream,
+    }) as unknown as typeof fetch;
+
+    // First poll returns still-active validating_report, second poll returns terminal ready snapshot.
+    mockBackendFetch
+      .mockReturnValueOnce(of({ data: makeSnapshot({ jobId: 'job-report-1', jobKind: 'report', status: 'validating_report' }) }))
+      .mockReturnValueOnce(of({ data: readyReportSnap }));
+
+    const result = await analyzeStatus(
+      {
+        language: 'en',
+        window: '1h',
+        baselineMode: 'preceding',
+        collectionStatus: {
+          alertsChecked: true,
+          rulesChecked: true,
+          totalRulesEvaluated: 1,
+          activeAlertsTotal: 0,
+          abnormalRulesTotal: 0,
+        },
+        evidence: {
+          collectedAt: '2026-11-27T00:00:00Z',
+          alerts: [],
+          rules: [],
+          metrics: [],
+          statusNotes: [{ id: 'ev-status-1', message: '0 active alerts' }],
+        },
+      },
+      undefined,
+      { enableSse: true, onStage: (ev) => stages.push(ev) }
+    );
+
+    expect(result).toEqual(readyReportSnap);
+    expect(stages.map((s) => `${s.operation}:${s.stage}`)).toEqual(['analyze:analyzing']);
+    expect(mockBackendFetch).toHaveBeenCalledTimes(2);
   });
 });

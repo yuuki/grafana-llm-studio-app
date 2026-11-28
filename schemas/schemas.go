@@ -11,3 +11,8 @@ var DashboardIRSchemaJSON []byte
 //
 //go:embed dashboard-patch.schema.json
 var DashboardPatchSchemaJSON []byte
+
+// StatusReportSchemaJSON is the canonical JSON Schema for StatusReportIR.
+//
+//go:embed status-report.schema.json
+var StatusReportSchemaJSON []byte

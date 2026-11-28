@@ -242,6 +242,7 @@ func (a *App) registerRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/health", a.handleHealth)
 	mux.HandleFunc("/config/public", a.handlePublicConfig)
 	mux.HandleFunc("/jobs/generate", a.handleGenerate)
+	mux.HandleFunc("/jobs/analyze", a.handleAnalyzeStatus)
 	mux.HandleFunc("/jobs/import", a.handleImport)
 	mux.HandleFunc("/jobs/", a.handleJobAction)
 }
@@ -336,6 +337,32 @@ func (a *App) handleGenerate(w http.ResponseWriter, r *http.Request) {
 
 	a.serveJobOperation(w, r, func(ctx context.Context) (jobs.JobSnapshot, error) {
 		return a.jobManager.Generate(ctx, owner, in)
+	})
+}
+
+func (a *App) handleAnalyzeStatus(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	owner, err := callerOwnerFromContext(r.Context())
+	if err != nil {
+		writeError(w, http.StatusUnauthorized, err.Error())
+		return
+	}
+	if a.jobManager == nil {
+		writeError(w, http.StatusServiceUnavailable, "LLM client or job store unavailable; check plugin configuration")
+		return
+	}
+
+	var in ir.AnalyzeStatusPayload
+	if err := decodeBoundedJSON(r.Body, &in); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	a.serveJobOperation(w, r, func(ctx context.Context) (jobs.JobSnapshot, error) {
+		return a.jobManager.AnalyzeStatus(ctx, owner, in)
 	})
 }
 
@@ -491,7 +518,7 @@ func (a *App) serveJobOperation(w http.ResponseWriter, r *http.Request, op func(
 	}
 	snap, err := op(r.Context())
 	if err != nil {
-		writeJobError(w, err, snap)
+		writeJobErrorForContext(r.Context(), w, err, snap)
 		return
 	}
 	writeJSON(w, http.StatusOK, snap)
@@ -534,26 +561,40 @@ func decodeBoundedJSON(body io.Reader, dst any) error {
 }
 
 func buildJobErrorPayload(err error, snap jobs.JobSnapshot) (int, map[string]any) {
+	return buildJobErrorPayloadForContext(context.Background(), err, snap)
+}
+
+func buildJobErrorPayloadForContext(ctx context.Context, err error, snap jobs.JobSnapshot) (int, map[string]any) {
 	status := http.StatusBadRequest
 	errMsg := err.Error()
+	pCtx := backend.PluginConfigFromContext(ctx)
+	isAdmin := pCtx.User != nil && strings.EqualFold(pCtx.User.Role, "Admin")
+
 	switch {
 	case errors.Is(err, jobs.ErrJobNotFound):
 		status = http.StatusNotFound
 	case errors.Is(err, jobs.ErrForbidden), errors.Is(err, jobs.ErrDatasourceDenied):
 		status = http.StatusForbidden
-	case errors.Is(err, ir.ErrRevisionConflict), errors.Is(err, jobs.ErrOperationInProgress), errors.Is(err, jobs.ErrJobCancelled):
+	case errors.Is(err, ir.ErrRevisionConflict), errors.Is(err, jobs.ErrOperationInProgress), errors.Is(err, jobs.ErrJobCancelled), errors.Is(err, jobs.ErrWrongJobKind):
 		status = http.StatusConflict
 	case errors.Is(err, jobs.ErrBudgetExhausted), errors.Is(err, jobs.ErrConcurrencyLimited):
 		status = http.StatusTooManyRequests
-	case errors.Is(err, jobs.ErrNotRepairable), errors.Is(err, jobs.ErrNoUndoHistory), errors.Is(err, ir.ErrNoOpPatch):
+	case errors.Is(err, jobs.ErrNotRepairable), errors.Is(err, jobs.ErrNoUndoHistory), errors.Is(err, ir.ErrNoOpPatch), errors.Is(err, ir.ErrInsufficientEvidence):
 		status = http.StatusUnprocessableEntity
+	case errors.Is(err, jobs.ErrReportStorageMigrationRequired):
+		status = http.StatusServiceUnavailable
+		if !isAdmin {
+			errMsg = jobs.ErrReportStorageMigrationRequired.Error()
+		}
 	case errors.Is(err, jobs.ErrStoreUnavailable):
 		status = http.StatusServiceUnavailable
 		errMsg = jobs.ErrStoreUnavailable.Error()
 	case errors.Is(err, context.DeadlineExceeded):
 		status = http.StatusGatewayTimeout
-	case errors.Is(err, llm.ErrOutputTruncated), errors.Is(err, llm.ErrOutputRefused):
+	case errors.Is(err, ir.ErrInvalidReportIR), errors.Is(err, llm.ErrOutputTruncated), errors.Is(err, llm.ErrOutputRefused), errors.Is(err, llm.ErrLLMUnavailable):
 		status = http.StatusBadGateway
+	case errors.Is(err, ir.ErrInvalidAnalyzeRequest):
+		status = http.StatusBadRequest
 	}
 	payload := map[string]any{
 		"error": errMsg,
@@ -566,6 +607,11 @@ func buildJobErrorPayload(err error, snap jobs.JobSnapshot) (int, map[string]any
 
 func writeJobError(w http.ResponseWriter, err error, snap jobs.JobSnapshot) {
 	status, payload := buildJobErrorPayload(err, snap)
+	writeJSON(w, status, payload)
+}
+
+func writeJobErrorForContext(ctx context.Context, w http.ResponseWriter, err error, snap jobs.JobSnapshot) {
+	status, payload := buildJobErrorPayloadForContext(ctx, err, snap)
 	writeJSON(w, status, payload)
 }
 

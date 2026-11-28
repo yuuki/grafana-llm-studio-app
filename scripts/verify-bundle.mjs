@@ -45,6 +45,7 @@ const requiredExternals = [
   'react',
   'react-dom',
   'react/jsx-runtime',
+  'react-router',
   'i18next',
   '@grafana/data',
   '@grafana/runtime',

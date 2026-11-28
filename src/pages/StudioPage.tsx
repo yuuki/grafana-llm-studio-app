@@ -1,5 +1,5 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { config, getDataSourceSrv } from '@grafana/runtime';
+import { config, getDataSourceSrv, locationService } from '@grafana/runtime';
 import { EmbeddedScene } from '@grafana/scenes';
 import {
   Alert,
@@ -101,6 +101,8 @@ const STAGE_LABEL_KEYS: Record<JobStatus, TranslationKey> = {
   generating: 'studio.progress.stage.generating',
   repairing: 'studio.progress.stage.repairing',
   validating_ir: 'studio.progress.stage.validating_ir',
+  analyzing: 'studio.progress.stage.analyzing',
+  validating_report: 'studio.progress.stage.validating_report',
   awaiting_preview: 'studio.progress.stage.awaiting_preview',
   ready: 'studio.progress.stage.ready',
   insufficient_metrics: 'studio.progress.stage.insufficient_metrics',
@@ -182,6 +184,7 @@ export const StudioPage: React.FC = () => {
   >('idle');
   const [liveStage, setLiveStage] = useState<JobStageEvent | null>(null);
   const [sseFallbackNotice, setSseFallbackNotice] = useState(false);
+  const [handoffFromReport, setHandoffFromReport] = useState(false);
   const [uiError, setUiError] = useState<string | null>(null);
 
   // Optional safe import state.
@@ -253,6 +256,7 @@ export const StudioPage: React.FC = () => {
     setJob(null);
     setLiveStage(null);
     setSseFallbackNotice(false);
+    setHandoffFromReport(false);
     setShowImportPanel(false);
     setImportUid('');
     setExistingDashboards([]);
@@ -306,7 +310,45 @@ export const StudioPage: React.FC = () => {
           .filter((d) => allowSet.has(d.uid) && isPrometheusCompatibleType(d.type))
           .map((d) => ({ uid: d.uid, name: d.name, type: d.type }));
         setAllowedDatasources(filtered);
-        setSelectedDsUid(filtered.length > 0 ? filtered[0].uid : '');
+
+        // Consume optional handoff query parameters from Operational Status Report ("Investigate in Studio").
+        const search = locationService?.getLocation?.()?.search ?? '';
+        const params = new URLSearchParams(search);
+        const handoffDs = (params.get('datasource') ?? '').trim();
+        const handoffScopeLabel = (params.get('scopeLabel') ?? '').trim();
+        const handoffScopeValue = (params.get('scopeValue') ?? '').trim().slice(0, 128);
+        const handoffIntent = (params.get('intent') ?? '').trim().slice(0, 300);
+        const hasHandoff = Boolean(handoffDs || handoffScopeLabel || handoffScopeValue || handoffIntent);
+
+        const resolvedDsUid =
+          handoffDs && filtered.some((d) => d.uid === handoffDs)
+            ? handoffDs
+            : filtered.length > 0
+              ? filtered[0].uid
+              : '';
+
+        if (hasHandoff) {
+          // Update prevContextKeyRef BEFORE setSelectedDsUid so the context-switch effect
+          // does not fire clearDraftAndMetadata() and wipe the pre-filled scopeLabelValue.
+          prevContextKeyRef.current = `${currentOrgId}:${resolvedDsUid}`;
+          setSelectedDsUid(resolvedDsUid);
+          if (handoffScopeLabel === 'service' || handoffScopeLabel === 'job' || handoffScopeLabel === 'namespace') {
+            setScopeLabelName(handoffScopeLabel);
+          }
+          if (handoffScopeValue) {
+            setScopeLabelValue(handoffScopeValue);
+          }
+          if (handoffIntent) {
+            setPromptText(handoffIntent);
+          }
+          setHandoffFromReport(true);
+          locationService?.partial?.(
+            { datasource: null, scopeLabel: null, scopeValue: null, intent: null },
+            true
+          );
+        } else {
+          setSelectedDsUid(resolvedDsUid);
+        }
       } catch (err: unknown) {
         if (active && !initController.signal.aborted) {
           setUiError(t('studio.errors.initFailed', { error: extractApiError(err) }));
@@ -1118,6 +1160,16 @@ export const StudioPage: React.FC = () => {
           <Alert title={t('studio.mockBanner.title')} severity="warning">
             {t('studio.mockBanner.body')}
           </Alert>
+        </div>
+      )}
+
+      {handoffFromReport && (
+        <div data-testid="studio-handoff-alert">
+          <Alert
+            title={t('studio.progress.handoffNotice')}
+            severity="info"
+            onRemove={() => setHandoffFromReport(false)}
+          />
         </div>
       )}
 

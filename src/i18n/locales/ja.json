@@ -86,12 +86,15 @@
         "generating": "構造化 IR 生成のため LLM を呼び出し中...",
         "repairing": "構文エラー修復のため LLM を呼び出し中...",
         "validating_ir": "IR スキーマとクエリ安全性を検証中...",
+        "analyzing": "収集したエビデンスを LLM で分析中...",
+        "validating_report": "レポートスキーマと根拠 ID 整合性を検証中...",
         "awaiting_preview": "ドラフト検証完了・プレビュー可能",
         "ready": "完了",
         "insufficient_metrics": "選択スコープに十分なメトリクスがありません",
         "cancelled": "処理をキャンセルしました",
         "failed": "処理に失敗しました"
-      }
+      },
+      "handoffNotice": "Status Report から調査条件を引き継ぎました。最初に「スコープのメトリクスを取得」を実行してからドラフトを生成してください。"
     },
     "validation": {
       "heading": "検証結果（Dry-Run: 直近5m / maxDataPoints=10）",
@@ -303,6 +306,103 @@
   "validator": {
     "errors": {
       "timeout": "検証クエリがタイムアウトしました ({{seconds}}s)"
+    }
+  },
+  "report": {
+    "pageTitle": "運用状況分析レポート",
+    "pageSubtitle": "Grafana Alerting とダッシュボード指標をユーザーセッションで有界収集し、根拠 ID 付きで LLM が分析します。",
+    "controls": {
+      "dashboardLabel": "対象ダッシュボード（任意・未選択時はアラート単体分析）",
+      "dashboardAlertsOnly": "アラート単体分析（ダッシュボード未選択）",
+      "datasourceLabel": "データソース（アラート単体時は任意・ダッシュボード分析時は必須）",
+      "scopeLabel": "スコープラベル（任意）",
+      "scopeValueLabel": "スコープ値（任意）",
+      "scopeValuePlaceholder": "例: checkout-api",
+      "windowLabel": "分析対象ウィンドウ",
+      "baselineLabel": "ベースライン比較",
+      "baselinePreceding": "直前の同長期間（既定）",
+      "baseline24h": "24時間前",
+      "baselineNone": "比較なし（単一期間）",
+      "languageLabel": "レポート出力言語",
+      "languageEn": "English (en)",
+      "languageJa": "日本語 (ja)",
+      "focusLabel": "分析フォーカス・追加の観点（任意）",
+      "focusPlaceholder": "例: 5xx エラー急増とレイテンシ悪化の原因を中心に分析",
+      "includeOrgCritical": "スコープ指定時も組織全体の Critical アラートを含める",
+      "previewBeforeSend": "LLM 送信前に収集エビデンスをプレビュー確認する",
+      "analyzeButton": "収集して分析を実行",
+      "collectPreviewButton": "エビデンス収集（プレビュー）",
+      "sendToLlmButton": "LLM へ送信してレポート生成",
+      "discardPreviewButton": "プレビューを破棄",
+      "cancelButton": "キャンセル",
+      "collecting": "エビデンス収集中...",
+      "analyzing": "分析中...",
+      "cancelling": "キャンセル中..."
+    },
+    "evidence": {
+      "heading": "収集エビデンス",
+      "empty": "「収集して分析を実行」を押すと、Grafana Alerting の状態とダッシュボード指標の統計要約を収集します。",
+      "summaryBadges": "アラート: {{alerts}} | 異常ルール: {{rules}} | メトリクス: {{metrics}} | マスク済: {{redacted}}",
+      "previewReady": "エビデンスの収集とサニタイズ（<= 24 KiB）が完了しました。内容を確認し「LLM へ送信してレポート生成」を押してください。",
+      "warningsHeading": "収集時の警告",
+      "alertsHeading": "Grafana アラート",
+      "rulesHeading": "アラートルール評価状態",
+      "metricsHeading": "ダッシュボード指標サマリ",
+      "statusNotesHeading": "ステータス補足",
+      "deltaLabel": "ベースライン平均比 {{delta}}%"
+    },
+    "result": {
+      "heading": "分析レポート",
+      "empty": "分析を実行すると、根拠 ID (ev-*) に紐づいた構造化レポートが表示されます。",
+      "overallStatus": "総合ステータス",
+      "confidence": "信頼度",
+      "copyMarkdown": "Markdown をコピー",
+      "copiedMarkdown": "Markdown をクリップボードにコピーしました。",
+      "copyFailed": "クリップボードへのコピーに失敗しました。",
+      "downloadMarkdown": ".md をダウンロード",
+      "exportJson": "JSON エクスポート",
+      "investigateInStudio": "Studio で調査ダッシュボード作成",
+      "executiveSummary": "エグゼクティブサマリ",
+      "findings": "検出事項",
+      "noFindings": "検出された異常事項はありません。",
+      "timeline": "タイムライン",
+      "hypotheses": "原因仮説",
+      "verificationSteps": "確認手順",
+      "recommendedActions": "推奨アクション",
+      "dataGaps": "未取得データ・分析の限界",
+      "suggestedIntentLabel": "Studio 調査プロンプト案:"
+    },
+    "status": {
+      "healthy": "正常",
+      "degraded": "劣化・注意",
+      "critical": "重大",
+      "insufficient_data": "データ不足"
+    },
+    "errors": {
+      "loadConfigFailed": "プラグイン設定の読み込みに失敗しました: {{message}}",
+      "loadDashboardsFailed": "ダッシュボード一覧の取得に失敗しました: {{message}}",
+      "collectionFailed": "エビデンス収集に失敗しました: {{message}}",
+      "analyzeFailed": "分析レポートの生成に失敗しました: {{message}}",
+      "noSources": "アラートおよびダッシュボード指標の取得がいずれも成功しませんでした。権限または対象ダッシュボードを確認してください。"
+    },
+    "markdown": {
+      "title": "運用状況・障害分析レポート",
+      "status": "総合ステータス",
+      "confidence": "信頼度",
+      "window": "対象期間",
+      "baseline": "ベースライン比較",
+      "dashboard": "ダッシュボード",
+      "scope": "スコープ",
+      "generatedAt": "生成日時",
+      "executiveSummary": "エグゼクティブサマリ",
+      "findings": "検出事項",
+      "none": "なし",
+      "evidence": "根拠",
+      "timeline": "タイムライン",
+      "hypotheses": "原因仮説",
+      "verify": "確認手順",
+      "recommendedActions": "推奨アクション",
+      "dataGaps": "未取得データ・分析の限界"
     }
   }
 }
