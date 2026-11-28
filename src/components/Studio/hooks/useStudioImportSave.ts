@@ -47,6 +47,78 @@ export interface UseStudioImportSaveParams {
   locale: string;
 }
 
+function validateSavePreconditions(
+  job: JobSnapshot | null,
+  selectedDatasource: AllowedDatasourceOption | null,
+  previewSpec: NormalizedDashboardSpec | null,
+  previewMeta: PreviewMeta | null,
+  hasBlockingValidationErrors: boolean,
+  t: StudioTranslateFn
+): string | null {
+  if (!job?.currentIR || !selectedDatasource || !previewSpec || !previewMeta) {
+    return t('studio.errors.previewRequiredBeforeSave');
+  }
+  if (previewMeta.jobId !== job.jobId || previewMeta.revision !== job.currentIR.revision) {
+    return t('studio.errors.latestDraftUnvalidated');
+  }
+  if (hasBlockingValidationErrors) {
+    return t('studio.errors.validationErrorsRemain');
+  }
+  return null;
+}
+
+async function executeDashboardSave(
+  saver: DashboardSaver,
+  currentSpec: NormalizedDashboardSpec,
+  job: JobSnapshot,
+  previewedRevision: number,
+  optInUpdateExisting: boolean,
+  preservedMeta: PreservedImportMeta | undefined,
+  selectedFolderUid: string
+): Promise<{ res: SaveDashboardResult; useUpdate: boolean; updateFolderUid: string }> {
+  const useUpdate =
+    optInUpdateExisting &&
+    Boolean(job.importSource?.uid) &&
+    Boolean(job.importSource?.resourceVersion) &&
+    Boolean(preservedMeta?.patchContext);
+  const updateFolderUid = job.importSource?.folderUid ?? preservedMeta?.folderUid ?? '';
+
+  if (useUpdate && job.currentIR && job.importSource && preservedMeta?.patchContext) {
+    const res = await saver.updateExistingDashboard({
+      spec: currentSpec,
+      currentIR: job.currentIR,
+      patchContext: preservedMeta.patchContext,
+      previewedRevision,
+      targetUid: job.importSource.uid,
+      expectedResourceVersion: preservedMeta.resourceVersion || job.importSource.resourceVersion!,
+      folderUid: updateFolderUid,
+      preservedAnnotations: preservedMeta.preservedAnnotations,
+      preservedLabels: preservedMeta.preservedLabels,
+    });
+    return { res, useUpdate: true, updateFolderUid };
+  }
+
+  const res = await saver.createNewDashboard({
+    spec: currentSpec,
+    previewedRevision,
+    folderUid: selectedFolderUid,
+  });
+  return { res, useUpdate: false, updateFolderUid };
+}
+
+function applyUpdatedResourceVersion(prev: JobSnapshot | null, resourceVersion: string): JobSnapshot | null {
+  if (!prev?.importSource) {
+    return prev;
+  }
+  return {
+    ...prev,
+    importSource: {
+      ...prev.importSource,
+      resourceVersion,
+    },
+  };
+}
+
 export function useStudioImportSave({
   job,
   setJob,
@@ -229,16 +301,16 @@ export function useStudioImportSave({
   );
 
   const handleSaveDashboard = async () => {
-    if (!job?.currentIR || !selectedDatasource || !previewSpec || !previewMeta) {
-      setUiError(t('studio.errors.previewRequiredBeforeSave'));
-      return;
-    }
-    if (previewMeta.jobId !== job.jobId || previewMeta.revision !== job.currentIR.revision) {
-      setUiError(t('studio.errors.latestDraftUnvalidated'));
-      return;
-    }
-    if (hasBlockingValidationErrors) {
-      setUiError(t('studio.errors.validationErrorsRemain'));
+    const precondErr = validateSavePreconditions(
+      job,
+      selectedDatasource,
+      previewSpec,
+      previewMeta,
+      hasBlockingValidationErrors,
+      t
+    );
+    if (precondErr || !job?.currentIR || !selectedDatasource || !previewMeta) {
+      setUiError(precondErr ?? t('studio.errors.previewRequiredBeforeSave'));
       return;
     }
 
@@ -257,32 +329,15 @@ export function useStudioImportSave({
       );
       const importMetaKey = job.importSource?.uid ? `${job.jobId}:${job.importSource.uid}` : '';
       const preservedMeta = importMetaKey ? latestImportMetaRef.current.get(importMetaKey) : undefined;
-      const useUpdate =
-        optInUpdateExisting &&
-        Boolean(job.importSource?.uid) &&
-        Boolean(job.importSource?.resourceVersion) &&
-        Boolean(preservedMeta?.patchContext);
-
-      const updateFolderUid = job.importSource?.folderUid ?? preservedMeta?.folderUid ?? '';
-
-      const res = useUpdate
-        ? await saverRef.current.updateExistingDashboard({
-            spec: currentSpec,
-            currentIR: job.currentIR,
-            patchContext: preservedMeta!.patchContext!,
-            previewedRevision: previewMeta.revision,
-            targetUid: job.importSource!.uid,
-            expectedResourceVersion:
-              preservedMeta?.resourceVersion || job.importSource!.resourceVersion!,
-            folderUid: updateFolderUid,
-            preservedAnnotations: preservedMeta?.preservedAnnotations,
-            preservedLabels: preservedMeta?.preservedLabels,
-          })
-        : await saverRef.current.createNewDashboard({
-            spec: currentSpec,
-            previewedRevision: previewMeta.revision,
-            folderUid: selectedFolderUid,
-          });
+      const { res, useUpdate, updateFolderUid } = await executeDashboardSave(
+        saverRef.current,
+        currentSpec,
+        job,
+        previewMeta.revision,
+        optInUpdateExisting,
+        preservedMeta,
+        selectedFolderUid
+      );
       if (seq === contextSeqRef.current) {
         setSavedResult(res);
         setOptInUpdateExisting(false);
@@ -292,17 +347,7 @@ export function useStudioImportSave({
             resourceVersion: res.resourceVersion,
             folderUid: updateFolderUid,
           });
-          setJob((prev) =>
-            prev?.importSource
-              ? {
-                  ...prev,
-                  importSource: {
-                    ...prev.importSource,
-                    resourceVersion: res.resourceVersion,
-                  },
-                }
-              : prev
-          );
+          setJob((prev) => applyUpdatedResourceVersion(prev, res.resourceVersion!));
         }
       }
     } catch (err: unknown) {

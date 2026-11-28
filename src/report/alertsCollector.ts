@@ -300,13 +300,24 @@ async function fetchWithTimeout<T>(url: string, timeoutMs: number, externalSigna
  * - GET /api/prometheus/grafana/api/v1/rules?limit_alerts=20
  * Handles 403/404 graceful degradation, deduplication via __alert_rule_uid__, and healthy-cluster summaries.
  */
+interface RankedAlert {
+  priority: number;
+  startsAtMs: number;
+  rawRuleUid: string;
+  rawAlertName: string;
+  rawRuleName: string;
+  item: Omit<AlertEvidenceItem, 'id'>;
+}
+
+type PushWarningFn = (code: CollectionWarningItem['code'], message: string) => void;
+
 export async function collectGrafanaAlertingEvidence(
   options: CollectAlertsOptions = {}
 ): Promise<CollectAlertsResult> {
   const timeoutMs = Math.max(2000, Math.min(options.timeoutMs ?? 8000, 20000));
   const includeOrgCritical = options.includeOrgCriticalAlerts ?? true;
   const warnings: CollectionWarningItem[] = [];
-  const pushWarning = (code: CollectionWarningItem['code'], message: string) => {
+  const pushWarning: PushWarningFn = (code, message) => {
     if (warnings.length >= 12) {
       return;
     }
@@ -316,11 +327,6 @@ export async function collectGrafanaAlertingEvidence(
       message: trimRunes(message, 200),
     });
   };
-
-  let alertsChecked = false;
-  let rulesChecked = false;
-  let rawAlerts: RawAlertmanagerAlert[] = [];
-  let rawRulesResp: RawPrometheusRulesResponse | null = null;
 
   const [alertsRes, rulesRes] = await Promise.allSettled([
     fetchWithTimeout<RawAlertmanagerAlert[]>(
@@ -339,11 +345,58 @@ export async function collectGrafanaAlertingEvidence(
     throw new DOMException('Aborted', 'AbortError');
   }
 
+  const { alertsChecked, rawAlerts } = resolveSettledAlerts(alertsRes, options.signal, pushWarning);
+  const { rulesChecked, rawRulesResp } = resolveSettledRules(rulesRes, options.signal, pushWarning);
+
+  const { alerts, activeAlertsTotal, coveredRuleUIDs, coveredRuleNames } = buildAlertEvidence(
+    rawAlerts,
+    options.scope,
+    includeOrgCritical,
+    pushWarning
+  );
+
+  const { rules, totalRulesEvaluated, abnormalRulesTotal } = buildRuleEvidence(
+    rawRulesResp?.data?.groups ?? [],
+    coveredRuleUIDs,
+    coveredRuleNames,
+    options.scope,
+    includeOrgCritical,
+    pushWarning
+  );
+
+  const statusNotes: StatusNoteEvidenceItem[] = [];
+  if ((alertsChecked || rulesChecked) && alerts.length === 0 && rules.length === 0) {
+    statusNotes.push({
+      id: 'ev-status-1',
+      message: `Grafana Alerting checked: ${activeAlertsTotal} active alerts across ${totalRulesEvaluated} evaluated alerting rules (no abnormal alert states matched).`,
+    });
+  }
+
+  return {
+    alerts,
+    rules,
+    statusNotes,
+    warnings,
+    collectionStatus: {
+      alertsChecked,
+      rulesChecked,
+      totalRulesEvaluated,
+      activeAlertsTotal,
+      abnormalRulesTotal,
+    },
+  };
+}
+
+function resolveSettledAlerts(
+  alertsRes: PromiseSettledResult<RawAlertmanagerAlert[]>,
+  signal: AbortSignal | undefined,
+  pushWarning: PushWarningFn
+): { alertsChecked: boolean; rawAlerts: RawAlertmanagerAlert[] } {
   if (alertsRes.status === 'fulfilled' && Array.isArray(alertsRes.value)) {
-    alertsChecked = true;
-    rawAlerts = alertsRes.value;
-  } else if (alertsRes.status === 'rejected') {
-    if (isAbortError(alertsRes.reason) && options.signal?.aborted) {
+    return { alertsChecked: true, rawAlerts: alertsRes.value };
+  }
+  if (alertsRes.status === 'rejected') {
+    if (isAbortError(alertsRes.reason) && signal?.aborted) {
       throw alertsRes.reason;
     }
     const status = extractHttpStatus(alertsRes.reason);
@@ -353,12 +406,19 @@ export async function collectGrafanaAlertingEvidence(
       pushWarning('alerting_unavailable', 'Grafana Alertmanager alerts endpoint was unavailable or timed out.');
     }
   }
+  return { alertsChecked: false, rawAlerts: [] };
+}
 
+function resolveSettledRules(
+  rulesRes: PromiseSettledResult<RawPrometheusRulesResponse>,
+  signal: AbortSignal | undefined,
+  pushWarning: PushWarningFn
+): { rulesChecked: boolean; rawRulesResp: RawPrometheusRulesResponse | null } {
   if (rulesRes.status === 'fulfilled' && rulesRes.value && typeof rulesRes.value === 'object') {
-    rulesChecked = true;
-    rawRulesResp = rulesRes.value;
-  } else if (rulesRes.status === 'rejected') {
-    if (isAbortError(rulesRes.reason) && options.signal?.aborted) {
+    return { rulesChecked: true, rawRulesResp: rulesRes.value };
+  }
+  if (rulesRes.status === 'rejected') {
+    if (isAbortError(rulesRes.reason) && signal?.aborted) {
       throw rulesRes.reason;
     }
     const status = extractHttpStatus(rulesRes.reason);
@@ -368,85 +428,113 @@ export async function collectGrafanaAlertingEvidence(
       pushWarning('alerting_unavailable', 'Grafana Alerting rules endpoint was unavailable or timed out.');
     }
   }
+  return { rulesChecked: false, rawRulesResp: null };
+}
 
-  let activeAlertsTotal = 0;
+function computeAlertPriority(
+  state: AlertEvidenceItem['state'],
+  matchesScope: boolean,
+  severity: string
+): number {
+  const isCritical = isCriticalSeverity(severity);
+  if (state === 'active' && matchesScope && isCritical) {
+    return 1;
+  }
+  if (state === 'active' && isCritical) {
+    return 10;
+  }
+  if (state === 'active' && matchesScope) {
+    return 15;
+  }
+  if (state === 'active') {
+    return 20;
+  }
+  return state === 'suppressed' ? 30 : 40;
+}
 
-  interface RankedAlert {
-    priority: number;
-    startsAtMs: number;
-    rawRuleUid: string;
-    rawAlertName: string;
-    rawRuleName: string;
-    item: Omit<AlertEvidenceItem, 'id'>;
+function resolveAlertDisplayName(labels: Record<string, string>): string {
+  const rawName = labels.alertname || '';
+  if (rawName === 'DatasourceNoData' || rawName === 'DatasourceError') {
+    return labels.rulename || rawName || 'UnnamedAlert';
+  }
+  return rawName || labels.rulename || 'UnnamedAlert';
+}
+
+function parseAlertStartsAt(rawStartsAt: unknown): { startsAtMs: number; startsAt?: string } {
+  const parsed = typeof rawStartsAt === 'string' ? Date.parse(rawStartsAt) : Number.NaN;
+  if (!Number.isFinite(parsed)) {
+    return { startsAtMs: 0 };
+  }
+  return {
+    startsAtMs: parsed,
+    startsAt: Math.abs(parsed) <= 8.64e15 ? new Date(parsed).toISOString() : undefined,
+  };
+}
+
+function toRankedAlert(
+  raw: RawAlertmanagerAlert,
+  state: AlertEvidenceItem['state'],
+  scope: ScopeFilter | undefined,
+  includeOrgCritical: boolean
+): RankedAlert | null {
+  const labels = raw.labels ?? {};
+  const annotations = raw.annotations ?? {};
+  const severity = labels.severity || labels.priority || '';
+  const matchesScope = matchesScopeLabels(labels, scope);
+
+  if (scope?.labelName && scope?.labelValue && !matchesScope) {
+    if (!(includeOrgCritical && state === 'active' && isCriticalSeverity(severity))) {
+      return null;
+    }
   }
 
+  const { startsAtMs, startsAt } = parseAlertStartsAt(raw.startsAt);
+  return {
+    priority: computeAlertPriority(state, matchesScope, severity),
+    startsAtMs,
+    rawRuleUid: labels.__alert_rule_uid__ ?? '',
+    rawAlertName: labels.alertname ?? '',
+    rawRuleName: labels.rulename ?? '',
+    item: {
+      alertName: trimRunes(resolveAlertDisplayName(labels), 128),
+      state,
+      severity: trimRunes(severity, 32) || undefined,
+      startsAt,
+      labels: selectPriorityLabels(labels),
+      summary: trimRunes(annotations.summary || annotations.message, 200) || undefined,
+      description: trimRunes(annotations.description, 300) || undefined,
+      matchesScope: matchesScope || undefined,
+    },
+  };
+}
+
+function buildAlertEvidence(
+  rawAlerts: RawAlertmanagerAlert[],
+  scope: ScopeFilter | undefined,
+  includeOrgCritical: boolean,
+  pushWarning: PushWarningFn
+): {
+  alerts: AlertEvidenceItem[];
+  activeAlertsTotal: number;
+  coveredRuleUIDs: Set<string>;
+  coveredRuleNames: Set<string>;
+} {
+  let activeAlertsTotal = 0;
   const rankedAlerts: RankedAlert[] = [];
   for (const raw of rawAlerts) {
-    const labels = raw.labels ?? {};
-    const annotations = raw.annotations ?? {};
     const state = normalizeAlertState(raw.status?.state);
     if (state === 'active') {
       activeAlertsTotal++;
     }
-    const rawName = labels.alertname || '';
-    const alertName =
-      rawName === 'DatasourceNoData' || rawName === 'DatasourceError'
-        ? labels.rulename || rawName || 'UnnamedAlert'
-        : rawName || labels.rulename || 'UnnamedAlert';
-    const severity = labels.severity || labels.priority || '';
-    const matchesScope = matchesScopeLabels(labels, options.scope);
-
-    if (options.scope?.labelName && options.scope?.labelValue && !matchesScope) {
-      if (!(includeOrgCritical && state === 'active' && isCriticalSeverity(severity))) {
-        continue;
-      }
+    const ranked = toRankedAlert(raw, state, scope, includeOrgCritical);
+    if (ranked) {
+      rankedAlerts.push(ranked);
     }
-
-    let priority = 40;
-    if (state === 'active' && matchesScope && isCriticalSeverity(severity)) {
-      priority = 1;
-    } else if (state === 'active' && isCriticalSeverity(severity)) {
-      priority = 10;
-    } else if (state === 'active' && matchesScope) {
-      priority = 15;
-    } else if (state === 'active') {
-      priority = 20;
-    } else if (state === 'suppressed') {
-      priority = 30;
-    }
-
-    const parsedStartsAt = typeof raw.startsAt === 'string' ? Date.parse(raw.startsAt) : Number.NaN;
-    const startsAtMs = Number.isFinite(parsedStartsAt) ? parsedStartsAt : 0;
-    const startsAt =
-      Number.isFinite(parsedStartsAt) && Math.abs(parsedStartsAt) <= 8.64e15
-        ? new Date(parsedStartsAt).toISOString()
-        : undefined;
-
-    rankedAlerts.push({
-      priority,
-      startsAtMs,
-      rawRuleUid: labels.__alert_rule_uid__ ?? '',
-      rawAlertName: labels.alertname ?? '',
-      rawRuleName: labels.rulename ?? '',
-      item: {
-        alertName: trimRunes(alertName, 128),
-        state,
-        severity: trimRunes(severity, 32) || undefined,
-        startsAt,
-        labels: selectPriorityLabels(labels),
-        summary: trimRunes(annotations.summary || annotations.message, 200) || undefined,
-        description: trimRunes(annotations.description, 300) || undefined,
-        matchesScope: matchesScope || undefined,
-      },
-    });
   }
 
-  rankedAlerts.sort((a, b) => {
-    if (a.priority !== b.priority) {
-      return a.priority - b.priority;
-    }
-    return b.startsAtMs - a.startsAtMs;
-  });
+  rankedAlerts.sort((a, b) =>
+    a.priority !== b.priority ? a.priority - b.priority : b.startsAtMs - a.startsAtMs
+  );
 
   if (rankedAlerts.length > MAX_ALERT_EVIDENCE_ITEMS) {
     pushWarning(
@@ -478,18 +566,68 @@ export async function collectGrafanaAlertingEvidence(
     id: `ev-alert-${idx + 1}`,
     ...r.item,
   }));
+  return { alerts, activeAlertsTotal, coveredRuleUIDs, coveredRuleNames };
+}
 
-  // Extract abnormal alerting rules (skipping recording rules and deduplicating active alerts already covered).
+function isRuleCoveredByAlertmanager(
+  rule: RawPrometheusRule,
+  ruleName: string,
+  coveredRuleUIDs: Set<string>,
+  coveredRuleNames: Set<string>
+): boolean {
+  const ruleUID = rule.labels?.__alert_rule_uid__ ?? '';
+  const instanceCoveredByUID = (rule.alerts ?? []).some((inst) => {
+    const instUID = inst.labels?.__alert_rule_uid__ ?? '';
+    return instUID !== '' && coveredRuleUIDs.has(instUID);
+  });
+  const hasAnyUID =
+    ruleUID !== '' || (rule.alerts ?? []).some((inst) => Boolean(inst.labels?.__alert_rule_uid__));
+  return (
+    (ruleUID !== '' && coveredRuleUIDs.has(ruleUID)) ||
+    instanceCoveredByUID ||
+    (!hasAnyUID && coveredRuleNames.has(ruleName))
+  );
+}
+
+function computeRulePriority(
+  state: RuleEvidenceItem['state'],
+  health: RuleEvidenceItem['health']
+): number {
+  if (health === 'error') {
+    return 5;
+  }
+  if (state === 'firing') {
+    return 10;
+  }
+  if (health === 'nodata') {
+    return 15;
+  }
+  if (state === 'pending' || state === 'recovering') {
+    return 20;
+  }
+  return 30;
+}
+
+function buildRuleEvidence(
+  groups: NonNullable<NonNullable<RawPrometheusRulesResponse['data']>['groups']>,
+  coveredRuleUIDs: Set<string>,
+  coveredRuleNames: Set<string>,
+  scope: ScopeFilter | undefined,
+  includeOrgCritical: boolean,
+  pushWarning: PushWarningFn
+): {
+  rules: RuleEvidenceItem[];
+  totalRulesEvaluated: number;
+  abnormalRulesTotal: number;
+} {
   let totalRulesEvaluated = 0;
   let abnormalRulesTotal = 0;
   let rulesResponseTruncated = false;
   const candidateRules: Array<{ priority: number; item: Omit<RuleEvidenceItem, 'id'> }> = [];
 
-  const groups = rawRulesResp?.data?.groups ?? [];
   let inspected = 0;
   outerRulesLoop: for (const grp of groups) {
-    const groupRules = grp.rules ?? [];
-    for (const rule of groupRules) {
+    for (const rule of grp.rules ?? []) {
       if (inspected >= MAX_RULES_RESPONSE_ITEMS) {
         rulesResponseTruncated = true;
         break outerRulesLoop;
@@ -502,65 +640,31 @@ export async function collectGrafanaAlertingEvidence(
 
       const state = normalizeRuleState(rule.state);
       const health = normalizeRuleHealth(rule.health);
-      const isAbnormalState = state === 'firing' || state === 'recovering' || state === 'pending';
-      const isAbnormalHealth = health === 'error' || health === 'nodata' || health === 'unknown';
-      if (!isAbnormalState && !isAbnormalHealth) {
+      const isAbnormal =
+        state === 'firing' ||
+        state === 'recovering' ||
+        state === 'pending' ||
+        health === 'error' ||
+        health === 'nodata' ||
+        health === 'unknown';
+      if (!isAbnormal) {
         continue;
       }
       abnormalRulesTotal++;
 
-      const ruleName = trimRunes(rule.name, 128) || 'UnnamedRule';
-      const ruleUID = rule.labels?.__alert_rule_uid__ ?? '';
-      const instanceCoveredByUID = (rule.alerts ?? []).some((inst) => {
-        const instUID = inst.labels?.__alert_rule_uid__ ?? '';
-        return instUID !== '' && coveredRuleUIDs.has(instUID);
-      });
-      const hasAnyUID =
-        ruleUID !== '' || (rule.alerts ?? []).some((inst) => Boolean(inst.labels?.__alert_rule_uid__));
-      const alreadyInAlertmanager =
-        (ruleUID !== '' && coveredRuleUIDs.has(ruleUID)) ||
-        instanceCoveredByUID ||
-        (!hasAnyUID && coveredRuleNames.has(ruleName));
-
-      // Avoid double-counting healthy firing rules already covered by kept active /v2/alerts,
-      // while preserving error/nodata/pending/recovering rules and external-Alertmanager firing rules.
-      if (state === 'firing' && health === 'ok' && alreadyInAlertmanager) {
-        continue;
+      const candidate = evaluateAbnormalRule(
+        grp.name,
+        rule,
+        state,
+        health,
+        coveredRuleUIDs,
+        coveredRuleNames,
+        scope,
+        includeOrgCritical
+      );
+      if (candidate) {
+        candidateRules.push(candidate);
       }
-
-      const ruleMatchesScope =
-        matchesScopeLabels(rule.labels, options.scope) ||
-        (rule.alerts ?? []).some((inst) => matchesScopeLabels(inst.labels, options.scope));
-
-      if (options.scope?.labelName && options.scope?.labelValue && !ruleMatchesScope) {
-        if (!(includeOrgCritical && (health === 'error' || state === 'firing'))) {
-          continue;
-        }
-      }
-
-      let priority = 30;
-      if (health === 'error') {
-        priority = 5;
-      } else if (state === 'firing') {
-        priority = 10;
-      } else if (health === 'nodata') {
-        priority = 15;
-      } else if (state === 'pending' || state === 'recovering') {
-        priority = 20;
-      }
-
-      candidateRules.push({
-        priority,
-        item: {
-          ruleName,
-          group: trimRunes(grp.name, 100) || undefined,
-          state,
-          health,
-          lastError: trimRunes(rule.lastError, 240) || undefined,
-          activeAlertsCount: Array.isArray(rule.alerts) ? rule.alerts.length : 0,
-          matchesScope: ruleMatchesScope || undefined,
-        },
-      });
     }
   }
 
@@ -585,26 +689,51 @@ export async function collectGrafanaAlertingEvidence(
       id: `ev-rule-${idx + 1}`,
       ...r.item,
     }));
+  return { rules, totalRulesEvaluated, abnormalRulesTotal };
+}
 
-  const statusNotes: StatusNoteEvidenceItem[] = [];
-  if ((alertsChecked || rulesChecked) && alerts.length === 0 && rules.length === 0) {
-    statusNotes.push({
-      id: 'ev-status-1',
-      message: `Grafana Alerting checked: ${activeAlertsTotal} active alerts across ${totalRulesEvaluated} evaluated alerting rules (no abnormal alert states matched).`,
-    });
+function evaluateAbnormalRule(
+  groupName: string | undefined,
+  rule: RawPrometheusRule,
+  state: RuleEvidenceItem['state'],
+  health: RuleEvidenceItem['health'],
+  coveredRuleUIDs: Set<string>,
+  coveredRuleNames: Set<string>,
+  scope: ScopeFilter | undefined,
+  includeOrgCritical: boolean
+): { priority: number; item: Omit<RuleEvidenceItem, 'id'> } | null {
+  const ruleName = trimRunes(rule.name, 128) || 'UnnamedRule';
+  // Avoid double-counting healthy firing rules already covered by kept active /v2/alerts,
+  // while preserving error/nodata/pending/recovering rules and external-Alertmanager firing rules.
+  if (
+    state === 'firing' &&
+    health === 'ok' &&
+    isRuleCoveredByAlertmanager(rule, ruleName, coveredRuleUIDs, coveredRuleNames)
+  ) {
+    return null;
+  }
+
+  const ruleMatchesScope =
+    matchesScopeLabels(rule.labels, scope) ||
+    (rule.alerts ?? []).some((inst) => matchesScopeLabels(inst.labels, scope));
+
+  if (scope?.labelName && scope?.labelValue && !ruleMatchesScope) {
+    if (!(includeOrgCritical && (health === 'error' || state === 'firing'))) {
+      return null;
+    }
   }
 
   return {
-    alerts,
-    rules,
-    statusNotes,
-    warnings,
-    collectionStatus: {
-      alertsChecked,
-      rulesChecked,
-      totalRulesEvaluated,
-      activeAlertsTotal,
-      abnormalRulesTotal,
+    priority: computeRulePriority(state, health),
+    item: {
+      ruleName,
+      group: trimRunes(groupName, 100) || undefined,
+      state,
+      health,
+      lastError: trimRunes(rule.lastError, 240) || undefined,
+      activeAlertsCount: Array.isArray(rule.alerts) ? rule.alerts.length : 0,
+      matchesScope: ruleMatchesScope || undefined,
     },
   };
 }
+

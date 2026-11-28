@@ -297,8 +297,37 @@ func ValidateIR(doc DashboardIR, opts ValidateOptions) error {
 		maxPanels = DefaultMaxPanels
 	}
 
-	var issues []string
+	issues := validateDashboardMeta(doc)
 
+	if len(doc.Variables) > MaxVariables {
+		issues = append(issues, fmt.Sprintf("variables count %d exceeds max %d", len(doc.Variables), MaxVariables))
+	}
+	seenVars := make(map[string]bool, len(doc.Variables))
+	for i, v := range doc.Variables {
+		issues = append(issues, validateVariable(i, v, seenVars)...)
+	}
+
+	if len(doc.Panels) == 0 {
+		issues = append(issues, "panels must contain at least 1 panel")
+	}
+	if len(doc.Panels) > maxPanels {
+		issues = append(issues, fmt.Sprintf("panels count %d exceeds maxPanels %d", len(doc.Panels), maxPanels))
+	}
+
+	seenIDs := make(map[string]bool, len(doc.Panels))
+	occupiedCells := make(map[string]string, len(doc.Panels)*2)
+	for i, p := range doc.Panels {
+		issues = append(issues, validatePanel(i, p, seenIDs, occupiedCells)...)
+	}
+
+	if len(issues) > 0 {
+		return &ValidationError{Issues: issues}
+	}
+	return nil
+}
+
+func validateDashboardMeta(doc DashboardIR) []string {
+	var issues []string
 	if !allowedSchemaVersions[doc.SchemaVersion] {
 		issues = append(issues, fmt.Sprintf("schemaVersion %q is not allowed (allowed: 1.0, 1.1)", doc.SchemaVersion))
 	}
@@ -319,103 +348,96 @@ func ValidateIR(doc DashboardIR, opts ValidateOptions) error {
 	if doc.TimeRange.To != "now" {
 		issues = append(issues, fmt.Sprintf("timeRange.to must be %q, got %q", "now", doc.TimeRange.To))
 	}
+	return issues
+}
 
-	if len(doc.Variables) > MaxVariables {
-		issues = append(issues, fmt.Sprintf("variables count %d exceeds max %d", len(doc.Variables), MaxVariables))
-	}
-	seenVars := make(map[string]bool, len(doc.Variables))
-	for i, v := range doc.Variables {
-		issues = append(issues, validateVariable(i, v, seenVars)...)
-	}
-
-	if len(doc.Panels) == 0 {
-		issues = append(issues, "panels must contain at least 1 panel")
-	}
-	if len(doc.Panels) > maxPanels {
-		issues = append(issues, fmt.Sprintf("panels count %d exceeds maxPanels %d", len(doc.Panels), maxPanels))
+func validatePanel(idx int, p PanelIR, seenIDs map[string]bool, occupiedCells map[string]string) []string {
+	var issues []string
+	prefix := fmt.Sprintf("panels[%d]", idx)
+	if !panelIDPattern.MatchString(p.ID) {
+		issues = append(issues, fmt.Sprintf("%s.id %q violates pattern", prefix, p.ID))
+	} else if seenIDs[p.ID] {
+		issues = append(issues, fmt.Sprintf("%s.id %q is duplicated", prefix, p.ID))
+	} else {
+		seenIDs[p.ID] = true
 	}
 
-	seenIDs := make(map[string]bool, len(doc.Panels))
-	occupiedCells := make(map[string]string, len(doc.Panels)*2)
-
-	for i, p := range doc.Panels {
-		prefix := fmt.Sprintf("panels[%d]", i)
-		if !panelIDPattern.MatchString(p.ID) {
-			issues = append(issues, fmt.Sprintf("%s.id %q violates pattern", prefix, p.ID))
-		} else if seenIDs[p.ID] {
-			issues = append(issues, fmt.Sprintf("%s.id %q is duplicated", prefix, p.ID))
-		} else {
-			seenIDs[p.ID] = true
-		}
-
-		if !allowedPanelTypes[p.Type] {
-			issues = append(issues, fmt.Sprintf("%s.type %q is not allowed", prefix, p.Type))
-		}
-		if err := validatePlainText(prefix+".title", p.Title, 1, MaxPanelTitleLen); err != nil {
+	if !allowedPanelTypes[p.Type] {
+		issues = append(issues, fmt.Sprintf("%s.type %q is not allowed", prefix, p.Type))
+	}
+	if err := validatePlainText(prefix+".title", p.Title, 1, MaxPanelTitleLen); err != nil {
+		issues = append(issues, err.Error())
+	}
+	if p.Description != "" {
+		if err := validatePlainText(prefix+".description", p.Description, 0, MaxPanelDescLen); err != nil {
 			issues = append(issues, err.Error())
 		}
-		if p.Description != "" {
-			if err := validatePlainText(prefix+".description", p.Description, 0, MaxPanelDescLen); err != nil {
-				issues = append(issues, err.Error())
-			}
-		}
-		if p.DatasourceRef != SelectedDatasourceRef {
-			issues = append(issues, fmt.Sprintf("%s.datasourceRef must be %q, got %q", prefix, SelectedDatasourceRef, p.DatasourceRef))
-		}
-
-		issues = append(issues, validatePanelQueries(prefix, p)...)
-
-		if !allowedUnits[p.Unit] {
-			issues = append(issues, fmt.Sprintf("%s.unit %q is not in allowlist", prefix, p.Unit))
-		}
-		if len(p.Thresholds) > MaxThresholds {
-			issues = append(issues, fmt.Sprintf("%s.thresholds count %d exceeds limit %d", prefix, len(p.Thresholds), MaxThresholds))
-		}
-		prevVal := math.Inf(-1)
-		for ti, th := range p.Thresholds {
-			if math.IsNaN(th.Value) || math.IsInf(th.Value, 0) || th.Value < -1e9 || th.Value > 1e9 {
-				issues = append(issues, fmt.Sprintf("%s.thresholds[%d].value out of range", prefix, ti))
-			}
-			if th.Value < prevVal {
-				issues = append(issues, fmt.Sprintf("%s.thresholds must be sorted ascending", prefix))
-			}
-			prevVal = th.Value
-			if !allowedThresholdColors[th.Color] {
-				issues = append(issues, fmt.Sprintf("%s.thresholds[%d].color %q is not allowed", prefix, ti, th.Color))
-			}
-		}
-		if p.Layout.Row < 0 || p.Layout.Row > 5 {
-			issues = append(issues, fmt.Sprintf("%s.layout.row %d out of range 0..5", prefix, p.Layout.Row))
-		}
-		if p.Layout.Col != 0 && p.Layout.Col != 1 {
-			issues = append(issues, fmt.Sprintf("%s.layout.col %d must be 0 or 1", prefix, p.Layout.Col))
-		}
-		if !allowedWidths[p.Layout.Width] {
-			issues = append(issues, fmt.Sprintf("%s.layout.width %q must be half or full", prefix, p.Layout.Width))
-		}
-		if p.Layout.Width == "full" && p.Layout.Col != 0 {
-			issues = append(issues, fmt.Sprintf("%s.layout.col must be 0 when width is full", prefix))
-		}
-		if p.Layout.Row >= 0 && p.Layout.Row <= 5 && (p.Layout.Col == 0 || p.Layout.Col == 1) && allowedWidths[p.Layout.Width] {
-			cols := []int{p.Layout.Col}
-			if p.Layout.Width == "full" {
-				cols = []int{0, 1}
-			}
-			for _, c := range cols {
-				key := fmt.Sprintf("%d:%d", p.Layout.Row, c)
-				if other, exists := occupiedCells[key]; exists {
-					issues = append(issues, fmt.Sprintf("%s.layout overlaps with panel %q at row=%d col=%d", prefix, other, p.Layout.Row, c))
-				} else {
-					occupiedCells[key] = p.ID
-				}
-			}
-		}
+	}
+	if p.DatasourceRef != SelectedDatasourceRef {
+		issues = append(issues, fmt.Sprintf("%s.datasourceRef must be %q, got %q", prefix, SelectedDatasourceRef, p.DatasourceRef))
 	}
 
-	if len(issues) > 0 {
-		return &ValidationError{Issues: issues}
+	issues = append(issues, validatePanelQueries(prefix, p)...)
+
+	if !allowedUnits[p.Unit] {
+		issues = append(issues, fmt.Sprintf("%s.unit %q is not in allowlist", prefix, p.Unit))
 	}
-	return nil
+	issues = append(issues, validatePanelThresholds(prefix, p.Thresholds)...)
+	issues = append(issues, validatePanelLayout(prefix, p.ID, p.Layout, occupiedCells)...)
+	return issues
+}
+
+func validatePanelThresholds(prefix string, thresholds []ThresholdIR) []string {
+	var issues []string
+	if len(thresholds) > MaxThresholds {
+		issues = append(issues, fmt.Sprintf("%s.thresholds count %d exceeds limit %d", prefix, len(thresholds), MaxThresholds))
+	}
+	prevVal := math.Inf(-1)
+	for ti, th := range thresholds {
+		if math.IsNaN(th.Value) || math.IsInf(th.Value, 0) || th.Value < -1e9 || th.Value > 1e9 {
+			issues = append(issues, fmt.Sprintf("%s.thresholds[%d].value out of range", prefix, ti))
+		}
+		if th.Value < prevVal {
+			issues = append(issues, fmt.Sprintf("%s.thresholds must be sorted ascending", prefix))
+		}
+		prevVal = th.Value
+		if !allowedThresholdColors[th.Color] {
+			issues = append(issues, fmt.Sprintf("%s.thresholds[%d].color %q is not allowed", prefix, ti, th.Color))
+		}
+	}
+	return issues
+}
+
+func validatePanelLayout(prefix, panelID string, layout LayoutHint, occupiedCells map[string]string) []string {
+	var issues []string
+	if layout.Row < 0 || layout.Row > 5 {
+		issues = append(issues, fmt.Sprintf("%s.layout.row %d out of range 0..5", prefix, layout.Row))
+	}
+	if layout.Col != 0 && layout.Col != 1 {
+		issues = append(issues, fmt.Sprintf("%s.layout.col %d must be 0 or 1", prefix, layout.Col))
+	}
+	if !allowedWidths[layout.Width] {
+		issues = append(issues, fmt.Sprintf("%s.layout.width %q must be half or full", prefix, layout.Width))
+	}
+	if layout.Width == "full" && layout.Col != 0 {
+		issues = append(issues, fmt.Sprintf("%s.layout.col must be 0 when width is full", prefix))
+	}
+	if layout.Row < 0 || layout.Row > 5 || (layout.Col != 0 && layout.Col != 1) || !allowedWidths[layout.Width] {
+		return issues
+	}
+	cols := []int{layout.Col}
+	if layout.Width == "full" {
+		cols = []int{0, 1}
+	}
+	for _, c := range cols {
+		key := fmt.Sprintf("%d:%d", layout.Row, c)
+		if other, exists := occupiedCells[key]; exists {
+			issues = append(issues, fmt.Sprintf("%s.layout overlaps with panel %q at row=%d col=%d", prefix, other, layout.Row, c))
+		} else {
+			occupiedCells[key] = panelID
+		}
+	}
+	return issues
 }
 
 func validatePanelQueries(prefix string, p PanelIR) []string {
@@ -499,51 +521,62 @@ func validateVariable(idx int, v VariableIR, seen map[string]bool) []string {
 
 	switch v.Type {
 	case "query":
-		if v.DatasourceRef != SelectedDatasourceRef {
-			issues = append(issues, fmt.Sprintf("%s.datasourceRef must be %q for query variable, got %q", prefix, SelectedDatasourceRef, v.DatasourceRef))
-		}
-		if !labelNamePattern.MatchString(v.LabelName) || v.LabelName == "__name__" {
-			issues = append(issues, fmt.Sprintf("%s.labelName %q is invalid for query variable", prefix, v.LabelName))
-		}
-		if v.MetricName != "" && !metricPattern.MatchString(v.MetricName) {
-			issues = append(issues, fmt.Sprintf("%s.metricName %q violates Prometheus metric pattern", prefix, v.MetricName))
-		}
-		if len(v.Options) > 0 {
-			issues = append(issues, fmt.Sprintf("%s.options must not be set on query variable", prefix))
-		}
-		if err := validateVariableValue(prefix+".defaultValue", v.DefaultValue, 1, MaxVariableDefaultLen, false); err != nil {
-			issues = append(issues, err.Error())
-		}
-
+		issues = append(issues, validateQueryVariable(prefix, v)...)
 	case "custom":
-		if v.DatasourceRef != "" {
-			issues = append(issues, fmt.Sprintf("%s.datasourceRef must be empty for custom variable", prefix))
-		}
-		if v.LabelName != "" || v.MetricName != "" {
-			issues = append(issues, fmt.Sprintf("%s.labelName and metricName must be empty for custom variable", prefix))
-		}
-		if len(v.Options) == 0 || len(v.Options) > MaxVariableOptions {
-			issues = append(issues, fmt.Sprintf("%s.options count %d must be between 1 and %d", prefix, len(v.Options), MaxVariableOptions))
-		}
-		optSeen := make(map[string]bool, len(v.Options))
-		for oi, opt := range v.Options {
-			if err := validateVariableValue(fmt.Sprintf("%s.options[%d]", prefix, oi), opt, 1, MaxVariableOptionLen, true); err != nil {
-				issues = append(issues, err.Error())
-			}
-			if optSeen[opt] {
-				issues = append(issues, fmt.Sprintf("%s.options[%d] %q is duplicated", prefix, oi, opt))
-			}
-			optSeen[opt] = true
-		}
-		if v.DefaultValue != "" {
-			if err := validateVariableValue(prefix+".defaultValue", v.DefaultValue, 1, MaxVariableDefaultLen, true); err != nil {
-				issues = append(issues, err.Error())
-			} else if !optSeen[v.DefaultValue] {
-				issues = append(issues, fmt.Sprintf("%s.defaultValue %q must be one of custom options", prefix, v.DefaultValue))
-			}
-		}
+		issues = append(issues, validateCustomVariable(prefix, v)...)
 	}
 
+	return issues
+}
+
+func validateQueryVariable(prefix string, v VariableIR) []string {
+	var issues []string
+	if v.DatasourceRef != SelectedDatasourceRef {
+		issues = append(issues, fmt.Sprintf("%s.datasourceRef must be %q for query variable, got %q", prefix, SelectedDatasourceRef, v.DatasourceRef))
+	}
+	if !labelNamePattern.MatchString(v.LabelName) || v.LabelName == "__name__" {
+		issues = append(issues, fmt.Sprintf("%s.labelName %q is invalid for query variable", prefix, v.LabelName))
+	}
+	if v.MetricName != "" && !metricPattern.MatchString(v.MetricName) {
+		issues = append(issues, fmt.Sprintf("%s.metricName %q violates Prometheus metric pattern", prefix, v.MetricName))
+	}
+	if len(v.Options) > 0 {
+		issues = append(issues, fmt.Sprintf("%s.options must not be set on query variable", prefix))
+	}
+	if err := validateVariableValue(prefix+".defaultValue", v.DefaultValue, 1, MaxVariableDefaultLen, false); err != nil {
+		issues = append(issues, err.Error())
+	}
+	return issues
+}
+
+func validateCustomVariable(prefix string, v VariableIR) []string {
+	var issues []string
+	if v.DatasourceRef != "" {
+		issues = append(issues, fmt.Sprintf("%s.datasourceRef must be empty for custom variable", prefix))
+	}
+	if v.LabelName != "" || v.MetricName != "" {
+		issues = append(issues, fmt.Sprintf("%s.labelName and metricName must be empty for custom variable", prefix))
+	}
+	if len(v.Options) == 0 || len(v.Options) > MaxVariableOptions {
+		issues = append(issues, fmt.Sprintf("%s.options count %d must be between 1 and %d", prefix, len(v.Options), MaxVariableOptions))
+	}
+	optSeen := make(map[string]bool, len(v.Options))
+	for oi, opt := range v.Options {
+		if err := validateVariableValue(fmt.Sprintf("%s.options[%d]", prefix, oi), opt, 1, MaxVariableOptionLen, true); err != nil {
+			issues = append(issues, err.Error())
+		}
+		if optSeen[opt] {
+			issues = append(issues, fmt.Sprintf("%s.options[%d] %q is duplicated", prefix, oi, opt))
+		}
+		optSeen[opt] = true
+	}
+	if v.DefaultValue != "" {
+		if err := validateVariableValue(prefix+".defaultValue", v.DefaultValue, 1, MaxVariableDefaultLen, true); err != nil {
+			issues = append(issues, err.Error())
+		} else if !optSeen[v.DefaultValue] {
+			issues = append(issues, fmt.Sprintf("%s.defaultValue %q must be one of custom options", prefix, v.DefaultValue))
+		}
+	}
 	return issues
 }
 

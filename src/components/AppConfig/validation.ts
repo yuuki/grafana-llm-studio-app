@@ -219,16 +219,7 @@ export interface AppConfigValidationInput {
 
 export type TranslateFn = (key: TranslationKey, vars?: Record<string, string | number>) => string;
 
-export function validateAppConfig(input: AppConfigValidationInput, t: TranslateFn): string | null {
-  if (input.llmMode === 'mock' && !input.allowMockInDev) {
-    return t('appConfig.validation.allowMockRequired');
-  }
-  if (
-    input.isTokenConfigured &&
-    canonicalGrafanaUrlForCompare(input.grafanaUrl) !== canonicalGrafanaUrlForCompare(input.savedGrafanaUrl)
-  ) {
-    return t('appConfig.validation.saTokenReentryRequired');
-  }
+function validateNumericRanges(input: AppConfigValidationInput, t: TranslateFn): string | null {
   const checks: Array<[string, number, number, number]> = [
     [t('appConfig.validation.fields.maxPanels'), input.maxPanels, 1, 6],
     [t('appConfig.validation.fields.maxRepairAttempts'), input.maxRepairAttempts, 0, 2],
@@ -248,64 +239,91 @@ export function validateAppConfig(input: AppConfigValidationInput, t: TranslateF
       return t('appConfig.validation.numberRange', { label, min: minVal, max: maxVal });
     }
   }
+  return null;
+}
+
+function validateRedisConfig(input: AppConfigValidationInput, t: TranslateFn): string | null {
+  if (!isValidRedisHostPort(input.redisAddr)) {
+    return t('appConfig.validation.redisAddrRequired');
+  }
+  const trimmedPrefix = input.redisKeyPrefix.trim();
+  if (trimmedPrefix && !REDIS_KEY_PREFIX_RE.test(trimmedPrefix)) {
+    return t('appConfig.validation.redisKeyPrefixInvalid');
+  }
+  if (utf8ByteLength(input.redisUsername.trim()) > 128) {
+    return t('appConfig.validation.redisUsernameTooLong');
+  }
+  if (
+    input.isRedisPasswordConfigured &&
+    (canonicalRedisAddrForCompare(input.redisAddr) !== canonicalRedisAddrForCompare(input.savedRedisAddr) ||
+      input.redisTls !== input.savedRedisTls)
+  ) {
+    return t('appConfig.validation.redisPasswordReentryRequired');
+  }
+  return null;
+}
+
+function validatePostgresConfig(input: AppConfigValidationInput, t: TranslateFn): string | null {
+  if (!isValidRedisHostPort(input.postgresAddr)) {
+    return t('appConfig.validation.postgresAddrRequired');
+  }
+  const trimmedDb = input.postgresDatabase.trim();
+  if (!trimmedDb || utf8ByteLength(trimmedDb) > 63 || hasForbiddenTextChar(trimmedDb, true)) {
+    return t('appConfig.validation.postgresDatabaseRequired');
+  }
+  const trimmedUser = input.postgresUsername.trim();
+  if (!trimmedUser || utf8ByteLength(trimmedUser) > 128 || hasForbiddenTextChar(trimmedUser, false)) {
+    return t('appConfig.validation.postgresUsernameRequired');
+  }
+  const trimmedSchema = input.postgresSchema.trim();
+  if (
+    trimmedSchema &&
+    (!POSTGRES_SCHEMA_RE.test(trimmedSchema) ||
+      trimmedSchema.startsWith('pg_') ||
+      trimmedSchema === 'information_schema')
+  ) {
+    return t('appConfig.validation.postgresSchemaInvalid');
+  }
+  const trimmedTablePrefix = input.postgresTablePrefix.trim();
+  if (trimmedTablePrefix && !POSTGRES_TABLE_PREFIX_RE.test(trimmedTablePrefix)) {
+    return t('appConfig.validation.postgresTablePrefixInvalid');
+  }
+  if (!ALLOWED_POSTGRES_SSL_MODES.has(input.postgresSslMode)) {
+    return t('appConfig.validation.postgresSslModeInvalid');
+  }
+  if (
+    input.isPostgresPasswordConfigured &&
+    (canonicalRedisAddrForCompare(input.postgresAddr) !== canonicalRedisAddrForCompare(input.savedPostgresAddr) ||
+      input.postgresSslMode !== input.savedPostgresSslMode)
+  ) {
+    return t('appConfig.validation.postgresPasswordReentryRequired');
+  }
+  return null;
+}
+
+export function validateAppConfig(input: AppConfigValidationInput, t: TranslateFn): string | null {
+  if (input.llmMode === 'mock' && !input.allowMockInDev) {
+    return t('appConfig.validation.allowMockRequired');
+  }
+  if (
+    input.isTokenConfigured &&
+    canonicalGrafanaUrlForCompare(input.grafanaUrl) !== canonicalGrafanaUrlForCompare(input.savedGrafanaUrl)
+  ) {
+    return t('appConfig.validation.saTokenReentryRequired');
+  }
+  const numericErr = validateNumericRanges(input, t);
+  if (numericErr) {
+    return numericErr;
+  }
   const normalizedEffort = input.reasoningEffort.trim().toLowerCase();
   if (!['', 'low', 'medium', 'high'].includes(normalizedEffort)) {
     return t('appConfig.validation.reasoningEffort');
   }
   if (input.jobStoreBackend === 'redis') {
-    if (!isValidRedisHostPort(input.redisAddr)) {
-      return t('appConfig.validation.redisAddrRequired');
-    }
-    const trimmedPrefix = input.redisKeyPrefix.trim();
-    if (trimmedPrefix && !REDIS_KEY_PREFIX_RE.test(trimmedPrefix)) {
-      return t('appConfig.validation.redisKeyPrefixInvalid');
-    }
-    if (utf8ByteLength(input.redisUsername.trim()) > 128) {
-      return t('appConfig.validation.redisUsernameTooLong');
-    }
-    if (
-      input.isRedisPasswordConfigured &&
-      (canonicalRedisAddrForCompare(input.redisAddr) !== canonicalRedisAddrForCompare(input.savedRedisAddr) ||
-        input.redisTls !== input.savedRedisTls)
-    ) {
-      return t('appConfig.validation.redisPasswordReentryRequired');
-    }
+    return validateRedisConfig(input, t);
   }
   if (input.jobStoreBackend === 'postgres') {
-    if (!isValidRedisHostPort(input.postgresAddr)) {
-      return t('appConfig.validation.postgresAddrRequired');
-    }
-    const trimmedDb = input.postgresDatabase.trim();
-    if (!trimmedDb || utf8ByteLength(trimmedDb) > 63 || hasForbiddenTextChar(trimmedDb, true)) {
-      return t('appConfig.validation.postgresDatabaseRequired');
-    }
-    const trimmedUser = input.postgresUsername.trim();
-    if (!trimmedUser || utf8ByteLength(trimmedUser) > 128 || hasForbiddenTextChar(trimmedUser, false)) {
-      return t('appConfig.validation.postgresUsernameRequired');
-    }
-    const trimmedSchema = input.postgresSchema.trim();
-    if (
-      trimmedSchema &&
-      (!POSTGRES_SCHEMA_RE.test(trimmedSchema) ||
-        trimmedSchema.startsWith('pg_') ||
-        trimmedSchema === 'information_schema')
-    ) {
-      return t('appConfig.validation.postgresSchemaInvalid');
-    }
-    const trimmedTablePrefix = input.postgresTablePrefix.trim();
-    if (trimmedTablePrefix && !POSTGRES_TABLE_PREFIX_RE.test(trimmedTablePrefix)) {
-      return t('appConfig.validation.postgresTablePrefixInvalid');
-    }
-    if (!ALLOWED_POSTGRES_SSL_MODES.has(input.postgresSslMode)) {
-      return t('appConfig.validation.postgresSslModeInvalid');
-    }
-    if (
-      input.isPostgresPasswordConfigured &&
-      (canonicalRedisAddrForCompare(input.postgresAddr) !== canonicalRedisAddrForCompare(input.savedPostgresAddr) ||
-        input.postgresSslMode !== input.savedPostgresSslMode)
-    ) {
-      return t('appConfig.validation.postgresPasswordReentryRequired');
-    }
+    return validatePostgresConfig(input, t);
   }
   return null;
 }

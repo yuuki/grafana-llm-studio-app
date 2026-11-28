@@ -263,17 +263,81 @@ func (r *Runner) runScenario(ctx context.Context, sc Scenario, iteration int) Ca
 	boundedCatalog := prompt.BoundCatalog(sc.Catalog)
 	qKind, kindErr := query.ParseKind(sc.QueryKind)
 	if kindErr != nil {
-		res.FailureStage = "setup"
-		res.FailureDetail = kindErr.Error()
-		return res
+		return failCase(res, "setup", kindErr.Error())
 	}
 	adapter, adapterErr := r.registry.Get(qKind)
 	if adapterErr != nil {
-		res.FailureStage = "setup"
-		res.FailureDetail = adapterErr.Error()
+		return failCase(res, "setup", adapterErr.Error())
+	}
+
+	raw, meta, latencyMs, stage, detail := r.invokeScenarioLLM(ctx, sc, safeScope, boundedCatalog, maxPanels, qKind, adapter)
+	res.LatencyMs = latencyMs
+	res.Meta = meta
+	if stage != "" {
+		return failCase(res, stage, detail)
+	}
+
+	finalDoc, patchPtr, diffs, ok := decodeAndApplyScenarioOutput(sc, raw, maxPanels, &res)
+	if !ok {
 		return res
 	}
 
+	if qKind != query.KindPromQL {
+		finalDoc.StampQueryKind(string(qKind))
+	}
+	res.PanelCount = len(finalDoc.Panels)
+	res.GeneratedExprs = collectGeneratedExprs(finalDoc)
+
+	warnings, valErr := query.ValidateDashboardIR(
+		adapter,
+		finalDoc,
+		boundedCatalog,
+		safeScope,
+		ir.ValidateOptions{MaxPanels: maxPanels},
+		query.ValidateOptions{RequireCatalogMatch: true},
+	)
+	if valErr != nil {
+		return failCase(res, "ir_promql_validate", valErr.Error())
+	}
+	res.IRPromQLValid = true
+	res.Warnings = warnings
+
+	if sc.CheckAdherence != nil {
+		if adhErr := sc.CheckAdherence(finalDoc, patchPtr, diffs); adhErr != nil {
+			return failCase(res, "adherence", adhErr.Error())
+		}
+	}
+	res.AdherencePassed = true
+
+	if strings.TrimSpace(r.cfg.PrometheusURL) != "" {
+		res.PrometheusChecked = true
+		nonEmpty, execErr := r.validateAgainstPrometheus(ctx, finalDoc, adapter)
+		res.PrometheusNonEmptyPanels = nonEmpty
+		if execErr != nil {
+			return failCase(res, "prometheus_exec", execErr.Error())
+		}
+		res.PrometheusExecPassed = true
+	}
+
+	res.Passed = true
+	return res
+}
+
+func failCase(res CaseResult, stage, detail string) CaseResult {
+	res.FailureStage = stage
+	res.FailureDetail = detail
+	return res
+}
+
+func (r *Runner) invokeScenarioLLM(
+	ctx context.Context,
+	sc Scenario,
+	safeScope *ir.ScopeFilter,
+	boundedCatalog []ir.MetricCatalogItem,
+	maxPanels int,
+	qKind query.Kind,
+	adapter query.Adapter,
+) ([]byte, llm.CompletionMeta, int64, string, string) {
 	start := time.Now()
 	var (
 		raw  []byte
@@ -293,9 +357,7 @@ func (r *Runner) runScenario(ctx context.Context, sc Scenario, iteration int) Ca
 		})
 	case KindPatch:
 		if sc.BaseIR == nil {
-			res.FailureStage = "setup"
-			res.FailureDetail = "patch scenario missing BaseIR"
-			return res
+			return nil, llm.CompletionMeta{}, 0, "setup", "patch scenario missing BaseIR"
 		}
 		raw, meta, err = r.client.GeneratePatch(ctx, llm.PatchRequest{
 			CurrentIR:     sc.BaseIR.Clone(),
@@ -308,9 +370,7 @@ func (r *Runner) runScenario(ctx context.Context, sc Scenario, iteration int) Ca
 		})
 	case KindRepair:
 		if sc.BaseIR == nil || len(sc.RepairTargets) == 0 {
-			res.FailureStage = "setup"
-			res.FailureDetail = "repair scenario missing BaseIR or RepairTargets"
-			return res
+			return nil, llm.CompletionMeta{}, 0, "setup", "repair scenario missing BaseIR or RepairTargets"
 		}
 		raw, meta, err = r.client.RepairPanels(ctx, llm.RepairRequest{
 			CurrentIR:    sc.BaseIR.Clone(),
@@ -321,168 +381,146 @@ func (r *Runner) runScenario(ctx context.Context, sc Scenario, iteration int) Ca
 			DialectRules: adapter.PromptRules(),
 		})
 	default:
-		res.FailureStage = "setup"
-		res.FailureDetail = fmt.Sprintf("unsupported scenario kind %q", sc.Kind)
-		return res
+		return nil, llm.CompletionMeta{}, 0, "setup", fmt.Sprintf("unsupported scenario kind %q", sc.Kind)
 	}
 
-	res.LatencyMs = time.Since(start).Milliseconds()
-	res.Meta = meta
+	latencyMs := time.Since(start).Milliseconds()
 	if err != nil {
+		stage := "llm_call"
 		if errors.Is(err, llm.ErrOutputTruncated) || errors.Is(err, llm.ErrOutputRefused) {
-			res.FailureStage = "finish_reason"
-		} else {
-			res.FailureStage = "llm_call"
+			stage = "finish_reason"
 		}
-		res.FailureDetail = err.Error()
-		return res
+		return nil, meta, latencyMs, stage, err.Error()
 	}
+	return raw, meta, latencyMs, "", ""
+}
 
-	var (
-		finalDoc ir.DashboardIR
-		patchPtr *ir.DashboardPatch
-		diffs    []ir.DiffEntry
-	)
-
+func decodeAndApplyScenarioOutput(
+	sc Scenario,
+	raw []byte,
+	maxPanels int,
+	res *CaseResult,
+) (ir.DashboardIR, *ir.DashboardPatch, []ir.DiffEntry, bool) {
 	switch sc.Kind {
 	case KindGenerate:
 		doc, decErr := ir.DecodeStrictIR(raw)
 		if decErr != nil {
 			res.FailureStage = "json_decode"
 			res.FailureDetail = decErr.Error()
-			return res
+			return ir.DashboardIR{}, nil, nil, false
 		}
 		res.JSONValid = true
 		doc.Revision = 1
-		finalDoc = doc
+		return doc, nil, nil, true
 
 	case KindPatch:
-		patch, decErr := ir.DecodeStrictPatch(raw)
-		if decErr != nil {
-			res.FailureStage = "json_decode"
-			res.FailureDetail = decErr.Error()
-			return res
-		}
-		res.JSONValid = true
-		patchPtr = &patch
-
-		if targetID := strings.TrimSpace(sc.TargetPanelID); targetID != "" {
-			for _, op := range patch.Operations {
-				if op.Op != "update_panel" || op.PanelID != targetID {
-					res.FailureStage = "patch_guard"
-					res.FailureDetail = fmt.Sprintf("targeted patch (%s) violated by op %s:%s", targetID, op.Op, op.PanelID)
-					return res
-				}
-			}
-		}
-
-		nextIR, appliedDiffs, applyErr := ir.ApplyPatch(sc.BaseIR.Clone(), patch, ir.ValidateOptions{MaxPanels: maxPanels})
-		if applyErr != nil {
-			res.FailureStage = "ir_apply"
-			res.FailureDetail = applyErr.Error()
-			return res
-		}
-		finalDoc = nextIR
-		diffs = appliedDiffs
+		return decodeAndApplyPatchScenario(sc, raw, maxPanels, res)
 
 	case KindRepair:
-		patch, decErr := ir.DecodeStrictPatch(raw)
-		if decErr != nil {
-			res.FailureStage = "json_decode"
-			res.FailureDetail = decErr.Error()
-			return res
-		}
-		res.JSONValid = true
-		patchPtr = &patch
+		return decodeAndApplyRepairScenario(sc, raw, maxPanels, res)
 
-		allowedTargetIDs := make(map[string]bool, len(sc.RepairTargets))
-		for _, t := range sc.RepairTargets {
-			allowedTargetIDs[t.PanelID] = true
-		}
+	default:
+		res.FailureStage = "setup"
+		res.FailureDetail = fmt.Sprintf("unsupported scenario kind %q", sc.Kind)
+		return ir.DashboardIR{}, nil, nil, false
+	}
+}
+
+func decodeAndApplyPatchScenario(
+	sc Scenario,
+	raw []byte,
+	maxPanels int,
+	res *CaseResult,
+) (ir.DashboardIR, *ir.DashboardPatch, []ir.DiffEntry, bool) {
+	patch, decErr := ir.DecodeStrictPatch(raw)
+	if decErr != nil {
+		res.FailureStage = "json_decode"
+		res.FailureDetail = decErr.Error()
+		return ir.DashboardIR{}, nil, nil, false
+	}
+	res.JSONValid = true
+
+	if targetID := strings.TrimSpace(sc.TargetPanelID); targetID != "" {
 		for _, op := range patch.Operations {
-			if op.Op != "update_panel" || !allowedTargetIDs[op.PanelID] || op.Panel == nil || (op.Panel.Query == nil && op.Panel.Queries == nil) {
+			if op.Op != "update_panel" || op.PanelID != targetID {
 				res.FailureStage = "patch_guard"
-				res.FailureDetail = fmt.Sprintf("repair patch contained disallowed op/panel (%s:%s)", op.Op, op.PanelID)
-				return res
-			}
-			p := op.Panel
-			if p.DatasourceRef != "" && p.DatasourceRef != ir.SelectedDatasourceRef {
-				res.FailureStage = "patch_guard"
-				res.FailureDetail = fmt.Sprintf("repair patch attempted to alter datasourceRef to %q", p.DatasourceRef)
-				return res
-			}
-			if p.Type != "" || p.Title != "" || p.Description != nil || p.Unit != "" || p.Thresholds != nil || p.Layout != nil {
-				res.FailureStage = "patch_guard"
-				res.FailureDetail = "repair patch must modify query only (non-query panel fields were set)"
-				return res
+				res.FailureDetail = fmt.Sprintf("targeted patch (%s) violated by op %s:%s", targetID, op.Op, op.PanelID)
+				return ir.DashboardIR{}, nil, nil, false
 			}
 		}
+	}
 
-		nextIR, appliedDiffs, applyErr := ir.ApplyPatch(sc.BaseIR.Clone(), patch, ir.ValidateOptions{MaxPanels: maxPanels})
-		if applyErr != nil {
-			res.FailureStage = "ir_apply"
-			res.FailureDetail = applyErr.Error()
-			return res
+	nextIR, appliedDiffs, applyErr := ir.ApplyPatch(sc.BaseIR.Clone(), patch, ir.ValidateOptions{MaxPanels: maxPanels})
+	if applyErr != nil {
+		res.FailureStage = "ir_apply"
+		res.FailureDetail = applyErr.Error()
+		return ir.DashboardIR{}, nil, nil, false
+	}
+	return nextIR, &patch, appliedDiffs, true
+}
+
+func decodeAndApplyRepairScenario(
+	sc Scenario,
+	raw []byte,
+	maxPanels int,
+	res *CaseResult,
+) (ir.DashboardIR, *ir.DashboardPatch, []ir.DiffEntry, bool) {
+	patch, decErr := ir.DecodeStrictPatch(raw)
+	if decErr != nil {
+		res.FailureStage = "json_decode"
+		res.FailureDetail = decErr.Error()
+		return ir.DashboardIR{}, nil, nil, false
+	}
+	res.JSONValid = true
+
+	if detail := checkRepairPatchGuard(sc.RepairTargets, patch.Operations); detail != "" {
+		res.FailureStage = "patch_guard"
+		res.FailureDetail = detail
+		return ir.DashboardIR{}, nil, nil, false
+	}
+
+	nextIR, appliedDiffs, applyErr := ir.ApplyPatch(sc.BaseIR.Clone(), patch, ir.ValidateOptions{MaxPanels: maxPanels})
+	if applyErr != nil {
+		res.FailureStage = "ir_apply"
+		res.FailureDetail = applyErr.Error()
+		return ir.DashboardIR{}, nil, nil, false
+	}
+	return nextIR, &patch, appliedDiffs, true
+}
+
+func checkRepairPatchGuard(targets []prompt.RepairTarget, ops []ir.PatchOperation) string {
+	allowedTargetIDs := make(map[string]bool, len(targets))
+	for _, t := range targets {
+		allowedTargetIDs[t.PanelID] = true
+	}
+	for _, op := range ops {
+		if op.Op != "update_panel" || !allowedTargetIDs[op.PanelID] || op.Panel == nil || (op.Panel.Query == nil && op.Panel.Queries == nil) {
+			return fmt.Sprintf("repair patch contained disallowed op/panel (%s:%s)", op.Op, op.PanelID)
 		}
-		finalDoc = nextIR
-		diffs = appliedDiffs
+		p := op.Panel
+		if p.DatasourceRef != "" && p.DatasourceRef != ir.SelectedDatasourceRef {
+			return fmt.Sprintf("repair patch attempted to alter datasourceRef to %q", p.DatasourceRef)
+		}
+		if p.Type != "" || p.Title != "" || p.Description != nil || p.Unit != "" || p.Thresholds != nil || p.Layout != nil {
+			return "repair patch must modify query only (non-query panel fields were set)"
+		}
 	}
+	return ""
+}
 
-	if qKind != query.KindPromQL {
-		finalDoc.StampQueryKind(string(qKind))
-	}
-	res.PanelCount = len(finalDoc.Panels)
-	res.GeneratedExprs = make([]string, 0, len(finalDoc.Panels))
-	for _, p := range finalDoc.Panels {
+func collectGeneratedExprs(doc ir.DashboardIR) []string {
+	exprs := make([]string, 0, len(doc.Panels))
+	for _, p := range doc.Panels {
 		qs := p.EffectiveQueries()
 		for qi, q := range qs {
 			if len(qs) == 1 {
-				res.GeneratedExprs = append(res.GeneratedExprs, fmt.Sprintf("%s: %s", p.ID, q.Expr))
+				exprs = append(exprs, fmt.Sprintf("%s: %s", p.ID, q.Expr))
 			} else {
-				res.GeneratedExprs = append(res.GeneratedExprs, fmt.Sprintf("%s[%d]: %s", p.ID, qi, q.Expr))
+				exprs = append(exprs, fmt.Sprintf("%s[%d]: %s", p.ID, qi, q.Expr))
 			}
 		}
 	}
-
-	warnings, valErr := query.ValidateDashboardIR(
-		adapter,
-		finalDoc,
-		boundedCatalog,
-		safeScope,
-		ir.ValidateOptions{MaxPanels: maxPanels},
-		query.ValidateOptions{RequireCatalogMatch: true},
-	)
-	if valErr != nil {
-		res.FailureStage = "ir_promql_validate"
-		res.FailureDetail = valErr.Error()
-		return res
-	}
-	res.IRPromQLValid = true
-	res.Warnings = warnings
-
-	if sc.CheckAdherence != nil {
-		if adhErr := sc.CheckAdherence(finalDoc, patchPtr, diffs); adhErr != nil {
-			res.FailureStage = "adherence"
-			res.FailureDetail = adhErr.Error()
-			return res
-		}
-	}
-	res.AdherencePassed = true
-
-	if strings.TrimSpace(r.cfg.PrometheusURL) != "" {
-		res.PrometheusChecked = true
-		nonEmpty, execErr := r.validateAgainstPrometheus(ctx, finalDoc, adapter)
-		res.PrometheusNonEmptyPanels = nonEmpty
-		if execErr != nil {
-			res.FailureStage = "prometheus_exec"
-			res.FailureDetail = execErr.Error()
-			return res
-		}
-		res.PrometheusExecPassed = true
-	}
-
-	res.Passed = true
-	return res
+	return exprs
 }
 
 type promRangeResponse struct {
@@ -591,17 +629,48 @@ func computeSummary(results []CaseResult) Summary {
 		return s
 	}
 
-	var (
-		latencies       = make([]int64, 0, len(results))
-		jsonOK          = 0
-		irPromQLOK      = 0
-		adherenceOK     = 0
-		promChecked     = 0
-		promOK          = 0
-		totalPrompt     = 0
-		totalCompletion = 0
-		byKindResults   = make(map[ScenarioKind][]CaseResult)
-	)
+	counts, latencies, byKindResults := aggregateCaseResults(results, &s)
+	n := float64(len(results))
+	s.OverallPassRate = pct(s.PassedRuns, len(results))
+	s.JSONPassRate = pct(counts.jsonOK, len(results))
+	s.IRPromQLPassRate = pct(counts.irPromQLOK, len(results))
+	s.AdherencePassRate = pct(counts.adherenceOK, len(results))
+	s.PrometheusCheckedRuns = counts.promChecked
+	if counts.promChecked > 0 {
+		s.PrometheusPassRate = pct(counts.promOK, counts.promChecked)
+	}
+	s.Latency = calcLatencyStats(latencies)
+	s.Tokens = TokenStats{
+		TotalPromptTokens:     counts.totalPrompt,
+		TotalCompletionTokens: counts.totalCompletion,
+		TotalTokens:           counts.totalPrompt + counts.totalCompletion,
+		MeanPromptTokens:      round1(float64(counts.totalPrompt) / n),
+		MeanCompletionTokens:  round1(float64(counts.totalCompletion) / n),
+	}
+
+	for kind, list := range byKindResults {
+		s.ByKind[kind] = summarizeKind(kind, list)
+	}
+	if len(s.FailureStageCounts) == 0 {
+		s.FailureStageCounts = nil
+	}
+	return s
+}
+
+type summaryTotals struct {
+	jsonOK          int
+	irPromQLOK      int
+	adherenceOK     int
+	promChecked     int
+	promOK          int
+	totalPrompt     int
+	totalCompletion int
+}
+
+func aggregateCaseResults(results []CaseResult, s *Summary) (summaryTotals, []int64, map[ScenarioKind][]CaseResult) {
+	var totals summaryTotals
+	latencies := make([]int64, 0, len(results))
+	byKindResults := make(map[ScenarioKind][]CaseResult)
 
 	for _, r := range results {
 		latencies = append(latencies, r.LatencyMs)
@@ -609,89 +678,70 @@ func computeSummary(results []CaseResult) Summary {
 			s.PassedRuns++
 		}
 		if r.JSONValid {
-			jsonOK++
+			totals.jsonOK++
 		}
 		if r.IRPromQLValid {
-			irPromQLOK++
+			totals.irPromQLOK++
 		}
 		if r.AdherencePassed {
-			adherenceOK++
+			totals.adherenceOK++
 		}
 		if r.PrometheusChecked {
-			promChecked++
+			totals.promChecked++
 			if r.PrometheusExecPassed {
-				promOK++
+				totals.promOK++
 			}
 		}
-		totalPrompt += r.Meta.PromptTokens
-		totalCompletion += r.Meta.CompletionTokens
-
-		fr := strings.TrimSpace(r.Meta.FinishReason)
-		if fr == "" {
-			if r.FailureStage == "llm_call" {
-				fr = "(error)"
-			} else {
-				fr = "(empty)"
-			}
-		}
-		s.FinishReasonCounts[fr]++
+		totals.totalPrompt += r.Meta.PromptTokens
+		totals.totalCompletion += r.Meta.CompletionTokens
+		s.FinishReasonCounts[normalizeFinishReason(r)]++
 		if r.FailureStage != "" {
 			s.FailureStageCounts[r.FailureStage]++
 		}
 		byKindResults[r.Kind] = append(byKindResults[r.Kind], r)
 	}
+	return totals, latencies, byKindResults
+}
 
-	n := float64(len(results))
-	s.OverallPassRate = pct(s.PassedRuns, len(results))
-	s.JSONPassRate = pct(jsonOK, len(results))
-	s.IRPromQLPassRate = pct(irPromQLOK, len(results))
-	s.AdherencePassRate = pct(adherenceOK, len(results))
-	s.PrometheusCheckedRuns = promChecked
-	if promChecked > 0 {
-		s.PrometheusPassRate = pct(promOK, promChecked)
+func normalizeFinishReason(r CaseResult) string {
+	fr := strings.TrimSpace(r.Meta.FinishReason)
+	if fr != "" {
+		return fr
 	}
-	s.Latency = calcLatencyStats(latencies)
-	s.Tokens = TokenStats{
-		TotalPromptTokens:     totalPrompt,
-		TotalCompletionTokens: totalCompletion,
-		TotalTokens:           totalPrompt + totalCompletion,
-		MeanPromptTokens:      round1(float64(totalPrompt) / n),
-		MeanCompletionTokens:  round1(float64(totalCompletion) / n),
+	if r.FailureStage == "llm_call" {
+		return "(error)"
 	}
+	return "(empty)"
+}
 
-	for kind, list := range byKindResults {
-		ks := KindSummary{
-			Kind:  kind,
-			Total: len(list),
-		}
-		kLat := make([]int64, 0, len(list))
-		kJSON, kIR, kAdh := 0, 0, 0
-		for _, r := range list {
-			kLat = append(kLat, r.LatencyMs)
-			if r.Passed {
-				ks.Passed++
-			}
-			if r.JSONValid {
-				kJSON++
-			}
-			if r.IRPromQLValid {
-				kIR++
-			}
-			if r.AdherencePassed {
-				kAdh++
-			}
-		}
-		ks.PassRate = pct(ks.Passed, len(list))
-		ks.JSONPassRate = pct(kJSON, len(list))
-		ks.IRPromQLPassRate = pct(kIR, len(list))
-		ks.AdherencePassRate = pct(kAdh, len(list))
-		ks.Latency = calcLatencyStats(kLat)
-		s.ByKind[kind] = ks
+func summarizeKind(kind ScenarioKind, list []CaseResult) KindSummary {
+	ks := KindSummary{
+		Kind:  kind,
+		Total: len(list),
 	}
-	if len(s.FailureStageCounts) == 0 {
-		s.FailureStageCounts = nil
+	kLat := make([]int64, 0, len(list))
+	kJSON, kIR, kAdh := 0, 0, 0
+	for _, r := range list {
+		kLat = append(kLat, r.LatencyMs)
+		if r.Passed {
+			ks.Passed++
+		}
+		if r.JSONValid {
+			kJSON++
+		}
+		if r.IRPromQLValid {
+			kIR++
+		}
+		if r.AdherencePassed {
+			kAdh++
+		}
 	}
-	return s
+	ks.PassRate = pct(ks.Passed, len(list))
+	ks.JSONPassRate = pct(kJSON, len(list))
+	ks.IRPromQLPassRate = pct(kIR, len(list))
+	ks.AdherencePassRate = pct(kAdh, len(list))
+	ks.Latency = calcLatencyStats(kLat)
+	return ks
 }
 
 func calcLatencyStats(vals []int64) LatencyStats {

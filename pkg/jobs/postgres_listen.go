@@ -122,69 +122,7 @@ func (s *PostgresStore) SubscribeCancels(ctx context.Context, onCancel func(jobI
 	go func() {
 		defer wg.Done()
 		defer s.subWG.Done()
-
-		cur := lc
-		defer func() {
-			if cur != nil {
-				cur.closeAndRelease()
-			}
-		}()
-
-		backoff := 200 * time.Millisecond
-		const maxBackoff = 2 * time.Second
-		for {
-			if cur == nil {
-				timer := time.NewTimer(jitterDuration(backoff))
-				select {
-				case <-subCtx.Done():
-					timer.Stop()
-					return
-				case <-timer.C:
-				}
-				backoff *= 2
-				if backoff > maxBackoff {
-					backoff = maxBackoff
-				}
-				acqCtx, acqCancel := context.WithTimeout(subCtx, postgresDefaultConnectTimeout)
-				nextLC, acqErr := s.openListenConn(acqCtx, listenSQL)
-				acqCancel()
-				if acqErr != nil {
-					if subCtx.Err() != nil {
-						return
-					}
-					continue
-				}
-				cur = nextLC
-				backoff = 200 * time.Millisecond
-			}
-
-			waitCtx, waitCancel := context.WithTimeout(subCtx, postgresListenKeepalive)
-			notif, waitErr := cur.conn().WaitForNotification(waitCtx)
-			waitCancel()
-			if waitErr != nil {
-				if subCtx.Err() != nil {
-					return
-				}
-				if errors.Is(waitErr, context.DeadlineExceeded) {
-					// Periodic keepalive ping detects half-open TCP drops behind cloud NAT/LBs.
-					pingCtx, pingCancel := context.WithTimeout(subCtx, postgresListenPingTimeout)
-					pingErr := cur.conn().Ping(pingCtx)
-					pingCancel()
-					if pingErr == nil {
-						continue
-					}
-				}
-				cur.closeAndRelease()
-				cur = nil
-				continue
-			}
-			if notif == nil {
-				continue
-			}
-			if jobID, token, ok := parseCancelNotification(notif.Payload); ok {
-				onCancel(jobID, token)
-			}
-		}
+		s.runCancelListenLoop(subCtx, lc, listenSQL, onCancel)
 	}()
 
 	var once sync.Once
@@ -195,4 +133,95 @@ func (s *PostgresStore) SubscribeCancels(ctx context.Context, onCancel func(jobI
 		})
 	}
 	return stop, nil
+}
+
+func (s *PostgresStore) runCancelListenLoop(
+	subCtx context.Context,
+	initial *pgListenConn,
+	listenSQL string,
+	onCancel func(jobID string, opToken uint64),
+) {
+	cur := initial
+	defer func() {
+		if cur != nil {
+			cur.closeAndRelease()
+		}
+	}()
+
+	backoff := 200 * time.Millisecond
+	for {
+		if cur == nil {
+			var ok bool
+			cur, backoff, ok = s.reconnectListenConn(subCtx, listenSQL, backoff)
+			if !ok {
+				return
+			}
+			if cur == nil {
+				continue
+			}
+		}
+
+		keepConn, done := waitListenNotification(subCtx, cur, onCancel)
+		if done {
+			return
+		}
+		if !keepConn {
+			cur.closeAndRelease()
+			cur = nil
+		}
+	}
+}
+
+func (s *PostgresStore) reconnectListenConn(subCtx context.Context, listenSQL string, backoff time.Duration) (*pgListenConn, time.Duration, bool) {
+	const maxBackoff = 2 * time.Second
+	timer := time.NewTimer(jitterDuration(backoff))
+	select {
+	case <-subCtx.Done():
+		timer.Stop()
+		return nil, backoff, false
+	case <-timer.C:
+	}
+
+	nextBackoff := min(backoff*2, maxBackoff)
+	acqCtx, acqCancel := context.WithTimeout(subCtx, postgresDefaultConnectTimeout)
+	nextLC, acqErr := s.openListenConn(acqCtx, listenSQL)
+	acqCancel()
+	if acqErr != nil {
+		if subCtx.Err() != nil {
+			return nil, nextBackoff, false
+		}
+		return nil, nextBackoff, true
+	}
+	return nextLC, 200 * time.Millisecond, true
+}
+
+func waitListenNotification(
+	subCtx context.Context,
+	cur *pgListenConn,
+	onCancel func(jobID string, opToken uint64),
+) (keepConn bool, done bool) {
+	waitCtx, waitCancel := context.WithTimeout(subCtx, postgresListenKeepalive)
+	notif, waitErr := cur.conn().WaitForNotification(waitCtx)
+	waitCancel()
+	if waitErr != nil {
+		if subCtx.Err() != nil {
+			return false, true
+		}
+		if errors.Is(waitErr, context.DeadlineExceeded) {
+			// Periodic keepalive ping detects half-open TCP drops behind cloud NAT/LBs.
+			pingCtx, pingCancel := context.WithTimeout(subCtx, postgresListenPingTimeout)
+			pingErr := cur.conn().Ping(pingCtx)
+			pingCancel()
+			if pingErr == nil {
+				return true, false
+			}
+		}
+		return false, false
+	}
+	if notif != nil {
+		if jobID, token, ok := parseCancelNotification(notif.Payload); ok {
+			onCancel(jobID, token)
+		}
+	}
+	return true, false
 }

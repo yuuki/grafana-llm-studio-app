@@ -287,73 +287,12 @@ export class DashboardSaver {
     if (this.inFlight) {
       throw new SaveDashboardError(t('save.errors.inFlight'), 'IN_FLIGHT');
     }
-    if (req.spec.revision !== req.previewedRevision) {
-      throw new SaveDashboardError(
-        t('save.errors.revisionMismatch', {
-          targetRevision: req.spec.revision,
-          previewedRevision: req.previewedRevision,
-        }),
-        'REVISION_MISMATCH'
-      );
-    }
-    const targetUid = req.targetUid.trim();
-    const expectedRV = req.expectedResourceVersion.trim();
-    if (!targetUid || !expectedRV) {
-      throw new SaveDashboardError(
-        t('save.errors.missingResourceVersion'),
-        'MISSING_RESOURCE_VERSION'
-      );
-    }
-    if (!req.currentIR || !req.patchContext || !req.patchContext.originalSpec) {
-      throw new SaveDashboardError(
-        t('save.errors.missingOriginalSpec'),
-        'MISSING_ORIGINAL_SPEC'
-      );
-    }
+    const { targetUid, expectedRV } = validateUpdateDashboardRequest(req);
 
     this.inFlight = true;
     try {
-      const patchedSpec = buildPatchedDashboardSpec({
-        targetUid,
-        currentIR: req.currentIR,
-        currentSpec: req.spec,
-        patchContext: req.patchContext,
-      });
+      const payload = buildUpdateDashboardPayload(req, targetUid, expectedRV);
       const namespace = getOrgNamespace();
-
-      const annotations: Record<string, string> = {};
-      if (req.preservedAnnotations) {
-        for (const [k, v] of Object.entries(req.preservedAnnotations)) {
-          if (k !== 'grafana.app/folder' && typeof v === 'string') {
-            annotations[k] = v;
-          }
-        }
-      }
-      if (req.folderUid && req.folderUid.trim() !== '') {
-        annotations['grafana.app/folder'] = req.folderUid.trim();
-      }
-
-      const metadata: {
-        name: string;
-        resourceVersion: string;
-        annotations: Record<string, string>;
-        labels?: Record<string, string>;
-      } = {
-        name: targetUid,
-        resourceVersion: expectedRV,
-        annotations,
-      };
-      if (req.preservedLabels && Object.keys(req.preservedLabels).length > 0) {
-        metadata.labels = { ...req.preservedLabels };
-      }
-
-      const payload = {
-        apiVersion: 'dashboard.grafana.app/v1beta1',
-        kind: 'Dashboard',
-        metadata,
-        spec: patchedSpec,
-      };
-
       const url = `/apis/dashboard.grafana.app/v1beta1/namespaces/${encodeURIComponent(namespace)}/dashboards/${encodeURIComponent(targetUid)}`;
 
       const response = await lastValueFrom(
@@ -379,32 +318,112 @@ export class DashboardSaver {
         resourceVersion: response.data?.metadata?.resourceVersion,
       };
     } catch (err: unknown) {
-      const status = (err as { status?: number })?.status;
-      const msg =
-        (err as { data?: { message?: string }; message?: string })?.data?.message ||
-        (err as { message?: string })?.message ||
-        t('save.errors.updateDefaultMessage');
-
-      if (status === 401 || status === 403) {
-        throw new SaveDashboardError(
-          t('save.errors.updatePermissionDenied', { status, message: msg }),
-          'PERMISSION_DENIED'
-        );
-      }
-      if (status === 409 || status === 412) {
-        throw new SaveDashboardError(
-          t('save.errors.revisionConflict', { status, message: msg }),
-          'REVISION_CONFLICT'
-        );
-      }
-      throw new SaveDashboardError(
-        t('save.errors.updateApiError', { status: status ?? 'unknown', message: msg }),
-        'API_ERROR'
-      );
+      throw mapUpdateDashboardError(err);
     } finally {
       this.inFlight = false;
     }
   }
+}
+
+function validateUpdateDashboardRequest(req: UpdateDashboardRequest): {
+  targetUid: string;
+  expectedRV: string;
+} {
+  if (req.spec.revision !== req.previewedRevision) {
+    throw new SaveDashboardError(
+      t('save.errors.revisionMismatch', {
+        targetRevision: req.spec.revision,
+        previewedRevision: req.previewedRevision,
+      }),
+      'REVISION_MISMATCH'
+    );
+  }
+  const targetUid = req.targetUid.trim();
+  const expectedRV = req.expectedResourceVersion.trim();
+  if (!targetUid || !expectedRV) {
+    throw new SaveDashboardError(
+      t('save.errors.missingResourceVersion'),
+      'MISSING_RESOURCE_VERSION'
+    );
+  }
+  if (!req.currentIR || !req.patchContext || !req.patchContext.originalSpec) {
+    throw new SaveDashboardError(
+      t('save.errors.missingOriginalSpec'),
+      'MISSING_ORIGINAL_SPEC'
+    );
+  }
+  return { targetUid, expectedRV };
+}
+
+function buildUpdateDashboardPayload(
+  req: UpdateDashboardRequest,
+  targetUid: string,
+  expectedRV: string
+) {
+  const patchedSpec = buildPatchedDashboardSpec({
+    targetUid,
+    currentIR: req.currentIR,
+    currentSpec: req.spec,
+    patchContext: req.patchContext,
+  });
+
+  const annotations: Record<string, string> = {};
+  if (req.preservedAnnotations) {
+    for (const [k, v] of Object.entries(req.preservedAnnotations)) {
+      if (k !== 'grafana.app/folder' && typeof v === 'string') {
+        annotations[k] = v;
+      }
+    }
+  }
+  if (req.folderUid && req.folderUid.trim() !== '') {
+    annotations['grafana.app/folder'] = req.folderUid.trim();
+  }
+
+  const metadata: {
+    name: string;
+    resourceVersion: string;
+    annotations: Record<string, string>;
+    labels?: Record<string, string>;
+  } = {
+    name: targetUid,
+    resourceVersion: expectedRV,
+    annotations,
+  };
+  if (req.preservedLabels && Object.keys(req.preservedLabels).length > 0) {
+    metadata.labels = { ...req.preservedLabels };
+  }
+
+  return {
+    apiVersion: 'dashboard.grafana.app/v1beta1',
+    kind: 'Dashboard',
+    metadata,
+    spec: patchedSpec,
+  };
+}
+
+function mapUpdateDashboardError(err: unknown): SaveDashboardError {
+  const status = (err as { status?: number })?.status;
+  const msg =
+    (err as { data?: { message?: string }; message?: string })?.data?.message ||
+    (err as { message?: string })?.message ||
+    t('save.errors.updateDefaultMessage');
+
+  if (status === 401 || status === 403) {
+    return new SaveDashboardError(
+      t('save.errors.updatePermissionDenied', { status, message: msg }),
+      'PERMISSION_DENIED'
+    );
+  }
+  if (status === 409 || status === 412) {
+    return new SaveDashboardError(
+      t('save.errors.revisionConflict', { status, message: msg }),
+      'REVISION_CONFLICT'
+    );
+  }
+  return new SaveDashboardError(
+    t('save.errors.updateApiError', { status: status ?? 'unknown', message: msg }),
+    'API_ERROR'
+  );
 }
 
 /**

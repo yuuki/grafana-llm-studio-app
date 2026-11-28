@@ -155,6 +155,21 @@ func (c *GrafanaLLMClient) callStructured(
 	schemaName string,
 	schemaBytes []byte,
 ) ([]byte, CompletionMeta, error) {
+	req := c.buildStructuredChatRequest(messages, schemaName, schemaBytes)
+
+	resp, err := c.executeWithTransportRetry(ctx, req)
+	if err != nil {
+		return nil, CompletionMeta{ProviderMode: "grafana-llm-app"}, err
+	}
+
+	return extractStructuredResponse(resp)
+}
+
+func (c *GrafanaLLMClient) buildStructuredChatRequest(
+	messages []openai.ChatCompletionMessage,
+	schemaName string,
+	schemaBytes []byte,
+) llmclient.ChatCompletionRequest {
 	reqMessages := make([]openai.ChatCompletionMessage, len(messages))
 	copy(reqMessages, messages)
 
@@ -199,44 +214,48 @@ func (c *GrafanaLLMClient) callStructured(
 		chatReq.Temperature = 0.1
 	}
 
-	req := llmclient.ChatCompletionRequest{
+	return llmclient.ChatCompletionRequest{
 		Model:                 c.cfg.ModelTier,
 		ChatCompletionRequest: chatReq,
 	}
+}
 
-	var (
-		resp    openai.ChatCompletionResponse
-		lastErr error
-	)
+func (c *GrafanaLLMClient) executeWithTransportRetry(
+	ctx context.Context,
+	req llmclient.ChatCompletionRequest,
+) (openai.ChatCompletionResponse, error) {
 	attempts := 1 + c.cfg.MaxTransportRetries
 	for attempt := 0; attempt < attempts; attempt++ {
 		if ctx.Err() != nil {
-			return nil, CompletionMeta{ProviderMode: "grafana-llm-app"}, ctx.Err()
+			return openai.ChatCompletionResponse{}, ctx.Err()
 		}
 		attemptCtx, cancel := context.WithTimeout(ctx, c.cfg.RequestTimeout)
-		resp, lastErr = c.provider.ChatCompletions(attemptCtx, req)
+		resp, err := c.provider.ChatCompletions(attemptCtx, req)
 		attemptTimedOut := errors.Is(attemptCtx.Err(), context.DeadlineExceeded)
 		cancel()
 
-		if lastErr == nil {
-			break
+		if err == nil {
+			return resp, nil
 		}
-		if attemptTimedOut || errors.Is(lastErr, context.DeadlineExceeded) {
-			return nil, CompletionMeta{ProviderMode: "grafana-llm-app"}, fmt.Errorf("%w: grafana-llm-app chat completion timed out: %v", context.DeadlineExceeded, lastErr)
+		if attemptTimedOut || errors.Is(err, context.DeadlineExceeded) {
+			return openai.ChatCompletionResponse{}, fmt.Errorf("%w: grafana-llm-app chat completion timed out: %v", context.DeadlineExceeded, err)
 		}
-		if errors.Is(lastErr, context.Canceled) || errors.Is(ctx.Err(), context.Canceled) {
-			return nil, CompletionMeta{ProviderMode: "grafana-llm-app"}, context.Canceled
+		if errors.Is(err, context.Canceled) || errors.Is(ctx.Err(), context.Canceled) {
+			return openai.ChatCompletionResponse{}, context.Canceled
 		}
-		if !isRetryableTransportError(ctx, lastErr) || attempt+1 >= attempts {
-			return nil, CompletionMeta{ProviderMode: "grafana-llm-app"}, fmt.Errorf("%w: grafana-llm-app chat completion failed: %v", ErrLLMUnavailable, lastErr)
+		if !isRetryableTransportError(ctx, err) || attempt+1 >= attempts {
+			return openai.ChatCompletionResponse{}, fmt.Errorf("%w: grafana-llm-app chat completion failed: %v", ErrLLMUnavailable, err)
 		}
 		select {
 		case <-ctx.Done():
-			return nil, CompletionMeta{ProviderMode: "grafana-llm-app"}, ctx.Err()
+			return openai.ChatCompletionResponse{}, ctx.Err()
 		case <-time.After(200 * time.Millisecond):
 		}
 	}
+	return openai.ChatCompletionResponse{}, fmt.Errorf("%w: grafana-llm-app chat completion failed", ErrLLMUnavailable)
+}
 
+func extractStructuredResponse(resp openai.ChatCompletionResponse) ([]byte, CompletionMeta, error) {
 	if len(resp.Choices) == 0 {
 		return nil, CompletionMeta{ProviderMode: "grafana-llm-app"}, fmt.Errorf("%w: LLM returned zero choices", ErrLLMUnavailable)
 	}

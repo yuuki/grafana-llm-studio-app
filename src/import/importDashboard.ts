@@ -279,39 +279,7 @@ export async function fetchExistingDashboardByUid(
       },
       signal
     );
-    const spec = res.data?.spec;
-    if (spec && typeof spec === 'object' && !Array.isArray(spec)) {
-      const rawAnnotations = res.data?.metadata?.annotations;
-      const folderAnn =
-        rawAnnotations && typeof rawAnnotations['grafana.app/folder'] === 'string'
-          ? sanitizePlainText(rawAnnotations['grafana.app/folder'], 64)
-          : '';
-      const rawName =
-        typeof res.data?.metadata?.name === 'string' && res.data.metadata.name.trim()
-          ? res.data.metadata.name.trim()
-          : cleanUid;
-      const rawRV =
-        typeof res.data?.metadata?.resourceVersion === 'string' &&
-        res.data.metadata.resourceVersion.trim()
-          ? res.data.metadata.resourceVersion.trim()
-          : undefined;
-      return {
-        rawDashboard: spec,
-        source: {
-          uid: rawName,
-          resourceVersion: rawRV,
-          folderUid: folderAnn,
-          title: typeof spec.title === 'string' ? sanitizePlainText(spec.title, 120) : undefined,
-          version: sanitizeVersion(spec.version),
-        },
-        preservedAnnotations: extractStringRecord(
-          rawAnnotations,
-          new Set(['grafana.app/folder'])
-        ),
-        preservedLabels: extractStringRecord(res.data?.metadata?.labels),
-      };
-    }
-    throw new Error(`Dashboard ${cleanUid} returned invalid spec`);
+    return parseV1Beta1DashboardResponse(res.data, cleanUid);
   } catch (err: unknown) {
     if (signal?.aborted) {
       throw err;
@@ -330,14 +298,54 @@ export async function fetchExistingDashboardByUid(
     },
     signal
   );
-  const rawDash = legacy.data?.dashboard;
+  return parseLegacyDashboardResponse(legacy.data, cleanUid);
+}
+
+function parseV1Beta1DashboardResponse(
+  data: RawDashboardV1Beta1 | undefined,
+  cleanUid: string
+): FetchedExistingDashboard {
+  const spec = data?.spec;
+  if (!spec || typeof spec !== 'object' || Array.isArray(spec)) {
+    throw new Error(`Dashboard ${cleanUid} returned invalid spec`);
+  }
+  const rawAnnotations = data?.metadata?.annotations;
+  const folderAnn =
+    rawAnnotations && typeof rawAnnotations['grafana.app/folder'] === 'string'
+      ? sanitizePlainText(rawAnnotations['grafana.app/folder'], 64)
+      : '';
+  const rawName =
+    typeof data?.metadata?.name === 'string' && data.metadata.name.trim()
+      ? data.metadata.name.trim()
+      : cleanUid;
+  const rawRV =
+    typeof data?.metadata?.resourceVersion === 'string' && data.metadata.resourceVersion.trim()
+      ? data.metadata.resourceVersion.trim()
+      : undefined;
+  return {
+    rawDashboard: spec,
+    source: {
+      uid: rawName,
+      resourceVersion: rawRV,
+      folderUid: folderAnn,
+      title: typeof spec.title === 'string' ? sanitizePlainText(spec.title, 120) : undefined,
+      version: sanitizeVersion(spec.version),
+    },
+    preservedAnnotations: extractStringRecord(rawAnnotations, new Set(['grafana.app/folder'])),
+    preservedLabels: extractStringRecord(data?.metadata?.labels),
+  };
+}
+
+function parseLegacyDashboardResponse(
+  data: RawLegacyDashboardEnvelope | undefined,
+  cleanUid: string
+): FetchedExistingDashboard {
+  const rawDash = data?.dashboard;
   if (!rawDash || typeof rawDash !== 'object' || Array.isArray(rawDash)) {
     throw new Error(`Dashboard ${cleanUid} returned no spec`);
   }
   const legacyFolderUid =
-    typeof legacy.data?.meta?.folderUid === 'string'
-      ? sanitizePlainText(legacy.data.meta.folderUid, 64)
-      : '';
+    typeof data?.meta?.folderUid === 'string' ? sanitizePlainText(data.meta.folderUid, 64) : '';
   return {
     rawDashboard: rawDash,
     source: {
@@ -397,340 +405,25 @@ export function convertGrafanaDashboardToIR(
     typeof raw.description === 'string' ? raw.description : '',
     400
   );
-
-  const rawTime = raw.time as { from?: unknown; to?: unknown } | undefined;
-  let timeFrom: AllowedTimeFrom = 'now-15m';
-  if (typeof rawTime?.from === 'string' && ALLOWED_TIME_FROM_SET.has(rawTime.from)) {
-    timeFrom = rawTime.from as AllowedTimeFrom;
-  } else if (typeof rawTime?.from === 'string' && rawTime.from !== '') {
-    warnings.push(`Unsupported time.from "${sanitizePlainText(rawTime.from, 40)}" normalized to "now-15m"`);
-  }
+  const timeFrom = normalizeImportTimeFrom(raw.time, warnings);
 
   // 1. Safely import up to 4 scoped template variables.
-  const variables: VariableIR[] = [];
-  const variableBindings: Record<string, number> = {};
-  const rawTemplating = raw.templating as { list?: unknown[] } | undefined;
-  const rawVarList = Array.isArray(rawTemplating?.list) ? rawTemplating.list : [];
-  const seenVarNames = new Set<string>();
-
-  for (let varIdx = 0; varIdx < rawVarList.length; varIdx++) {
-    const item = rawVarList[varIdx];
-    if (!item || typeof item !== 'object' || Array.isArray(item)) {
-      continue;
-    }
-    const v = item as Record<string, unknown>;
-    const rawName = typeof v.name === 'string' ? v.name.trim() : '';
-    const rawType = typeof v.type === 'string' ? v.type.trim() : 'unknown';
-
-    if (v.hide === 2) {
-      skippedVariables.push({
-        title: rawName || '(unnamed)',
-        type: rawType,
-        reason: 'hidden dashboard variables (e.g., VictoriaMetrics WITH template variables) are not imported into IR v1.1',
-      });
-      continue;
-    }
-
-    if (variables.length >= MAX_VARIABLES) {
-      skippedVariables.push({
-        title: rawName || '(unnamed)',
-        type: rawType,
-        reason: `exceeded max ${MAX_VARIABLES} variables`,
-      });
-      continue;
-    }
-    if (
-      !VALID_VAR_NAME.test(rawName) ||
-      isReservedVariableName(rawName) ||
-      seenVarNames.has(rawName)
-    ) {
-      skippedVariables.push({
-        title: rawName || '(unnamed)',
-        type: rawType,
-        reason: 'invalid, reserved, or duplicate variable name',
-      });
-      continue;
-    }
-
-    const label = sanitizePlainText(typeof v.label === 'string' ? v.label : '', 64);
-    const multi = Boolean(v.multi);
-    const includeAll = Boolean(v.includeAll);
-    const currentVal = extractVariableCurrentValue(v.current);
-
-    if (rawType === 'query') {
-      if (!isDatasourceCompatible(v.datasource, options)) {
-        skippedVariables.push({
-          title: rawName,
-          type: rawType,
-          reason: 'variable datasource does not match selected Prometheus datasource',
-        });
-        continue;
-      }
-      const parsed = parseLabelValuesQuery(v.query, options.scope);
-      if (!parsed) {
-        skippedVariables.push({
-          title: rawName,
-          type: rawType,
-          reason:
-            'only unfiltered Prometheus label_values(metric, label) or label_values(label) query variables are supported in IR v1.1',
-        });
-        continue;
-      }
-      const candidateDefault = currentVal || extractFirstConcreteOption(v.options);
-      const safeDefault = sanitizePlainText(candidateDefault, 128);
-      if (
-        !safeDefault ||
-        validateVariableValueClient(`variables.${rawName}.defaultValue`, safeDefault, 1, 128, false) !==
-          null
-      ) {
-        skippedVariables.push({
-          title: rawName,
-          type: rawType,
-          reason: 'query variable has no concrete safe defaultValue required by IR v1.1',
-        });
-        continue;
-      }
-      const varIR: VariableIR = {
-        name: rawName,
-        type: 'query',
-        datasourceRef: SELECTED_DATASOURCE_REF,
-        labelName: parsed.labelName,
-        defaultValue: safeDefault,
-        ...(label ? { label } : {}),
-        ...(parsed.metricName ? { metricName: parsed.metricName } : {}),
-        ...(multi ? { multi: true } : {}),
-        ...(includeAll ? { includeAll: true } : {}),
-      };
-      seenVarNames.add(rawName);
-      variableBindings[rawName] = varIdx;
-      variables.push(varIR);
-    } else if (rawType === 'custom') {
-      const opts = extractCustomVariableOptions(v);
-      if (opts.length === 0) {
-        skippedVariables.push({
-          title: rawName,
-          type: rawType,
-          reason: 'no valid safe custom options found',
-        });
-        continue;
-      }
-      const boundedOpts = opts.slice(0, MAX_VARIABLE_OPTIONS);
-      if (opts.length > MAX_VARIABLE_OPTIONS) {
-        warnings.push(
-          `Variable $${rawName}: truncated custom options from ${opts.length} to ${MAX_VARIABLE_OPTIONS}`
-        );
-      }
-      const cleanCurrent = sanitizePlainText(currentVal, 64);
-      const defVal =
-        cleanCurrent && boundedOpts.includes(cleanCurrent) ? cleanCurrent : boundedOpts[0];
-      const varIR: VariableIR = {
-        name: rawName,
-        type: 'custom',
-        options: boundedOpts,
-        defaultValue: defVal,
-        ...(label ? { label } : {}),
-        ...(multi ? { multi: true } : {}),
-        ...(includeAll ? { includeAll: true } : {}),
-      };
-      seenVarNames.add(rawName);
-      variableBindings[rawName] = varIdx;
-      variables.push(varIR);
-    } else {
-      skippedVariables.push({
-        title: rawName,
-        type: rawType,
-        reason: `variable type "${sanitizePlainText(rawType, 40)}" is not supported in IR v1.1`,
-      });
-    }
-  }
+  const { variables, variableBindings, seenVarNames } = importDashboardVariables(
+    raw.templating,
+    options,
+    warnings,
+    skippedVariables
+  );
 
   // 2. Flatten row-nested panels while recording exact original spec locators, and convert up to maxPanels supported panels.
-  const rawPanels = flattenRawPanelsWithLocators(Array.isArray(raw.panels) ? raw.panels : []);
-  rawPanels.sort((a, b) => {
-    const ga = (a.panel.gridPos as { y?: number; x?: number } | undefined) ?? {};
-    const gb = (b.panel.gridPos as { y?: number; x?: number } | undefined) ?? {};
-    const dy = (Number(ga.y) || 0) - (Number(gb.y) || 0);
-    if (dy !== 0) {
-      return dy;
-    }
-    return (Number(ga.x) || 0) - (Number(gb.x) || 0);
-  });
-
-  const panels: PanelIR[] = [];
-  const panelBindings: Record<string, ImportedPanelLocator> = {};
-  const usedPanelIds = new Set<string>();
-  const widthHints: Array<'half' | 'full'> = [];
-
-  for (let i = 0; i < rawPanels.length; i++) {
-    const entry = rawPanels[i];
-    const rp = entry.panel;
-    const pType = typeof rp.type === 'string' ? rp.type.trim() : 'unknown';
-    const rawTitle = typeof rp.title === 'string' ? rp.title : `Panel ${i + 1}`;
-    const safeTitle = sanitizePlainText(rawTitle, 80) || `Panel ${i + 1}`;
-
-    if (pType === 'row') {
-      continue;
-    }
-    if (!ALLOWED_PANEL_TYPE_SET.has(pType)) {
-      skippedPanels.push({
-        title: safeTitle,
-        type: pType,
-        reason: `panel type "${sanitizePlainText(pType, 40)}" is not supported in IR v1.1`,
-      });
-      continue;
-    }
-    if (panels.length >= maxPanels) {
-      skippedPanels.push({
-        title: safeTitle,
-        type: pType,
-        reason: `exceeded max ${maxPanels} panels`,
-      });
-      continue;
-    }
-
-    const rawTargets = Array.isArray(rp.targets) ? rp.targets : [];
-    const importedQueries: QueryIR[] = [];
-    const importedTargetIndices: number[] = [];
-    let skippedTargetsCount = 0;
-    let skippedUndeclaredVarCount = 0;
-    let skippedWithTemplateCount = 0;
-
-    for (let targetIdx = 0; targetIdx < rawTargets.length; targetIdx++) {
-      const rt = rawTargets[targetIdx];
-      if (!rt || typeof rt !== 'object' || Array.isArray(rt)) {
-        continue;
-      }
-      const target = rt as Record<string, unknown>;
-      if (target.hide === true) {
-        continue;
-      }
-      const hasTargetDs =
-        target.datasource !== undefined && target.datasource !== null && target.datasource !== '';
-      const targetDs = hasTargetDs ? target.datasource : rp.datasource;
-      if (!isDatasourceCompatible(targetDs, options)) {
-        skippedTargetsCount++;
-        continue;
-      }
-      if (typeof target.withTemplate === 'string' && target.withTemplate.trim() !== '') {
-        skippedWithTemplateCount++;
-        warnings.push(
-          `Panel "${safeTitle}": skipped query referencing external VictoriaMetrics WITH template`
-        );
-        continue;
-      }
-      if (typeof target.expr !== 'string' || target.expr.trim() === '') {
-        continue;
-      }
-      const cleanExpr = sanitizeExprText(target.expr, 512);
-      if (!cleanExpr) {
-        warnings.push(`Panel "${safeTitle}": skipped query exceeding 512 chars or containing forbidden chars/markup`);
-        continue;
-      }
-      const undeclaredVar = findUndeclaredOrLegacyVarRef(cleanExpr, seenVarNames);
-      if (undeclaredVar) {
-        skippedUndeclaredVarCount++;
-        warnings.push(
-          `Panel "${safeTitle}": skipped query referencing undeclared/unsupported variable "${undeclaredVar}"`
-        );
-        continue;
-      }
-      if (importedQueries.length >= MAX_QUERIES_PER_PANEL) {
-        warnings.push(`Panel "${safeTitle}": truncated to max ${MAX_QUERIES_PER_PANEL} queries`);
-        break;
-      }
-      let legend = sanitizePlainText(
-        typeof target.legendFormat === 'string' ? target.legendFormat : '',
-        80
-      );
-      if (legend && LEGEND_VAR_TOKEN_REGEX.test(legend)) {
-        warnings.push(
-          `Panel "${safeTitle}": omitted legendFormat containing template variable token`
-        );
-        legend = '';
-      }
-      importedQueries.push({
-        refId: ALLOWED_QUERY_REF_IDS[importedQueries.length],
-        ...(options.queryKind ? { kind: options.queryKind } : {}),
-        expr: cleanExpr,
-        ...(legend ? { legendFormat: legend } : {}),
-      });
-      importedTargetIndices.push(targetIdx);
-    }
-
-    if (skippedTargetsCount > 0) {
-      warnings.push(
-        `Panel "${safeTitle}": skipped ${skippedTargetsCount} query target(s) bound to another datasource`
-      );
-    }
-    if (importedQueries.length === 0) {
-      const dialectLabel = options.queryKind === 'metricsql' ? 'MetricsQL' : 'Prometheus PromQL';
-      const reason =
-        skippedWithTemplateCount > 0
-          ? 'queries referenced unsupported external VictoriaMetrics WITH templates'
-          : skippedUndeclaredVarCount > 0
-            ? 'queries referenced undeclared or unsupported template variables'
-            : `no compatible ${dialectLabel} queries found for selected datasource`;
-      skippedPanels.push({
-        title: safeTitle,
-        type: pType,
-        reason,
-      });
-      continue;
-    }
-
-    const fieldDefaults =
-      (rp.fieldConfig as { defaults?: Record<string, unknown> } | undefined)?.defaults ?? {};
-    const rawUnit = typeof fieldDefaults.unit === 'string' ? fieldDefaults.unit : '';
-    let unit: AllowedUnit = 'short';
-    if (rawUnit && ALLOWED_UNIT_SET.has(rawUnit)) {
-      unit = rawUnit as AllowedUnit;
-    } else if (rawUnit) {
-      warnings.push(
-        `Panel "${safeTitle}": unsupported unit "${sanitizePlainText(rawUnit, 40)}" mapped to "short"`
-      );
-    }
-
-    const thresholds = convertThresholds(fieldDefaults.thresholds);
-    const panelDesc = sanitizePlainText(
-      typeof rp.description === 'string' ? rp.description : '',
-      240
-    );
-    const panelId = makeUniquePanelId(safeTitle, panels.length + 1, usedPanelIds);
-    const gridPos = rp.gridPos as { w?: number } | undefined;
-    const widthHint: 'half' | 'full' = (Number(gridPos?.w) || 12) > 12 ? 'full' : 'half';
-    widthHints.push(widthHint);
-
-    const panelIR: PanelIR = {
-      id: panelId,
-      type: pType as PanelType,
-      title: safeTitle,
-      ...(panelDesc ? { description: panelDesc } : {}),
-      datasourceRef: SELECTED_DATASOURCE_REF,
-      ...(importedQueries.length === 1
-        ? {
-            query: {
-              ...(importedQueries[0].kind ? { kind: importedQueries[0].kind } : {}),
-              expr: importedQueries[0].expr,
-              ...(importedQueries[0].legendFormat
-                ? { legendFormat: importedQueries[0].legendFormat }
-                : {}),
-            },
-          }
-        : { queries: importedQueries }),
-      unit,
-      ...(thresholds.length > 0 ? { thresholds } : {}),
-      layout: { row: 0, col: 0, width: widthHint },
-    };
-    const originalNumericId =
-      typeof rp.id === 'number' && Number.isInteger(rp.id) && rp.id > 0 ? rp.id : undefined;
-    panelBindings[panelId] = {
-      topIndex: entry.topIndex,
-      ...(entry.rowChildIndex !== undefined ? { rowChildIndex: entry.rowChildIndex } : {}),
-      ...(originalNumericId !== undefined ? { originalNumericId } : {}),
-      importedTargetIndices,
-    };
-    panels.push(panelIR);
-  }
+  const { panels, panelBindings, widthHints } = importDashboardPanels(
+    raw.panels,
+    maxPanels,
+    seenVarNames,
+    options,
+    warnings,
+    skippedPanels
+  );
 
   if (panels.length === 0) {
     throw new Error(
@@ -770,6 +463,498 @@ export function convertGrafanaDashboardToIR(
       variableBindings,
     },
   };
+}
+
+function normalizeImportTimeFrom(rawTimeInput: unknown, warnings: string[]): AllowedTimeFrom {
+  const rawTime = rawTimeInput as { from?: unknown; to?: unknown } | undefined;
+  if (typeof rawTime?.from === 'string' && ALLOWED_TIME_FROM_SET.has(rawTime.from)) {
+    return rawTime.from as AllowedTimeFrom;
+  }
+  if (typeof rawTime?.from === 'string' && rawTime.from !== '') {
+    warnings.push(
+      `Unsupported time.from "${sanitizePlainText(rawTime.from, 40)}" normalized to "now-15m"`
+    );
+  }
+  return 'now-15m';
+}
+
+function importDashboardVariables(
+  rawTemplatingInput: unknown,
+  options: ImportConversionOptions,
+  warnings: string[],
+  skippedVariables: SkippedImportItem[]
+): {
+  variables: VariableIR[];
+  variableBindings: Record<string, number>;
+  seenVarNames: Set<string>;
+} {
+  const variables: VariableIR[] = [];
+  const variableBindings: Record<string, number> = {};
+  const rawTemplating = rawTemplatingInput as { list?: unknown[] } | undefined;
+  const rawVarList = Array.isArray(rawTemplating?.list) ? rawTemplating.list : [];
+  const seenVarNames = new Set<string>();
+
+  for (let varIdx = 0; varIdx < rawVarList.length; varIdx++) {
+    const item = rawVarList[varIdx];
+    if (!item || typeof item !== 'object' || Array.isArray(item)) {
+      continue;
+    }
+    const varIR = convertSingleDashboardVariable(
+      item as Record<string, unknown>,
+      variables.length,
+      seenVarNames,
+      options,
+      warnings,
+      skippedVariables
+    );
+    if (varIR) {
+      seenVarNames.add(varIR.name);
+      variableBindings[varIR.name] = varIdx;
+      variables.push(varIR);
+    }
+  }
+  return { variables, variableBindings, seenVarNames };
+}
+
+function convertSingleDashboardVariable(
+  v: Record<string, unknown>,
+  importedCount: number,
+  seenVarNames: Set<string>,
+  options: ImportConversionOptions,
+  warnings: string[],
+  skippedVariables: SkippedImportItem[]
+): VariableIR | null {
+  const rawName = typeof v.name === 'string' ? v.name.trim() : '';
+  const rawType = typeof v.type === 'string' ? v.type.trim() : 'unknown';
+
+  if (v.hide === 2) {
+    skippedVariables.push({
+      title: rawName || '(unnamed)',
+      type: rawType,
+      reason:
+        'hidden dashboard variables (e.g., VictoriaMetrics WITH template variables) are not imported into IR v1.1',
+    });
+    return null;
+  }
+  if (importedCount >= MAX_VARIABLES) {
+    skippedVariables.push({
+      title: rawName || '(unnamed)',
+      type: rawType,
+      reason: `exceeded max ${MAX_VARIABLES} variables`,
+    });
+    return null;
+  }
+  if (!VALID_VAR_NAME.test(rawName) || isReservedVariableName(rawName) || seenVarNames.has(rawName)) {
+    skippedVariables.push({
+      title: rawName || '(unnamed)',
+      type: rawType,
+      reason: 'invalid, reserved, or duplicate variable name',
+    });
+    return null;
+  }
+
+  const label = sanitizePlainText(typeof v.label === 'string' ? v.label : '', 64);
+  const multi = Boolean(v.multi);
+  const includeAll = Boolean(v.includeAll);
+  const currentVal = extractVariableCurrentValue(v.current);
+
+  if (rawType === 'query') {
+    return convertImportedQueryVariable(
+      v,
+      rawName,
+      rawType,
+      label,
+      multi,
+      includeAll,
+      currentVal,
+      options,
+      skippedVariables
+    );
+  }
+  if (rawType === 'custom') {
+    return convertImportedCustomVariable(
+      v,
+      rawName,
+      rawType,
+      label,
+      multi,
+      includeAll,
+      currentVal,
+      warnings,
+      skippedVariables
+    );
+  }
+  skippedVariables.push({
+    title: rawName,
+    type: rawType,
+    reason: `variable type "${sanitizePlainText(rawType, 40)}" is not supported in IR v1.1`,
+  });
+  return null;
+}
+
+function convertImportedQueryVariable(
+  v: Record<string, unknown>,
+  rawName: string,
+  rawType: string,
+  label: string,
+  multi: boolean,
+  includeAll: boolean,
+  currentVal: string,
+  options: ImportConversionOptions,
+  skippedVariables: SkippedImportItem[]
+): VariableIR | null {
+  if (!isDatasourceCompatible(v.datasource, options)) {
+    skippedVariables.push({
+      title: rawName,
+      type: rawType,
+      reason: 'variable datasource does not match selected Prometheus datasource',
+    });
+    return null;
+  }
+  const parsed = parseLabelValuesQuery(v.query, options.scope);
+  if (!parsed) {
+    skippedVariables.push({
+      title: rawName,
+      type: rawType,
+      reason:
+        'only unfiltered Prometheus label_values(metric, label) or label_values(label) query variables are supported in IR v1.1',
+    });
+    return null;
+  }
+  const candidateDefault = currentVal || extractFirstConcreteOption(v.options);
+  const safeDefault = sanitizePlainText(candidateDefault, 128);
+  if (
+    !safeDefault ||
+    validateVariableValueClient(`variables.${rawName}.defaultValue`, safeDefault, 1, 128, false) !==
+      null
+  ) {
+    skippedVariables.push({
+      title: rawName,
+      type: rawType,
+      reason: 'query variable has no concrete safe defaultValue required by IR v1.1',
+    });
+    return null;
+  }
+  return {
+    name: rawName,
+    type: 'query',
+    datasourceRef: SELECTED_DATASOURCE_REF,
+    labelName: parsed.labelName,
+    defaultValue: safeDefault,
+    ...(label ? { label } : {}),
+    ...(parsed.metricName ? { metricName: parsed.metricName } : {}),
+    ...(multi ? { multi: true } : {}),
+    ...(includeAll ? { includeAll: true } : {}),
+  };
+}
+
+function convertImportedCustomVariable(
+  v: Record<string, unknown>,
+  rawName: string,
+  rawType: string,
+  label: string,
+  multi: boolean,
+  includeAll: boolean,
+  currentVal: string,
+  warnings: string[],
+  skippedVariables: SkippedImportItem[]
+): VariableIR | null {
+  const opts = extractCustomVariableOptions(v);
+  if (opts.length === 0) {
+    skippedVariables.push({
+      title: rawName,
+      type: rawType,
+      reason: 'no valid safe custom options found',
+    });
+    return null;
+  }
+  const boundedOpts = opts.slice(0, MAX_VARIABLE_OPTIONS);
+  if (opts.length > MAX_VARIABLE_OPTIONS) {
+    warnings.push(
+      `Variable $${rawName}: truncated custom options from ${opts.length} to ${MAX_VARIABLE_OPTIONS}`
+    );
+  }
+  const cleanCurrent = sanitizePlainText(currentVal, 64);
+  const defVal = cleanCurrent && boundedOpts.includes(cleanCurrent) ? cleanCurrent : boundedOpts[0];
+  return {
+    name: rawName,
+    type: 'custom',
+    options: boundedOpts,
+    defaultValue: defVal,
+    ...(label ? { label } : {}),
+    ...(multi ? { multi: true } : {}),
+    ...(includeAll ? { includeAll: true } : {}),
+  };
+}
+
+function importDashboardPanels(
+  rawPanelsInput: unknown,
+  maxPanels: number,
+  seenVarNames: Set<string>,
+  options: ImportConversionOptions,
+  warnings: string[],
+  skippedPanels: SkippedImportItem[]
+): {
+  panels: PanelIR[];
+  panelBindings: Record<string, ImportedPanelLocator>;
+  widthHints: Array<'half' | 'full'>;
+} {
+  const rawPanels = flattenRawPanelsWithLocators(Array.isArray(rawPanelsInput) ? rawPanelsInput : []);
+  rawPanels.sort(compareFlattenedPanelGridPos);
+
+  const panels: PanelIR[] = [];
+  const panelBindings: Record<string, ImportedPanelLocator> = {};
+  const usedPanelIds = new Set<string>();
+  const widthHints: Array<'half' | 'full'> = [];
+
+  for (let i = 0; i < rawPanels.length; i++) {
+    const entry = rawPanels[i];
+    const rp = entry.panel;
+    const pType = typeof rp.type === 'string' ? rp.type.trim() : 'unknown';
+    const rawTitle = typeof rp.title === 'string' ? rp.title : `Panel ${i + 1}`;
+    const safeTitle = sanitizePlainText(rawTitle, 80) || `Panel ${i + 1}`;
+
+    if (pType === 'row') {
+      continue;
+    }
+    if (!ALLOWED_PANEL_TYPE_SET.has(pType)) {
+      skippedPanels.push({
+        title: safeTitle,
+        type: pType,
+        reason: `panel type "${sanitizePlainText(pType, 40)}" is not supported in IR v1.1`,
+      });
+      continue;
+    }
+    if (panels.length >= maxPanels) {
+      skippedPanels.push({
+        title: safeTitle,
+        type: pType,
+        reason: `exceeded max ${maxPanels} panels`,
+      });
+      continue;
+    }
+
+    const targetsResult = importPanelTargets(rp, safeTitle, seenVarNames, options, warnings);
+    if (targetsResult.importedQueries.length === 0) {
+      skippedPanels.push({
+        title: safeTitle,
+        type: pType,
+        reason: targetsResult.emptyReason,
+      });
+      continue;
+    }
+
+    const panelId = makeUniquePanelId(safeTitle, panels.length + 1, usedPanelIds);
+    const { panelIR, widthHint } = buildImportedPanelIR(
+      rp,
+      panelId,
+      pType as PanelType,
+      safeTitle,
+      targetsResult.importedQueries,
+      warnings
+    );
+    widthHints.push(widthHint);
+
+    const originalNumericId =
+      typeof rp.id === 'number' && Number.isInteger(rp.id) && rp.id > 0 ? rp.id : undefined;
+    panelBindings[panelId] = {
+      topIndex: entry.topIndex,
+      ...(entry.rowChildIndex !== undefined ? { rowChildIndex: entry.rowChildIndex } : {}),
+      ...(originalNumericId !== undefined ? { originalNumericId } : {}),
+      importedTargetIndices: targetsResult.importedTargetIndices,
+    };
+    panels.push(panelIR);
+  }
+
+  return { panels, panelBindings, widthHints };
+}
+
+function compareFlattenedPanelGridPos(a: FlattenedPanelEntry, b: FlattenedPanelEntry): number {
+  const ga = (a.panel.gridPos as { y?: number; x?: number } | undefined) ?? {};
+  const gb = (b.panel.gridPos as { y?: number; x?: number } | undefined) ?? {};
+  const dy = (Number(ga.y) || 0) - (Number(gb.y) || 0);
+  if (dy !== 0) {
+    return dy;
+  }
+  return (Number(ga.x) || 0) - (Number(gb.x) || 0);
+}
+
+function importPanelTargets(
+  rp: Record<string, unknown>,
+  safeTitle: string,
+  seenVarNames: Set<string>,
+  options: ImportConversionOptions,
+  warnings: string[]
+): {
+  importedQueries: QueryIR[];
+  importedTargetIndices: number[];
+  emptyReason: string;
+} {
+  const rawTargets = Array.isArray(rp.targets) ? rp.targets : [];
+  const importedQueries: QueryIR[] = [];
+  const importedTargetIndices: number[] = [];
+  const skipCounts = { foreignDs: 0, undeclaredVar: 0, withTemplate: 0 };
+
+  for (let targetIdx = 0; targetIdx < rawTargets.length; targetIdx++) {
+    const query = evaluateRawPanelTarget(
+      rawTargets[targetIdx],
+      rp.datasource,
+      safeTitle,
+      seenVarNames,
+      options,
+      warnings,
+      skipCounts
+    );
+    if (!query) {
+      continue;
+    }
+    if (importedQueries.length >= MAX_QUERIES_PER_PANEL) {
+      warnings.push(`Panel "${safeTitle}": truncated to max ${MAX_QUERIES_PER_PANEL} queries`);
+      break;
+    }
+    importedQueries.push({
+      refId: ALLOWED_QUERY_REF_IDS[importedQueries.length],
+      ...query,
+    });
+    importedTargetIndices.push(targetIdx);
+  }
+
+  if (skipCounts.foreignDs > 0) {
+    warnings.push(
+      `Panel "${safeTitle}": skipped ${skipCounts.foreignDs} query target(s) bound to another datasource`
+    );
+  }
+  const dialectLabel = options.queryKind === 'metricsql' ? 'MetricsQL' : 'Prometheus PromQL';
+  const emptyReason =
+    skipCounts.withTemplate > 0
+      ? 'queries referenced unsupported external VictoriaMetrics WITH templates'
+      : skipCounts.undeclaredVar > 0
+        ? 'queries referenced undeclared or unsupported template variables'
+        : `no compatible ${dialectLabel} queries found for selected datasource`;
+  return { importedQueries, importedTargetIndices, emptyReason };
+}
+
+function evaluateRawPanelTarget(
+  rt: unknown,
+  panelDatasource: unknown,
+  safeTitle: string,
+  seenVarNames: Set<string>,
+  options: ImportConversionOptions,
+  warnings: string[],
+  skipCounts: { foreignDs: number; undeclaredVar: number; withTemplate: number }
+): Omit<QueryIR, 'refId'> | null {
+  if (!rt || typeof rt !== 'object' || Array.isArray(rt)) {
+    return null;
+  }
+  const target = rt as Record<string, unknown>;
+  if (target.hide === true) {
+    return null;
+  }
+  const hasTargetDs =
+    target.datasource !== undefined && target.datasource !== null && target.datasource !== '';
+  const targetDs = hasTargetDs ? target.datasource : panelDatasource;
+  if (!isDatasourceCompatible(targetDs, options)) {
+    skipCounts.foreignDs++;
+    return null;
+  }
+  if (typeof target.withTemplate === 'string' && target.withTemplate.trim() !== '') {
+    skipCounts.withTemplate++;
+    warnings.push(
+      `Panel "${safeTitle}": skipped query referencing external VictoriaMetrics WITH template`
+    );
+    return null;
+  }
+  if (typeof target.expr !== 'string' || target.expr.trim() === '') {
+    return null;
+  }
+  const cleanExpr = sanitizeExprText(target.expr, 512);
+  if (!cleanExpr) {
+    warnings.push(
+      `Panel "${safeTitle}": skipped query exceeding 512 chars or containing forbidden chars/markup`
+    );
+    return null;
+  }
+  const undeclaredVar = findUndeclaredOrLegacyVarRef(cleanExpr, seenVarNames);
+  if (undeclaredVar) {
+    skipCounts.undeclaredVar++;
+    warnings.push(
+      `Panel "${safeTitle}": skipped query referencing undeclared/unsupported variable "${undeclaredVar}"`
+    );
+    return null;
+  }
+  const legend = sanitizeImportedLegend(target.legendFormat, safeTitle, warnings);
+  return {
+    ...(options.queryKind ? { kind: options.queryKind } : {}),
+    expr: cleanExpr,
+    ...(legend ? { legendFormat: legend } : {}),
+  };
+}
+
+function sanitizeImportedLegend(
+  rawLegend: unknown,
+  safeTitle: string,
+  warnings: string[]
+): string {
+  const legend = sanitizePlainText(typeof rawLegend === 'string' ? rawLegend : '', 80);
+  if (legend && LEGEND_VAR_TOKEN_REGEX.test(legend)) {
+    warnings.push(
+      `Panel "${safeTitle}": omitted legendFormat containing template variable token`
+    );
+    return '';
+  }
+  return legend;
+}
+
+function buildImportedPanelIR(
+  rp: Record<string, unknown>,
+  panelId: string,
+  pType: PanelType,
+  safeTitle: string,
+  importedQueries: QueryIR[],
+  warnings: string[]
+): { panelIR: PanelIR; widthHint: 'half' | 'full' } {
+  const fieldDefaults =
+    (rp.fieldConfig as { defaults?: Record<string, unknown> } | undefined)?.defaults ?? {};
+  const rawUnit = typeof fieldDefaults.unit === 'string' ? fieldDefaults.unit : '';
+  let unit: AllowedUnit = 'short';
+  if (rawUnit && ALLOWED_UNIT_SET.has(rawUnit)) {
+    unit = rawUnit as AllowedUnit;
+  } else if (rawUnit) {
+    warnings.push(
+      `Panel "${safeTitle}": unsupported unit "${sanitizePlainText(rawUnit, 40)}" mapped to "short"`
+    );
+  }
+
+  const thresholds = convertThresholds(fieldDefaults.thresholds);
+  const panelDesc = sanitizePlainText(
+    typeof rp.description === 'string' ? rp.description : '',
+    240
+  );
+  const gridPos = rp.gridPos as { w?: number } | undefined;
+  const widthHint: 'half' | 'full' = (Number(gridPos?.w) || 12) > 12 ? 'full' : 'half';
+
+  const panelIR: PanelIR = {
+    id: panelId,
+    type: pType,
+    title: safeTitle,
+    ...(panelDesc ? { description: panelDesc } : {}),
+    datasourceRef: SELECTED_DATASOURCE_REF,
+    ...(importedQueries.length === 1
+      ? {
+          query: {
+            ...(importedQueries[0].kind ? { kind: importedQueries[0].kind } : {}),
+            expr: importedQueries[0].expr,
+            ...(importedQueries[0].legendFormat
+              ? { legendFormat: importedQueries[0].legendFormat }
+              : {}),
+          },
+        }
+      : { queries: importedQueries }),
+    unit,
+    ...(thresholds.length > 0 ? { thresholds } : {}),
+    layout: { row: 0, col: 0, width: widthHint },
+  };
+  return { panelIR, widthHint };
 }
 
 interface FlattenedPanelEntry {
@@ -860,10 +1045,7 @@ function parseLabelValuesQuery(
   rawQuery: unknown,
   activeScope?: ScopeFilter
 ): { labelName: string; metricName?: string } | null {
-  let queryStr = '';
-  if (typeof rawQuery === 'string') {
-    queryStr = rawQuery.trim();
-  } else if (rawQuery && typeof rawQuery === 'object' && !Array.isArray(rawQuery)) {
+  if (rawQuery && typeof rawQuery === 'object' && !Array.isArray(rawQuery)) {
     const qObj = rawQuery as {
       query?: unknown;
       qryType?: unknown;
@@ -872,30 +1054,45 @@ function parseLabelValuesQuery(
       labelFilters?: unknown;
     };
     if (typeof qObj.query === 'string' && qObj.query.trim() !== '') {
-      queryStr = qObj.query.trim();
-    } else if (qObj.qryType === 1 && typeof qObj.label === 'string') {
-      // Grafana 10+ Prometheus & victoriametrics-metrics-datasource object-form Label Values variable.
-      // Reject non-empty labelFilters so import never silently widens variable scope.
-      if (Array.isArray(qObj.labelFilters) && qObj.labelFilters.length > 0) {
-        return null;
-      }
-      const labelName = qObj.label.trim();
-      const metricName = typeof qObj.metric === 'string' ? qObj.metric.trim() : '';
-      if (!VALID_LABEL_NAME.test(labelName) || labelName === '__name__') {
-        return null;
-      }
-      if (metricName) {
-        if (!VALID_METRIC_NAME.test(metricName)) {
-          return null;
-        }
-        return { metricName, labelName };
-      }
-      return { labelName };
+      return parseLabelValuesString(qObj.query.trim(), activeScope);
     }
+    return parseObjectLabelValuesQuery(qObj);
   }
-  if (!queryStr) {
+  if (typeof rawQuery === 'string' && rawQuery.trim() !== '') {
+    return parseLabelValuesString(rawQuery.trim(), activeScope);
+  }
+  return null;
+}
+
+function parseObjectLabelValuesQuery(qObj: {
+  qryType?: unknown;
+  label?: unknown;
+  metric?: unknown;
+  labelFilters?: unknown;
+}): { labelName: string; metricName?: string } | null {
+  if (qObj.qryType !== 1 || typeof qObj.label !== 'string') {
     return null;
   }
+  // Grafana 10+ Prometheus & victoriametrics-metrics-datasource object-form Label Values variable.
+  // Reject non-empty labelFilters so import never silently widens variable scope.
+  if (Array.isArray(qObj.labelFilters) && qObj.labelFilters.length > 0) {
+    return null;
+  }
+  const labelName = qObj.label.trim();
+  const metricName = typeof qObj.metric === 'string' ? qObj.metric.trim() : '';
+  if (!VALID_LABEL_NAME.test(labelName) || labelName === '__name__') {
+    return null;
+  }
+  if (!metricName) {
+    return { labelName };
+  }
+  return VALID_METRIC_NAME.test(metricName) ? { metricName, labelName } : null;
+}
+
+function parseLabelValuesString(
+  queryStr: string,
+  activeScope?: ScopeFilter
+): { labelName: string; metricName?: string } | null {
   const withMetric = queryStr.match(LABEL_VALUES_WITH_METRIC);
   if (withMetric) {
     const metricName = withMetric[1];
@@ -911,24 +1108,9 @@ function parseLabelValuesQuery(
   }
   // Allow a single equality matcher inside label_values(...) ONLY when it matches the active import scope verbatim,
   // enabling lossless round-trips of Studio-generated scoped variable queries without widening arbitrary filters.
-  if (activeScope?.labelName?.trim() && activeScope?.labelValue?.trim()) {
-    const scopedMatch = queryStr.match(LABEL_VALUES_WITH_SCOPED_SELECTOR);
-    if (scopedMatch) {
-      const metricName = scopedMatch[1] ?? '';
-      const filterLabel = scopedMatch[2];
-      const filterValue = unescapePromQLQuotedValue(scopedMatch[3]);
-      const labelName = scopedMatch[4];
-      if (
-        filterLabel === activeScope.labelName.trim() &&
-        filterValue === activeScope.labelValue.trim() &&
-        VALID_LABEL_NAME.test(labelName) &&
-        labelName !== '__name__' &&
-        (!metricName || VALID_METRIC_NAME.test(metricName))
-      ) {
-        return metricName ? { metricName, labelName } : { labelName };
-      }
-      return null;
-    }
+  const scopedResult = parseScopedLabelValuesString(queryStr, activeScope);
+  if (scopedResult !== undefined) {
+    return scopedResult;
   }
   const labelOnly = queryStr.match(LABEL_VALUES_ONLY);
   if (labelOnly) {
@@ -936,6 +1118,33 @@ function parseLabelValuesQuery(
     if (VALID_LABEL_NAME.test(labelName) && labelName !== '__name__') {
       return { labelName };
     }
+  }
+  return null;
+}
+
+function parseScopedLabelValuesString(
+  queryStr: string,
+  activeScope?: ScopeFilter
+): { labelName: string; metricName?: string } | null | undefined {
+  if (!activeScope?.labelName?.trim() || !activeScope?.labelValue?.trim()) {
+    return undefined;
+  }
+  const scopedMatch = queryStr.match(LABEL_VALUES_WITH_SCOPED_SELECTOR);
+  if (!scopedMatch) {
+    return undefined;
+  }
+  const metricName = scopedMatch[1] ?? '';
+  const filterLabel = scopedMatch[2];
+  const filterValue = unescapePromQLQuotedValue(scopedMatch[3]);
+  const labelName = scopedMatch[4];
+  if (
+    filterLabel === activeScope.labelName.trim() &&
+    filterValue === activeScope.labelValue.trim() &&
+    VALID_LABEL_NAME.test(labelName) &&
+    labelName !== '__name__' &&
+    (!metricName || VALID_METRIC_NAME.test(metricName))
+  ) {
+    return metricName ? { metricName, labelName } : { labelName };
   }
   return null;
 }

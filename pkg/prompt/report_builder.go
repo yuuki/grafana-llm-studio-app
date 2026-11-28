@@ -21,70 +21,86 @@ func SanitizeAnalyzePayload(in ir.AnalyzeStatusPayload) ir.AnalyzeStatusPayload 
 		}
 	}
 	out := ir.AnalyzeStatusPayload{
-		DatasourceUID:    SanitizeUntrustedText(in.DatasourceUID, 64),
-		Scope:            sanitizedScope,
-		Window:           in.Window,
-		BaselineMode:     in.BaselineMode,
-		Language:         in.Language,
-		UserFocus:        sanitizeReportInputText(in.UserFocus, ir.MaxAnalyzeFocusRunes),
-		CollectionStatus: in.CollectionStatus,
+		DatasourceUID:      SanitizeUntrustedText(in.DatasourceUID, 64),
+		Scope:              sanitizedScope,
+		Window:             in.Window,
+		BaselineMode:       in.BaselineMode,
+		Language:           in.Language,
+		UserFocus:          sanitizeReportInputText(in.UserFocus, ir.MaxAnalyzeFocusRunes),
+		CollectionStatus:   in.CollectionStatus,
+		DashboardContext:   sanitizeDashboardContext(in.DashboardContext),
+		CollectionWarnings: sanitizeCollectionWarningItems(in.CollectionWarnings),
 		Evidence: ir.ReportEvidenceBundle{
 			CollectedAt: strings.TrimSpace(in.Evidence.CollectedAt),
-			Alerts:      make([]ir.AlertEvidenceItem, 0, min(len(in.Evidence.Alerts), ir.MaxAlertEvidenceItems)),
-			Rules:       make([]ir.RuleEvidenceItem, 0, min(len(in.Evidence.Rules), ir.MaxRuleEvidenceItems)),
-			Metrics:     make([]ir.MetricEvidenceItem, 0, min(len(in.Evidence.Metrics), ir.MaxMetricEvidenceItems)),
+			Alerts:      sanitizeAlertItems(in.Evidence.Alerts),
+			Rules:       sanitizeRuleItems(in.Evidence.Rules),
+			Metrics:     sanitizeMetricItems(in.Evidence.Metrics),
+			StatusNotes: sanitizeStatusNoteItems(in.Evidence.StatusNotes),
 		},
 	}
+	return out
+}
 
-	if in.DashboardContext != nil {
-		out.DashboardContext = &ir.ReportDashboardContext{
-			UID:                SanitizeUntrustedText(in.DashboardContext.UID, 64),
-			Title:              sanitizeReportInputText(in.DashboardContext.Title, ir.MaxTitleLen),
-			PanelCount:         in.DashboardContext.PanelCount,
-			AnalyzedPanelCount: in.DashboardContext.AnalyzedPanelCount,
-		}
+func sanitizeDashboardContext(ctx *ir.ReportDashboardContext) *ir.ReportDashboardContext {
+	if ctx == nil {
+		return nil
 	}
+	return &ir.ReportDashboardContext{
+		UID:                SanitizeUntrustedText(ctx.UID, 64),
+		Title:              sanitizeReportInputText(ctx.Title, ir.MaxTitleLen),
+		PanelCount:         ctx.PanelCount,
+		AnalyzedPanelCount: ctx.AnalyzedPanelCount,
+	}
+}
 
-	for i, a := range in.Evidence.Alerts {
-		if i >= ir.MaxAlertEvidenceItems {
+func sanitizeEvidenceLabels(labels map[string]string) map[string]string {
+	if len(labels) == 0 {
+		return nil
+	}
+	keys := make([]string, 0, len(labels))
+	for k := range labels {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	cleanLabels := make(map[string]string, min(len(keys), ir.MaxEvidenceLabels))
+	for _, k := range keys {
+		if len(cleanLabels) >= ir.MaxEvidenceLabels {
 			break
 		}
-		var cleanLabels map[string]string
-		if len(a.Labels) > 0 {
-			keys := make([]string, 0, len(a.Labels))
-			for k := range a.Labels {
-				keys = append(keys, k)
-			}
-			sort.Strings(keys)
-			cleanLabels = make(map[string]string, min(len(keys), ir.MaxEvidenceLabels))
-			for _, k := range keys {
-				if len(cleanLabels) >= ir.MaxEvidenceLabels {
-					break
-				}
-				if !validLabelName.MatchString(k) {
-					continue
-				}
-				cleanLabels[k] = sanitizeReportInputText(a.Labels[k], ir.MaxEvidenceLabelValRune)
-			}
+		if !validLabelName.MatchString(k) {
+			continue
 		}
-		out.Evidence.Alerts = append(out.Evidence.Alerts, ir.AlertEvidenceItem{
+		cleanLabels[k] = sanitizeReportInputText(labels[k], ir.MaxEvidenceLabelValRune)
+	}
+	return cleanLabels
+}
+
+func sanitizeAlertItems(alerts []ir.AlertEvidenceItem) []ir.AlertEvidenceItem {
+	limit := min(len(alerts), ir.MaxAlertEvidenceItems)
+	out := make([]ir.AlertEvidenceItem, 0, limit)
+	for i := 0; i < limit; i++ {
+		a := alerts[i]
+		out = append(out, ir.AlertEvidenceItem{
 			ID:           a.ID,
 			AlertName:    sanitizeReportInputText(a.AlertName, 128),
 			State:        a.State,
 			Severity:     sanitizeReportInputText(a.Severity, 32),
 			StartsAt:     strings.TrimSpace(a.StartsAt),
-			Labels:       cleanLabels,
+			Labels:       sanitizeEvidenceLabels(a.Labels),
 			Summary:      sanitizeReportInputText(a.Summary, ir.MaxEvidenceSummaryRunes),
 			Description:  sanitizeReportInputText(a.Description, ir.MaxEvidenceDescRunes),
 			MatchesScope: a.MatchesScope,
 		})
 	}
+	return out
+}
 
-	for i, r := range in.Evidence.Rules {
-		if i >= ir.MaxRuleEvidenceItems {
-			break
-		}
-		out.Evidence.Rules = append(out.Evidence.Rules, ir.RuleEvidenceItem{
+func sanitizeRuleItems(rules []ir.RuleEvidenceItem) []ir.RuleEvidenceItem {
+	limit := min(len(rules), ir.MaxRuleEvidenceItems)
+	out := make([]ir.RuleEvidenceItem, 0, limit)
+	for i := 0; i < limit; i++ {
+		r := rules[i]
+		out = append(out, ir.RuleEvidenceItem{
 			ID:                r.ID,
 			RuleName:          sanitizeReportInputText(r.RuleName, 128),
 			Group:             sanitizeReportInputText(r.Group, 100),
@@ -95,12 +111,15 @@ func SanitizeAnalyzePayload(in ir.AnalyzeStatusPayload) ir.AnalyzeStatusPayload 
 			MatchesScope:      r.MatchesScope,
 		})
 	}
+	return out
+}
 
-	for i, m := range in.Evidence.Metrics {
-		if i >= ir.MaxMetricEvidenceItems {
-			break
-		}
-		out.Evidence.Metrics = append(out.Evidence.Metrics, ir.MetricEvidenceItem{
+func sanitizeMetricItems(metrics []ir.MetricEvidenceItem) []ir.MetricEvidenceItem {
+	limit := min(len(metrics), ir.MaxMetricEvidenceItems)
+	out := make([]ir.MetricEvidenceItem, 0, limit)
+	for i := 0; i < limit; i++ {
+		m := metrics[i]
+		out = append(out, ir.MetricEvidenceItem{
 			ID:                m.ID,
 			PanelTitle:        sanitizeReportInputText(m.PanelTitle, ir.MaxTitleLen),
 			Unit:              sanitizeReportInputText(m.Unit, 32),
@@ -117,34 +136,39 @@ func SanitizeAnalyzePayload(in ir.AnalyzeStatusPayload) ir.AnalyzeStatusPayload 
 			AnomalyHint:       m.AnomalyHint,
 		})
 	}
+	return out
+}
 
-	if len(in.Evidence.StatusNotes) > 0 {
-		out.Evidence.StatusNotes = make([]ir.StatusNoteEvidenceItem, 0, min(len(in.Evidence.StatusNotes), ir.MaxStatusNoteItems))
-		for i, s := range in.Evidence.StatusNotes {
-			if i >= ir.MaxStatusNoteItems {
-				break
-			}
-			out.Evidence.StatusNotes = append(out.Evidence.StatusNotes, ir.StatusNoteEvidenceItem{
-				ID:      s.ID,
-				Message: sanitizeReportInputText(s.Message, ir.MaxEvidenceSummaryRunes),
-			})
-		}
+func sanitizeStatusNoteItems(notes []ir.StatusNoteEvidenceItem) []ir.StatusNoteEvidenceItem {
+	if len(notes) == 0 {
+		return nil
 	}
-
-	if len(in.CollectionWarnings) > 0 {
-		out.CollectionWarnings = make([]ir.CollectionWarningItem, 0, min(len(in.CollectionWarnings), ir.MaxCollectionWarnings))
-		for i, w := range in.CollectionWarnings {
-			if i >= ir.MaxCollectionWarnings {
-				break
-			}
-			out.CollectionWarnings = append(out.CollectionWarnings, ir.CollectionWarningItem{
-				ID:      w.ID,
-				Code:    w.Code,
-				Message: sanitizeReportInputText(w.Message, ir.MaxEvidenceSummaryRunes),
-			})
-		}
+	limit := min(len(notes), ir.MaxStatusNoteItems)
+	out := make([]ir.StatusNoteEvidenceItem, 0, limit)
+	for i := 0; i < limit; i++ {
+		s := notes[i]
+		out = append(out, ir.StatusNoteEvidenceItem{
+			ID:      s.ID,
+			Message: sanitizeReportInputText(s.Message, ir.MaxEvidenceSummaryRunes),
+		})
 	}
+	return out
+}
 
+func sanitizeCollectionWarningItems(warnings []ir.CollectionWarningItem) []ir.CollectionWarningItem {
+	if len(warnings) == 0 {
+		return nil
+	}
+	limit := min(len(warnings), ir.MaxCollectionWarnings)
+	out := make([]ir.CollectionWarningItem, 0, limit)
+	for i := 0; i < limit; i++ {
+		w := warnings[i]
+		out = append(out, ir.CollectionWarningItem{
+			ID:      w.ID,
+			Code:    w.Code,
+			Message: sanitizeReportInputText(w.Message, ir.MaxEvidenceSummaryRunes),
+		})
+	}
 	return out
 }
 
