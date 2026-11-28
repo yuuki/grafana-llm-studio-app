@@ -19,16 +19,10 @@ func (m *Manager) AnalyzeStatus(ctx context.Context, owner Owner, in ir.AnalyzeS
 	if err := validateOwner(owner); err != nil {
 		return JobSnapshot{}, err
 	}
-
-	dsUID := strings.TrimSpace(in.DatasourceUID)
-	if len(in.Evidence.Metrics) > 0 || in.DashboardContext != nil {
-		if dsUID == "" || !m.isDatasourceAllowed(dsUID) {
-			return JobSnapshot{}, fmt.Errorf("%w: %q", ErrDatasourceDenied, dsUID)
-		}
-	} else if dsUID != "" && !m.isDatasourceAllowed(dsUID) {
-		return JobSnapshot{}, fmt.Errorf("%w: %q", ErrDatasourceDenied, dsUID)
+	dsUID, err := m.validateAnalyzeDatasource(in)
+	if err != nil {
+		return JobSnapshot{}, err
 	}
-
 	allowedEvidenceIDs, err := ir.ValidateAnalyzePayload(in)
 	if err != nil {
 		return JobSnapshot{}, err
@@ -76,40 +70,73 @@ func (m *Manager) AnalyzeStatus(ctx context.Context, owner Owner, in ir.AnalyzeS
 		Payload: sanitized,
 	})
 	if err != nil {
-		if errors.Is(err, context.Canceled) || opCtx.Err() == context.Canceled {
-			snap, _ := m.finishReportJobWithStage(ctx, owner, jobID, opToken, StatusCancelled, nil, "Status analysis was cancelled.", "Status analysis was cancelled.", &meta)
-			return snap, ErrJobCancelled
-		}
-		redactedErr := prompt.RedactSecretsAndURLs(err.Error())
-		if redactedErr == "" {
-			redactedErr = "upstream LLM error"
-		}
-		errMsg := fmt.Sprintf("LLM status analysis failed: %s", redactedErr)
-		retErr := err
-		if !errors.Is(err, context.DeadlineExceeded) &&
-			!errors.Is(err, llm.ErrOutputTruncated) &&
-			!errors.Is(err, llm.ErrOutputRefused) &&
-			!errors.Is(err, llm.ErrLLMUnavailable) {
-			retErr = fmt.Errorf("%w: %s", llm.ErrLLMUnavailable, redactedErr)
-		}
-		snap, finishErr := m.finishReportJobWithStage(ctx, owner, jobID, opToken, StatusFailed, nil, "", errMsg, &meta)
-		if errors.Is(finishErr, ErrJobCancelled) {
-			return snap, ErrJobCancelled
-		}
-		return snap, retErr
+		return m.handleAnalyzeLLMError(ctx, opCtx, owner, jobID, opToken, &meta, err)
 	}
 
+	return m.decodeAndPersistStatusReport(ctx, owner, jobID, opToken, raw, &meta, allowedEvidenceIDs)
+}
+
+func (m *Manager) validateAnalyzeDatasource(in ir.AnalyzeStatusPayload) (string, error) {
+	dsUID := strings.TrimSpace(in.DatasourceUID)
+	if len(in.Evidence.Metrics) > 0 || in.DashboardContext != nil {
+		if dsUID == "" || !m.isDatasourceAllowed(dsUID) {
+			return "", fmt.Errorf("%w: %q", ErrDatasourceDenied, dsUID)
+		}
+		return dsUID, nil
+	}
+	if dsUID != "" && !m.isDatasourceAllowed(dsUID) {
+		return "", fmt.Errorf("%w: %q", ErrDatasourceDenied, dsUID)
+	}
+	return dsUID, nil
+}
+
+func (m *Manager) handleAnalyzeLLMError(
+	ctx, opCtx context.Context,
+	owner Owner,
+	jobID string,
+	opToken uint64,
+	meta *llm.CompletionMeta,
+	err error,
+) (JobSnapshot, error) {
+	if errors.Is(err, context.Canceled) || opCtx.Err() == context.Canceled {
+		snap, _ := m.finishReportJobWithStage(ctx, owner, jobID, opToken, StatusCancelled, nil, "Status analysis was cancelled.", "Status analysis was cancelled.", meta)
+		return snap, ErrJobCancelled
+	}
+	redactedErr := prompt.RedactSecretsAndURLs(err.Error())
+	if redactedErr == "" {
+		redactedErr = "upstream LLM error"
+	}
+	errMsg := fmt.Sprintf("LLM status analysis failed: %s", redactedErr)
+	retErr := err
+	if !errors.Is(err, context.DeadlineExceeded) &&
+		!errors.Is(err, llm.ErrOutputTruncated) &&
+		!errors.Is(err, llm.ErrOutputRefused) &&
+		!errors.Is(err, llm.ErrLLMUnavailable) {
+		retErr = fmt.Errorf("%w: %s", llm.ErrLLMUnavailable, redactedErr)
+	}
+	snap, finishErr := m.finishReportJobWithStage(ctx, owner, jobID, opToken, StatusFailed, nil, "", errMsg, meta)
+	if errors.Is(finishErr, ErrJobCancelled) {
+		return snap, ErrJobCancelled
+	}
+	return snap, retErr
+}
+
+func (m *Manager) decodeAndPersistStatusReport(
+	ctx context.Context,
+	owner Owner,
+	jobID string,
+	opToken uint64,
+	raw []byte,
+	meta *llm.CompletionMeta,
+	allowedEvidenceIDs map[string]bool,
+) (JobSnapshot, error) {
 	m.setStatusIfToken(ctx, owner, jobID, opToken, StatusValidatingReport)
 	m.emitStage(ctx, jobID, OperationAnalyze, StatusValidatingReport)
 
 	report, err := ir.DecodeStrictStatusReport(raw)
 	if err != nil {
 		errMsg := fmt.Sprintf("Status report JSON schema validation failed: %s", prompt.RedactSecretsAndURLs(err.Error()))
-		snap, finishErr := m.finishReportJobWithStage(ctx, owner, jobID, opToken, StatusFailed, nil, "", errMsg, &meta)
-		if errors.Is(finishErr, ErrJobCancelled) {
-			return snap, ErrJobCancelled
-		}
-		return snap, err
+		return m.failReportJob(ctx, owner, jobID, opToken, errMsg, meta, err)
 	}
 
 	// Defense-in-depth: redact any secret-like strings before final validation & persistence
@@ -118,14 +145,26 @@ func (m *Manager) AnalyzeStatus(ctx context.Context, owner Owner, in ir.AnalyzeS
 
 	if err := ir.ValidateStatusReport(report, allowedEvidenceIDs); err != nil {
 		errMsg := fmt.Sprintf("Status report grounding or hygiene validation failed: %s", prompt.RedactSecretsAndURLs(err.Error()))
-		snap, finishErr := m.finishReportJobWithStage(ctx, owner, jobID, opToken, StatusFailed, nil, "", errMsg, &meta)
-		if errors.Is(finishErr, ErrJobCancelled) {
-			return snap, ErrJobCancelled
-		}
-		return snap, err
+		return m.failReportJob(ctx, owner, jobID, opToken, errMsg, meta, err)
 	}
 
-	return m.finishReportJobWithStage(ctx, owner, jobID, opToken, StatusReady, &report, report.ExecutiveSummary, "", &meta)
+	return m.finishReportJobWithStage(ctx, owner, jobID, opToken, StatusReady, &report, report.ExecutiveSummary, "", meta)
+}
+
+func (m *Manager) failReportJob(
+	ctx context.Context,
+	owner Owner,
+	jobID string,
+	opToken uint64,
+	errMsg string,
+	meta *llm.CompletionMeta,
+	cause error,
+) (JobSnapshot, error) {
+	snap, finishErr := m.finishReportJobWithStage(ctx, owner, jobID, opToken, StatusFailed, nil, "", errMsg, meta)
+	if errors.Is(finishErr, ErrJobCancelled) {
+		return snap, ErrJobCancelled
+	}
+	return snap, cause
 }
 
 func (m *Manager) finishReportJobWithStage(

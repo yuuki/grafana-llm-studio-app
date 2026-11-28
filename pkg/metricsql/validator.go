@@ -415,108 +415,144 @@ func (s *walkState) validateMetricExpr(me *vmql.MetricExpr) error {
 	if len(me.LabelFilterss) == 0 {
 		return fmt.Errorf("%w: metric selector must specify an explicit metric name", ErrPolicyViolation)
 	}
-
 	for branchIdx, lfs := range me.LabelFilterss {
-		if len(lfs) == 0 {
-			return fmt.Errorf("%w: metric selector branch %d is empty", ErrPolicyViolation, branchIdx)
+		if err := s.validateMetricBranch(branchIdx, lfs); err != nil {
+			return err
 		}
-		s.selectorCount++
-		if s.policy.MaxSelectorsPerExpr > 0 && s.selectorCount > s.policy.MaxSelectorsPerExpr {
-			return fmt.Errorf("%w: expression references %d selectors (max %d)", ErrPolicyViolation, s.selectorCount, s.policy.MaxSelectorsPerExpr)
+	}
+	return nil
+}
+
+func (s *walkState) validateMetricBranch(branchIdx int, lfs []vmql.LabelFilter) error {
+	if len(lfs) == 0 {
+		return fmt.Errorf("%w: metric selector branch %d is empty", ErrPolicyViolation, branchIdx)
+	}
+	s.selectorCount++
+	if s.policy.MaxSelectorsPerExpr > 0 && s.selectorCount > s.policy.MaxSelectorsPerExpr {
+		return fmt.Errorf("%w: expression references %d selectors (max %d)", ErrPolicyViolation, s.selectorCount, s.policy.MaxSelectorsPerExpr)
+	}
+
+	// Reset per-branch state so EVERY OR-branch must independently satisfy metric + scope rules.
+	branchMetricName, err := extractBranchMetricName(lfs)
+	if err != nil {
+		return err
+	}
+	if !s.seenMetrics[branchMetricName] {
+		s.seenMetrics[branchMetricName] = true
+		s.res.ReferencedMetrics = append(s.res.ReferencedMetrics, branchMetricName)
+	}
+
+	var catalogItem ir.MetricCatalogItem
+	inCatalog := false
+	if s.policy.RequireCatalogMatch {
+		item, ok := s.catalogByName[branchMetricName]
+		if !ok {
+			return fmt.Errorf("%w: %q", ErrMetricNotInCatalog, branchMetricName)
 		}
+		catalogItem = item
+		inCatalog = true
+	}
 
-		// Reset per-branch state so EVERY OR-branch must independently satisfy metric + scope rules.
-		branchMetricName := ""
-		metricNameCount := 0
+	return s.validateBranchMatchers(lfs, branchMetricName, catalogItem, inCatalog)
+}
 
-		for _, lf := range lfs {
-			if lf.Label == "__name__" {
-				if lf.IsNegative || lf.IsRegexp {
-					return fmt.Errorf("%w: non-equality matching on __name__ is disallowed", ErrPolicyViolation)
-				}
-				if query.ContainsVarSyntax.MatchString(lf.Value) {
-					return fmt.Errorf("%w: template variables are forbidden in __name__ matcher", ErrPolicyViolation)
-				}
-				metricNameCount++
-				if metricNameCount > 1 {
-					return fmt.Errorf("%w: duplicate __name__ matcher in selector is disallowed", ErrPolicyViolation)
-				}
-				branchMetricName = lf.Value
-				continue
+func extractBranchMetricName(lfs []vmql.LabelFilter) (string, error) {
+	branchMetricName := ""
+	metricNameCount := 0
+	for _, lf := range lfs {
+		if lf.Label == "__name__" {
+			if lf.IsNegative || lf.IsRegexp {
+				return "", fmt.Errorf("%w: non-equality matching on __name__ is disallowed", ErrPolicyViolation)
 			}
-			if !query.ValidPromLabelName.MatchString(lf.Label) {
-				return fmt.Errorf("%w: invalid label name %q in selector", ErrPolicyViolation, lf.Label)
+			if query.ContainsVarSyntax.MatchString(lf.Value) {
+				return "", fmt.Errorf("%w: template variables are forbidden in __name__ matcher", ErrPolicyViolation)
 			}
-		}
-
-		if branchMetricName == "" {
-			return fmt.Errorf("%w: metric selector must specify an explicit metric name", ErrPolicyViolation)
-		}
-		if query.ContainsVarSyntax.MatchString(branchMetricName) {
-			return fmt.Errorf("%w: template variables cannot be used as metric names (%q)", ErrPolicyViolation, branchMetricName)
-		}
-		if !s.seenMetrics[branchMetricName] {
-			s.seenMetrics[branchMetricName] = true
-			s.res.ReferencedMetrics = append(s.res.ReferencedMetrics, branchMetricName)
-		}
-
-		var catalogItem ir.MetricCatalogItem
-		inCatalog := false
-		if s.policy.RequireCatalogMatch {
-			item, ok := s.catalogByName[branchMetricName]
-			if !ok {
-				return fmt.Errorf("%w: %q", ErrMetricNotInCatalog, branchMetricName)
+			metricNameCount++
+			if metricNameCount > 1 {
+				return "", fmt.Errorf("%w: duplicate __name__ matcher in selector is disallowed", ErrPolicyViolation)
 			}
-			catalogItem = item
-			inCatalog = true
+			branchMetricName = lf.Value
+			continue
 		}
-
-		branchScopeMatched := s.normalizedScope == nil
-		allowedLabelSet := make(map[string]bool, len(catalogItem.Labels))
-		for _, lbl := range catalogItem.Labels {
-			allowedLabelSet[lbl] = true
+		if !query.ValidPromLabelName.MatchString(lf.Label) {
+			return "", fmt.Errorf("%w: invalid label name %q in selector", ErrPolicyViolation, lf.Label)
 		}
+	}
+	if branchMetricName == "" {
+		return "", fmt.Errorf("%w: metric selector must specify an explicit metric name", ErrPolicyViolation)
+	}
+	if query.ContainsVarSyntax.MatchString(branchMetricName) {
+		return "", fmt.Errorf("%w: template variables cannot be used as metric names (%q)", ErrPolicyViolation, branchMetricName)
+	}
+	return branchMetricName, nil
+}
 
-		for _, lf := range lfs {
-			if lf.Label == "__name__" {
-				continue
-			}
-			qm := toQueryMatcher(lf)
-			if qm.Type == query.MatchNotEqual && qm.Value == "" {
-				return fmt.Errorf("%w: catch-all negative matcher %s!=\"\" is disallowed", ErrPolicyViolation, qm.Name)
-			}
+func (s *walkState) validateBranchMatchers(
+	lfs []vmql.LabelFilter,
+	branchMetricName string,
+	catalogItem ir.MetricCatalogItem,
+	inCatalog bool,
+) error {
+	branchScopeMatched := s.normalizedScope == nil
+	allowedLabelSet := make(map[string]bool, len(catalogItem.Labels))
+	for _, lbl := range catalogItem.Labels {
+		allowedLabelSet[lbl] = true
+	}
 
-			if query.ContainsVarSyntax.MatchString(qm.Value) {
-				v, err := query.ValidateVariableMatcher(qm, s.varByName, s.policy.MaxRegexLength, s.policy.MaxRegexRepeat)
-				if err != nil {
-					return err
-				}
-				if !s.seenVars[v.Name] {
-					s.seenVars[v.Name] = true
-					s.res.ReferencedVariables = append(s.res.ReferencedVariables, v.Name)
-				}
-			} else {
-				if qm.Type == query.MatchRegexp || qm.Type == query.MatchNotRegexp {
-					if err := query.ValidateRegexMatcher(qm.Name, qm.Type, qm.Value, s.policy.MaxRegexLength, s.policy.MaxRegexRepeat); err != nil {
-						return err
-					}
-				}
-				if !branchScopeMatched && qm.Name == s.normalizedScope.LabelName && qm.Type == query.MatchEqual && qm.Value == s.normalizedScope.LabelValue {
-					branchScopeMatched = true
-				}
-			}
-
-			if inCatalog && len(allowedLabelSet) > 0 && !allowedLabelSet[qm.Name] {
-				s.res.Warnings = append(s.res.Warnings, fmt.Sprintf("label %q not listed in sampled labels for %q", qm.Name, branchMetricName))
-			}
+	for _, lf := range lfs {
+		if lf.Label == "__name__" {
+			continue
 		}
-
-		if !branchScopeMatched {
-			return fmt.Errorf("%w: selector for %q must retain literal %s=%q", ErrScopeFilterMissing, branchMetricName, s.normalizedScope.LabelName, s.normalizedScope.LabelValue)
+		matched, err := s.validateSingleBranchMatcher(toQueryMatcher(lf), branchMetricName, allowedLabelSet, inCatalog)
+		if err != nil {
+			return err
+		}
+		if matched {
+			branchScopeMatched = true
 		}
 	}
 
+	if !branchScopeMatched {
+		return fmt.Errorf("%w: selector for %q must retain literal %s=%q", ErrScopeFilterMissing, branchMetricName, s.normalizedScope.LabelName, s.normalizedScope.LabelValue)
+	}
 	return nil
+}
+
+func (s *walkState) validateSingleBranchMatcher(
+	qm query.Matcher,
+	branchMetricName string,
+	allowedLabelSet map[string]bool,
+	inCatalog bool,
+) (bool, error) {
+	if qm.Type == query.MatchNotEqual && qm.Value == "" {
+		return false, fmt.Errorf("%w: catch-all negative matcher %s!=\"\" is disallowed", ErrPolicyViolation, qm.Name)
+	}
+
+	scopeMatched := false
+	if query.ContainsVarSyntax.MatchString(qm.Value) {
+		v, err := query.ValidateVariableMatcher(qm, s.varByName, s.policy.MaxRegexLength, s.policy.MaxRegexRepeat)
+		if err != nil {
+			return false, err
+		}
+		if !s.seenVars[v.Name] {
+			s.seenVars[v.Name] = true
+			s.res.ReferencedVariables = append(s.res.ReferencedVariables, v.Name)
+		}
+	} else {
+		if qm.Type == query.MatchRegexp || qm.Type == query.MatchNotRegexp {
+			if err := query.ValidateRegexMatcher(qm.Name, qm.Type, qm.Value, s.policy.MaxRegexLength, s.policy.MaxRegexRepeat); err != nil {
+				return false, err
+			}
+		}
+		if s.normalizedScope != nil && qm.Name == s.normalizedScope.LabelName && qm.Type == query.MatchEqual && qm.Value == s.normalizedScope.LabelValue {
+			scopeMatched = true
+		}
+	}
+
+	if inCatalog && len(allowedLabelSet) > 0 && !allowedLabelSet[qm.Name] {
+		s.res.Warnings = append(s.res.Warnings, fmt.Sprintf("label %q not listed in sampled labels for %q", qm.Name, branchMetricName))
+	}
+	return scopeMatched, nil
 }
 
 func (s *walkState) validateRollupExpr(re *vmql.RollupExpr, subqueryDepth int, astDepth int) error {

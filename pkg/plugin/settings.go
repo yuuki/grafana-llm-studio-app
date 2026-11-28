@@ -262,24 +262,48 @@ func LoadSettingsWithOptions(appSettings backend.AppInstanceSettings, opts LoadO
 	}
 
 	trustedAppURL := strings.TrimSpace(opts.TrustedGrafanaAppURL)
-	pinnedRedisAddr := strings.TrimSpace(opts.PinnedRedisAddr)
-	pinnedPostgresAddr := strings.TrimSpace(opts.PinnedPostgresAddr)
+	rawGrafanaURL, reasoning, effectiveRepairs, err := normalizeLLMSettings(&js, trustedAppURL)
+	if err != nil {
+		return Settings{}, err
+	}
+	normalizeNumericLimits(&js)
+	if err := normalizeDatasourceSettings(&js); err != nil {
+		return Settings{}, err
+	}
+	if err := normalizeJobStoreSettings(&js, strings.TrimSpace(opts.PinnedRedisAddr), strings.TrimSpace(opts.PinnedPostgresAddr)); err != nil {
+		return Settings{}, err
+	}
 
+	token, redisPass, postgresPass, err := unwrapSettingsSecrets(appSettings.DecryptedSecureJSONData, js, rawGrafanaURL, trustedAppURL)
+	if err != nil {
+		return Settings{}, err
+	}
+
+	return Settings{
+		JSONSettings:             js,
+		EffectiveReasoningEffort: reasoning,
+		EffectiveMaxRepairs:      effectiveRepairs,
+		llmServiceAccountToken:   token,
+		redisPassword:            redisPass,
+		postgresPassword:         postgresPass,
+	}, nil
+}
+
+func normalizeLLMSettings(js *JSONSettings, trustedAppURL string) (string, string, int, error) {
 	if strings.TrimSpace(js.LLMMode) == "" {
 		js.LLMMode = LLMModeGrafanaLLMApp
 	}
 	rawGrafanaURL := strings.TrimSpace(js.GrafanaURL)
-	if rawGrafanaURL == "" {
-		if trustedAppURL != "" {
-			js.GrafanaURL = trustedAppURL
-		} else {
-			js.GrafanaURL = "http://localhost:3000"
-		}
-	} else {
+	switch {
+	case rawGrafanaURL != "":
 		js.GrafanaURL = rawGrafanaURL
+	case trustedAppURL != "":
+		js.GrafanaURL = trustedAppURL
+	default:
+		js.GrafanaURL = "http://localhost:3000"
 	}
 	if err := validateGrafanaURL(js.GrafanaURL, trustedAppURL); err != nil {
-		return Settings{}, err
+		return "", "", 0, err
 	}
 
 	if js.ModelTier != string(llmclient.ModelBase) && js.ModelTier != string(llmclient.ModelLarge) {
@@ -291,7 +315,7 @@ func LoadSettingsWithOptions(appSettings backend.AppInstanceSettings, opts LoadO
 		js.StructuredOutputMode = llm.StructuredOutputJSONSchema
 	}
 	if !allowedStructuredOutputModes[js.StructuredOutputMode] {
-		return Settings{}, fmt.Errorf("unsupported structuredOutputMode %q (allowed: json_schema, json_object)", js.StructuredOutputMode)
+		return "", "", 0, fmt.Errorf("unsupported structuredOutputMode %q (allowed: json_schema, json_object)", js.StructuredOutputMode)
 	}
 
 	js.TokenLimitField = strings.TrimSpace(strings.ToLower(js.TokenLimitField))
@@ -299,7 +323,7 @@ func LoadSettingsWithOptions(appSettings backend.AppInstanceSettings, opts LoadO
 		js.TokenLimitField = llm.TokenLimitMaxCompletionTokens
 	}
 	if !allowedTokenLimitFields[js.TokenLimitField] {
-		return Settings{}, fmt.Errorf("unsupported tokenLimitField %q (allowed: max_completion_tokens, max_tokens)", js.TokenLimitField)
+		return "", "", 0, fmt.Errorf("unsupported tokenLimitField %q (allowed: max_completion_tokens, max_tokens)", js.TokenLimitField)
 	}
 
 	// Default ReasoningEffort to "" (omitted) so standard OpenAI and OpenAI-compatible models
@@ -310,125 +334,99 @@ func LoadSettingsWithOptions(appSettings backend.AppInstanceSettings, opts LoadO
 		reasoning = strings.TrimSpace(strings.ToLower(*js.ReasoningEffort))
 	}
 	if !allowedReasoningEfforts[reasoning] {
-		return Settings{}, fmt.Errorf("unsupported reasoningEffort %q (allowed: \"\", low, medium, high)", reasoning)
-	}
-
-	if js.MaxPanels <= 0 || js.MaxPanels > ir.MaxPanelsHardCap {
-		js.MaxPanels = ir.DefaultMaxPanels
+		return "", "", 0, fmt.Errorf("unsupported reasoningEffort %q (allowed: \"\", low, medium, high)", reasoning)
 	}
 
 	// Support explicit maxRepairAttempts=0 to disable automatic syntax repair.
 	effectiveRepairs := 2
 	if js.MaxRepairAttempts != nil {
-		effectiveRepairs = *js.MaxRepairAttempts
-		if effectiveRepairs < 0 {
-			effectiveRepairs = 0
-		}
-		if effectiveRepairs > 2 {
-			effectiveRepairs = 2
-		}
+		effectiveRepairs = min(max(*js.MaxRepairAttempts, 0), 2)
 	}
 
-	if js.MaxOutputTokens <= 0 || js.MaxOutputTokens > 8192 {
-		js.MaxOutputTokens = 2048
+	if err := validateLLMModeSettings(js); err != nil {
+		return "", "", 0, err
 	}
-	if js.LLMTimeoutSeconds <= 0 || js.LLMTimeoutSeconds > 120 {
-		js.LLMTimeoutSeconds = 45
-	}
-	if js.JobDeadlineSeconds <= 0 || js.JobDeadlineSeconds > 180 {
-		js.JobDeadlineSeconds = 90
-	}
-	if js.MaxConcurrentJobs <= 0 || js.MaxConcurrentJobs > 16 {
-		js.MaxConcurrentJobs = 4
-	}
-	if js.ValidationTimeoutSec <= 0 || js.ValidationTimeoutSec > 30 {
-		js.ValidationTimeoutSec = 10
-	}
-	if js.MaxConcurrentQueries <= 0 || js.MaxConcurrentQueries > 4 {
-		js.MaxConcurrentQueries = 2
-	}
+	return rawGrafanaURL, reasoning, effectiveRepairs, nil
+}
 
-	cleaned := make([]string, 0, len(js.AllowedDatasourceUIDs))
-	for _, uid := range js.AllowedDatasourceUIDs {
-		u := strings.TrimSpace(uid)
-		if u != "" {
-			cleaned = append(cleaned, u)
-		}
-	}
-	js.AllowedDatasourceUIDs = cleaned
-
-	if len(js.DatasourceDialects) > 0 {
-		normalizedDialects := make(map[string]string, len(js.DatasourceDialects))
-		for rawUID, rawKind := range js.DatasourceDialects {
-			uid := strings.TrimSpace(rawUID)
-			if uid == "" {
-				continue
-			}
-			kStr := strings.TrimSpace(strings.ToLower(rawKind))
-			if kStr == "" {
-				continue
-			}
-			parsed, err := query.ParseKind(kStr)
-			if err != nil {
-				return Settings{}, fmt.Errorf("datasourceDialects[%q]: %w", uid, err)
-			}
-			normalizedDialects[uid] = string(parsed)
-		}
-		js.DatasourceDialects = normalizedDialects
-	} else {
-		js.DatasourceDialects = nil
-	}
-
+func validateLLMModeSettings(js *JSONSettings) error {
 	if js.LLMMode != LLMModeGrafanaLLMApp && js.LLMMode != LLMModeMock {
-		return Settings{}, fmt.Errorf("unsupported llmMode %q (must be %q or %q)", js.LLMMode, LLMModeGrafanaLLMApp, LLMModeMock)
+		return fmt.Errorf("unsupported llmMode %q (must be %q or %q)", js.LLMMode, LLMModeGrafanaLLMApp, LLMModeMock)
 	}
 	if js.LLMMode == LLMModeMock && !js.AllowMockInDev {
-		return Settings{}, errors.New("llmMode=mock requires explicit allowMockInDev=true (dev/test only)")
+		return errors.New("llmMode=mock requires explicit allowMockInDev=true (dev/test only)")
 	}
 	if js.LLMMode != LLMModeMock || !js.AllowMockInDev || js.MockDelayMs < 0 {
 		js.MockDelayMs = 0
 	} else if js.MockDelayMs > 10000 {
 		js.MockDelayMs = 10000
 	}
+	return nil
+}
 
+func normalizeNumericLimits(js *JSONSettings) {
+	js.MaxPanels = defaultIfOutOfRange(js.MaxPanels, 1, ir.MaxPanelsHardCap, ir.DefaultMaxPanels)
+	js.MaxOutputTokens = defaultIfOutOfRange(js.MaxOutputTokens, 1, 8192, 2048)
+	js.LLMTimeoutSeconds = defaultIfOutOfRange(js.LLMTimeoutSeconds, 1, 120, 45)
+	js.JobDeadlineSeconds = defaultIfOutOfRange(js.JobDeadlineSeconds, 1, 180, 90)
+	js.MaxConcurrentJobs = defaultIfOutOfRange(js.MaxConcurrentJobs, 1, 16, 4)
+	js.ValidationTimeoutSec = defaultIfOutOfRange(js.ValidationTimeoutSec, 1, 30, 10)
+	js.MaxConcurrentQueries = defaultIfOutOfRange(js.MaxConcurrentQueries, 1, 4, 2)
+}
+
+func defaultIfOutOfRange(val, minVal, maxVal, def int) int {
+	if val < minVal || val > maxVal {
+		return def
+	}
+	return val
+}
+
+func normalizeDatasourceSettings(js *JSONSettings) error {
+	cleaned := make([]string, 0, len(js.AllowedDatasourceUIDs))
+	for _, uid := range js.AllowedDatasourceUIDs {
+		if u := strings.TrimSpace(uid); u != "" {
+			cleaned = append(cleaned, u)
+		}
+	}
+	js.AllowedDatasourceUIDs = cleaned
+
+	if len(js.DatasourceDialects) == 0 {
+		js.DatasourceDialects = nil
+		return nil
+	}
+	normalizedDialects := make(map[string]string, len(js.DatasourceDialects))
+	for rawUID, rawKind := range js.DatasourceDialects {
+		uid := strings.TrimSpace(rawUID)
+		kStr := strings.TrimSpace(strings.ToLower(rawKind))
+		if uid == "" || kStr == "" {
+			continue
+		}
+		parsed, err := query.ParseKind(kStr)
+		if err != nil {
+			return fmt.Errorf("datasourceDialects[%q]: %w", uid, err)
+		}
+		normalizedDialects[uid] = string(parsed)
+	}
+	js.DatasourceDialects = normalizedDialects
+	return nil
+}
+
+func normalizeJobStoreSettings(js *JSONSettings, pinnedRedisAddr, pinnedPostgresAddr string) error {
 	js.JobStoreBackend = strings.TrimSpace(strings.ToLower(js.JobStoreBackend))
 	if js.JobStoreBackend == "" {
 		js.JobStoreBackend = JobStoreBackendMemory
 	}
 	if js.JobStoreBackend != JobStoreBackendMemory && js.JobStoreBackend != JobStoreBackendRedis && js.JobStoreBackend != JobStoreBackendPostgres {
-		return Settings{}, fmt.Errorf("unsupported jobStoreBackend %q (must be %q, %q, or %q)", js.JobStoreBackend, JobStoreBackendMemory, JobStoreBackendRedis, JobStoreBackendPostgres)
+		return fmt.Errorf("unsupported jobStoreBackend %q (must be %q, %q, or %q)", js.JobStoreBackend, JobStoreBackendMemory, JobStoreBackendRedis, JobStoreBackendPostgres)
 	}
-	if js.JobTTLMinutes <= 0 || js.JobTTLMinutes > 1440 {
-		js.JobTTLMinutes = 30
-	}
+	js.JobTTLMinutes = defaultIfOutOfRange(js.JobTTLMinutes, 1, 1440, 30)
+
 	js.RedisAddr = strings.TrimSpace(js.RedisAddr)
 	js.RedisKeyPrefix = strings.TrimSpace(js.RedisKeyPrefix)
 	js.RedisUsername = strings.TrimSpace(js.RedisUsername)
 	if js.JobStoreBackend == JobStoreBackendRedis {
-		if pinnedRedisAddr != "" {
-			if err := jobs.ValidateRedisAddr(pinnedRedisAddr); err != nil {
-				return Settings{}, fmt.Errorf("invalid operator-pinned LLMSTUDIO_REDIS_ADDR: %w", err)
-			}
-			if js.RedisAddr == "" {
-				js.RedisAddr = pinnedRedisAddr
-			} else if canonicalRedisAddr(js.RedisAddr) != canonicalRedisAddr(pinnedRedisAddr) {
-				return Settings{}, fmt.Errorf("redisAddr %q does not match operator-pinned LLMSTUDIO_REDIS_ADDR", js.RedisAddr)
-			}
-		}
-		if len(js.RedisUsername) > 128 {
-			return Settings{}, errors.New("redisUsername exceeds maximum length of 128 characters")
-		}
-		if err := jobs.ValidateRedisAddr(js.RedisAddr); err != nil {
-			return Settings{}, err
-		}
-		if js.RedisDB < 0 || js.RedisDB > 15 {
-			return Settings{}, fmt.Errorf("redisDb must be between 0 and 15, got %d", js.RedisDB)
-		}
-		if err := jobs.ValidateRedisKeyPrefix(js.RedisKeyPrefix); err != nil {
-			return Settings{}, err
-		}
-		if js.RedisKeyPrefix == "" {
-			js.RedisKeyPrefix = jobs.DefaultRedisKeyPrefix
+		if err := validateRedisSettings(js, pinnedRedisAddr); err != nil {
+			return err
 		}
 	}
 
@@ -439,58 +437,99 @@ func LoadSettingsWithOptions(appSettings backend.AppInstanceSettings, opts LoadO
 	js.PostgresUsername = strings.TrimSpace(js.PostgresUsername)
 	js.PostgresSSLMode = strings.TrimSpace(strings.ToLower(js.PostgresSSLMode))
 	if js.JobStoreBackend == JobStoreBackendPostgres {
-		if pinnedPostgresAddr != "" {
-			if err := jobs.ValidatePostgresAddr(pinnedPostgresAddr); err != nil {
-				return Settings{}, fmt.Errorf("invalid operator-pinned LLMSTUDIO_POSTGRES_ADDR: %w", err)
-			}
-			if js.PostgresAddr == "" {
-				js.PostgresAddr = pinnedPostgresAddr
-			} else if canonicalRedisAddr(js.PostgresAddr) != canonicalRedisAddr(pinnedPostgresAddr) {
-				return Settings{}, fmt.Errorf("postgresAddr %q does not match operator-pinned LLMSTUDIO_POSTGRES_ADDR", js.PostgresAddr)
-			}
-		}
-		if err := jobs.ValidatePostgresAddr(js.PostgresAddr); err != nil {
-			return Settings{}, err
-		}
-		if err := jobs.ValidatePostgresDatabase(js.PostgresDatabase); err != nil {
-			return Settings{}, err
-		}
-		if err := jobs.ValidatePostgresUsername(js.PostgresUsername); err != nil {
-			return Settings{}, err
-		}
-		if err := jobs.ValidatePostgresSchema(js.PostgresSchema); err != nil {
-			return Settings{}, err
-		}
-		if js.PostgresSchema == "" {
-			js.PostgresSchema = jobs.DefaultPostgresSchema
-		}
-		if err := jobs.ValidatePostgresTablePrefix(js.PostgresTablePrefix); err != nil {
-			return Settings{}, err
-		}
-		if js.PostgresTablePrefix == "" {
-			js.PostgresTablePrefix = jobs.DefaultPostgresTablePrefix
-		}
-		if err := jobs.ValidatePostgresSSLMode(js.PostgresSSLMode); err != nil {
-			return Settings{}, err
-		}
-		if js.PostgresSSLMode == "" {
-			js.PostgresSSLMode = jobs.DefaultPostgresSSLMode
+		if err := validatePostgresSettings(js, pinnedPostgresAddr); err != nil {
+			return err
 		}
 	}
+	return nil
+}
 
-	var token string
-	var redisPass string
-	var postgresPass string
-	if appSettings.DecryptedSecureJSONData != nil {
-		token = strings.TrimSpace(appSettings.DecryptedSecureJSONData["llmServiceAccountToken"])
-		redisPass = appSettings.DecryptedSecureJSONData["redisPassword"]
-		postgresPass = appSettings.DecryptedSecureJSONData["postgresPassword"]
+func validateRedisSettings(js *JSONSettings, pinnedRedisAddr string) error {
+	if pinnedRedisAddr != "" {
+		if err := jobs.ValidateRedisAddr(pinnedRedisAddr); err != nil {
+			return fmt.Errorf("invalid operator-pinned LLMSTUDIO_REDIS_ADDR: %w", err)
+		}
+		if js.RedisAddr == "" {
+			js.RedisAddr = pinnedRedisAddr
+		} else if canonicalRedisAddr(js.RedisAddr) != canonicalRedisAddr(pinnedRedisAddr) {
+			return fmt.Errorf("redisAddr %q does not match operator-pinned LLMSTUDIO_REDIS_ADDR", js.RedisAddr)
+		}
 	}
+	if len(js.RedisUsername) > 128 {
+		return errors.New("redisUsername exceeds maximum length of 128 characters")
+	}
+	if err := jobs.ValidateRedisAddr(js.RedisAddr); err != nil {
+		return err
+	}
+	if js.RedisDB < 0 || js.RedisDB > 15 {
+		return fmt.Errorf("redisDb must be between 0 and 15, got %d", js.RedisDB)
+	}
+	if err := jobs.ValidateRedisKeyPrefix(js.RedisKeyPrefix); err != nil {
+		return err
+	}
+	if js.RedisKeyPrefix == "" {
+		js.RedisKeyPrefix = jobs.DefaultRedisKeyPrefix
+	}
+	return nil
+}
+
+func validatePostgresSettings(js *JSONSettings, pinnedPostgresAddr string) error {
+	if pinnedPostgresAddr != "" {
+		if err := jobs.ValidatePostgresAddr(pinnedPostgresAddr); err != nil {
+			return fmt.Errorf("invalid operator-pinned LLMSTUDIO_POSTGRES_ADDR: %w", err)
+		}
+		if js.PostgresAddr == "" {
+			js.PostgresAddr = pinnedPostgresAddr
+		} else if canonicalRedisAddr(js.PostgresAddr) != canonicalRedisAddr(pinnedPostgresAddr) {
+			return fmt.Errorf("postgresAddr %q does not match operator-pinned LLMSTUDIO_POSTGRES_ADDR", js.PostgresAddr)
+		}
+	}
+	if err := jobs.ValidatePostgresAddr(js.PostgresAddr); err != nil {
+		return err
+	}
+	if err := jobs.ValidatePostgresDatabase(js.PostgresDatabase); err != nil {
+		return err
+	}
+	if err := jobs.ValidatePostgresUsername(js.PostgresUsername); err != nil {
+		return err
+	}
+	if err := jobs.ValidatePostgresSchema(js.PostgresSchema); err != nil {
+		return err
+	}
+	if js.PostgresSchema == "" {
+		js.PostgresSchema = jobs.DefaultPostgresSchema
+	}
+	if err := jobs.ValidatePostgresTablePrefix(js.PostgresTablePrefix); err != nil {
+		return err
+	}
+	if js.PostgresTablePrefix == "" {
+		js.PostgresTablePrefix = jobs.DefaultPostgresTablePrefix
+	}
+	if err := jobs.ValidatePostgresSSLMode(js.PostgresSSLMode); err != nil {
+		return err
+	}
+	if js.PostgresSSLMode == "" {
+		js.PostgresSSLMode = jobs.DefaultPostgresSSLMode
+	}
+	return nil
+}
+
+func unwrapSettingsSecrets(
+	decrypted map[string]string,
+	js JSONSettings,
+	rawGrafanaURL, trustedAppURL string,
+) (string, string, string, error) {
+	if decrypted == nil {
+		return "", "", "", nil
+	}
+	token := strings.TrimSpace(decrypted["llmServiceAccountToken"])
+	redisPass := decrypted["redisPassword"]
+	postgresPass := decrypted["postgresPassword"]
 
 	if token != "" {
 		unwrappedToken, err := unwrapBoundGrafanaToken(token, js.GrafanaURL, rawGrafanaURL, trustedAppURL)
 		if err != nil {
-			return Settings{}, err
+			return "", "", "", err
 		}
 		token = unwrappedToken
 	}
@@ -499,7 +538,7 @@ func LoadSettingsWithOptions(appSettings backend.AppInstanceSettings, opts LoadO
 		if redisPass != "" {
 			unwrappedPass, err := unwrapBoundRedisPassword(redisPass, js.RedisAddr, js.RedisTLS)
 			if err != nil {
-				return Settings{}, err
+				return "", "", "", err
 			}
 			redisPass = unwrappedPass
 		}
@@ -511,7 +550,7 @@ func LoadSettingsWithOptions(appSettings backend.AppInstanceSettings, opts LoadO
 		if postgresPass != "" {
 			unwrappedPass, err := unwrapBoundPostgresPassword(postgresPass, js.PostgresAddr, js.PostgresSSLMode)
 			if err != nil {
-				return Settings{}, err
+				return "", "", "", err
 			}
 			postgresPass = unwrappedPass
 		}
@@ -519,14 +558,7 @@ func LoadSettingsWithOptions(appSettings backend.AppInstanceSettings, opts LoadO
 		postgresPass = ""
 	}
 
-	return Settings{
-		JSONSettings:             js,
-		EffectiveReasoningEffort: reasoning,
-		EffectiveMaxRepairs:      effectiveRepairs,
-		llmServiceAccountToken:   token,
-		redisPassword:            redisPass,
-		postgresPassword:         postgresPass,
-	}, nil
+	return token, redisPass, postgresPass, nil
 }
 
 func unwrapBoundRedisPassword(rawSecret, activeAddr string, activeTLS bool) (string, error) {

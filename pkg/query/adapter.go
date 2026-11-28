@@ -132,74 +132,107 @@ func ValidateDashboardIR(
 	if err := ir.ValidateIR(doc, irOpts); err != nil {
 		return nil, err
 	}
-
-	var warnings []string
-
 	if err := ValidateScopeFilter(scope); err != nil {
 		return nil, err
 	}
-	normalizedScope := NormalizeScope(scope)
 
-	if normalizedScope != nil && len(doc.Variables) > 0 {
-		for _, v := range doc.Variables {
+	warnings, err := validateDashboardVariables(doc.Variables, catalog, NormalizeScope(scope), opts.RequireCatalogMatch)
+	if err != nil {
+		return nil, err
+	}
+
+	expectedKind := string(adapter.Kind())
+	for _, p := range doc.Panels {
+		panelWarnings, err := validateDashboardPanelQueries(adapter, expectedKind, p, catalog, scope, doc.Variables, opts)
+		if err != nil {
+			return nil, err
+		}
+		warnings = append(warnings, panelWarnings...)
+	}
+	return warnings, nil
+}
+
+func validateDashboardVariables(
+	variables []ir.VariableIR,
+	catalog []ir.MetricCatalogItem,
+	normalizedScope *ir.ScopeFilter,
+	requireCatalog bool,
+) ([]string, error) {
+	if len(variables) == 0 {
+		return nil, nil
+	}
+	if normalizedScope != nil {
+		for _, v := range variables {
 			if v.Type == "query" && v.LabelName == normalizedScope.LabelName {
 				return nil, fmt.Errorf("variable %q: %w: query variable cannot target locked scope label %q", v.Name, ErrPolicyViolation, normalizedScope.LabelName)
 			}
 		}
 	}
-
-	if opts.RequireCatalogMatch && len(doc.Variables) > 0 {
-		catalogByName := IndexCatalogFirstWins(catalog)
-		for _, v := range doc.Variables {
-			if v.Type != "query" {
-				continue
-			}
-			if strings.TrimSpace(v.MetricName) == "" {
-				return nil, fmt.Errorf("variable %q: %w: query variable requires metricName in scoped catalog", v.Name, ErrPolicyViolation)
-			}
-			item, ok := catalogByName[v.MetricName]
-			if !ok {
-				return nil, fmt.Errorf("variable %q: %w: %q", v.Name, ErrMetricNotInCatalog, v.MetricName)
-			}
-			if len(item.Labels) > 0 {
-				foundLbl := false
-				for _, lbl := range item.Labels {
-					if lbl == v.LabelName {
-						foundLbl = true
-						break
-					}
-				}
-				if !foundLbl {
-					warnings = append(warnings, fmt.Sprintf("variable %s: label %q not listed in sampled labels for %q", v.Name, v.LabelName, v.MetricName))
-				}
-			}
-		}
+	if !requireCatalog {
+		return nil, nil
 	}
 
-	expectedKind := string(adapter.Kind())
-	for _, p := range doc.Panels {
-		queries := p.EffectiveQueries()
-		for qi, q := range queries {
-			if q.Kind != "" && q.Kind != expectedKind {
-				if len(queries) > 1 {
-					return nil, fmt.Errorf("panel %q query[%d]: %w: query kind %q does not match active dialect %q", p.ID, qi, ErrPolicyViolation, q.Kind, expectedKind)
-				}
-				return nil, fmt.Errorf("panel %q: %w: query kind %q does not match active dialect %q", p.ID, ErrPolicyViolation, q.Kind, expectedKind)
-			}
-			res, err := adapter.ValidateExprWithVariables(q.Expr, catalog, scope, doc.Variables, opts)
-			if err != nil {
-				if len(queries) > 1 {
-					return nil, fmt.Errorf("panel %q query[%d]: %w", p.ID, qi, err)
-				}
-				return nil, fmt.Errorf("panel %q: %w", p.ID, err)
-			}
-			for _, w := range res.Warnings {
-				warnings = append(warnings, fmt.Sprintf("panel %s: %s", p.ID, w))
-			}
-			if strings.Contains(q.Expr, "_seconds") && (p.Unit == "bytes" || p.Unit == "percentunit" || p.Unit == "reqps") {
-				warnings = append(warnings, fmt.Sprintf("panel %s: metric appears to measure seconds but unit is %q", p.ID, p.Unit))
-			}
+	var warnings []string
+	catalogByName := IndexCatalogFirstWins(catalog)
+	for _, v := range variables {
+		if v.Type != "query" {
+			continue
+		}
+		if strings.TrimSpace(v.MetricName) == "" {
+			return nil, fmt.Errorf("variable %q: %w: query variable requires metricName in scoped catalog", v.Name, ErrPolicyViolation)
+		}
+		item, ok := catalogByName[v.MetricName]
+		if !ok {
+			return nil, fmt.Errorf("variable %q: %w: %q", v.Name, ErrMetricNotInCatalog, v.MetricName)
+		}
+		if len(item.Labels) > 0 && !containsString(item.Labels, v.LabelName) {
+			warnings = append(warnings, fmt.Sprintf("variable %s: label %q not listed in sampled labels for %q", v.Name, v.LabelName, v.MetricName))
 		}
 	}
 	return warnings, nil
+}
+
+func containsString(items []string, target string) bool {
+	for _, item := range items {
+		if item == target {
+			return true
+		}
+	}
+	return false
+}
+
+func validateDashboardPanelQueries(
+	adapter Adapter,
+	expectedKind string,
+	p ir.PanelIR,
+	catalog []ir.MetricCatalogItem,
+	scope *ir.ScopeFilter,
+	variables []ir.VariableIR,
+	opts ValidateOptions,
+) ([]string, error) {
+	var warnings []string
+	queries := p.EffectiveQueries()
+	for qi, q := range queries {
+		if q.Kind != "" && q.Kind != expectedKind {
+			return nil, formatPanelQueryErr(p.ID, qi, len(queries), fmt.Errorf("%w: query kind %q does not match active dialect %q", ErrPolicyViolation, q.Kind, expectedKind))
+		}
+		res, err := adapter.ValidateExprWithVariables(q.Expr, catalog, scope, variables, opts)
+		if err != nil {
+			return nil, formatPanelQueryErr(p.ID, qi, len(queries), err)
+		}
+		for _, w := range res.Warnings {
+			warnings = append(warnings, fmt.Sprintf("panel %s: %s", p.ID, w))
+		}
+		if strings.Contains(q.Expr, "_seconds") && (p.Unit == "bytes" || p.Unit == "percentunit" || p.Unit == "reqps") {
+			warnings = append(warnings, fmt.Sprintf("panel %s: metric appears to measure seconds but unit is %q", p.ID, p.Unit))
+		}
+	}
+	return warnings, nil
+}
+
+func formatPanelQueryErr(panelID string, qi int, total int, err error) error {
+	if total > 1 {
+		return fmt.Errorf("panel %q query[%d]: %w", panelID, qi, err)
+	}
+	return fmt.Errorf("panel %q: %w", panelID, err)
 }

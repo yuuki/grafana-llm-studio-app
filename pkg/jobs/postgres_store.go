@@ -642,13 +642,7 @@ func (s *PostgresStore) BeginRepair(ctx context.Context, params BeginRepairParam
 }
 
 func (s *PostgresStore) beginEditOpTx(ctx context.Context, opName string, spec beginEditSpec) (BeginOpResult, error) {
-	if err := validateOwner(spec.owner); err != nil {
-		return BeginOpResult{}, err
-	}
-	if err := ValidateJobID(spec.jobID); err != nil {
-		return BeginOpResult{}, err
-	}
-	if err := s.ensureSchema(ctx); err != nil {
+	if err := s.validateAndEnsureSchema(ctx, spec.owner, spec.jobID); err != nil {
 		return BeginOpResult{}, err
 	}
 
@@ -674,95 +668,27 @@ func (s *PostgresStore) beginEditOpTx(ctx context.Context, opName string, spec b
 
 	row, err := s.verifyOwnedRowTx(ctx, tx, spec.owner, spec.jobID, nowMs, false)
 	if err != nil {
-		if isDomainJobErr(err) {
-			return BeginOpResult{}, err
-		}
-		return BeginOpResult{}, wrapPostgresErr(opName, err)
+		return BeginOpResult{}, mapDomainOrPostgresErr(opName, err)
 	}
-	if row.jobKind == JobKindReport {
-		return BeginOpResult{}, ErrWrongJobKind
-	}
-	if row.currentIRJSON == "" {
-		return BeginOpResult{}, errors.New(spec.noDraftMsg)
-	}
-	var currentIR ir.DashboardIR
-	if err := json.Unmarshal([]byte(row.currentIRJSON), &currentIR); err != nil {
-		return BeginOpResult{}, wrapPostgresErr(opName, fmt.Errorf("unmarshal currentIR: %w", err))
-	}
-	if row.currentRev > 0 {
-		currentIR.Revision = row.currentRev
-	}
-	if spec.baseRevision != currentIR.Revision {
-		return BeginOpResult{}, formatRevisionConflict(spec.revPrefix, spec.baseRevision, currentIR.Revision)
-	}
-	if spec.targetPanelID != "" && (strings.ContainsAny(spec.targetPanelID, "\r\n") || !panelExists(currentIR.Panels, spec.targetPanelID)) {
-		return BeginOpResult{}, fmt.Errorf("%w: %q", ir.ErrPanelNotFound, spec.targetPanelID)
-	}
-	if row.isActive(nowMs) {
-		return BeginOpResult{}, ErrOperationInProgress
-	}
-	if spec.consumeRepair && row.repairAttemptsUsed >= row.maxRepairAttempts {
-		return BeginOpResult{}, fmt.Errorf("%w: used %d of %d repair attempts", ErrBudgetExhausted, row.repairAttemptsUsed, row.maxRepairAttempts)
+	currentIR, scope, knownGauges, gaugesJSON, err := validateBeginEditRow(opName, row, spec, nowMs)
+	if err != nil {
+		return BeginOpResult{}, err
 	}
 
-	// Parse scope and knownGauges BEFORE committing any budget decrement, lease, or slot.
-	var scope *ir.ScopeFilter
-	if row.scopeJSON != "" {
-		var sf ir.ScopeFilter
-		if err := json.Unmarshal([]byte(row.scopeJSON), &sf); err != nil {
-			return BeginOpResult{}, wrapPostgresErr(opName, fmt.Errorf("unmarshal scope: %w", err))
-		}
-		scope = &sf
-	}
-	knownGauges, err := unmarshalGaugeMap(row.knownGaugesJSON)
-	if err != nil {
-		return BeginOpResult{}, wrapPostgresErr(opName, fmt.Errorf("unmarshal knownGauges: %w", err))
-	}
-	mergeGaugeMapBounded(knownGauges, spec.catalogGauges)
-	gaugesJSON, err := marshalGaugeMap(knownGauges)
-	if err != nil {
-		return BeginOpResult{}, fmt.Errorf("marshal knownGauges: %w", err)
-	}
-
-	if err := s.reapExpiredOrgSlotsTx(ctx, tx, spec.owner.OrgID, nowMs); err != nil {
-		return BeginOpResult{}, wrapPostgresErr(opName, err)
-	}
 	oKey := ownerKey(spec.owner)
-	canAcquire, err := s.canAcquireSlotTx(ctx, tx, spec.owner.OrgID, oKey, nowMs, limits)
-	if err != nil {
-		return BeginOpResult{}, wrapPostgresErr(opName, err)
-	}
-	if !canAcquire {
-		return BeginOpResult{}, ErrConcurrencyLimited
+	if err := s.acquireOrgSlotTx(ctx, tx, opName, spec.owner.OrgID, oKey, nowMs, limits); err != nil {
+		return BeginOpResult{}, err
 	}
 
 	newToken, err := nextOpToken(row.activeOpToken)
 	if err != nil {
 		return BeginOpResult{}, wrapPostgresErr(opName, err)
 	}
-	jobTTLMs := maxInt64(limits.JobTTL.Milliseconds(), 1)
-	leaseTTLMs := maxInt64(limits.OpLeaseTTL.Milliseconds(), 1)
-	leaseUntilMs := nowMs + leaseTTLMs
-	expiresAtMs := nowMs + jobTTLMs
+	leaseUntilMs := nowMs + maxInt64(limits.OpLeaseTTL.Milliseconds(), 1)
+	expiresAtMs := nowMs + maxInt64(limits.JobTTL.Milliseconds(), 1)
 
-	updateSQL := fmt.Sprintf(`UPDATE %s
-		SET active_op_token = $1, active_op_until_ms = $2, status = $3,
-		    known_gauges_json = $4, updated_at_ms = $5, expires_at_ms = $6
-		WHERE job_id = $7`, s.jobsTable)
-	if spec.consumeRepair {
-		// Atomically consume repair budget BEFORE calling the LLM.
-		updateSQL = fmt.Sprintf(`UPDATE %s
-		SET repair_attempts_used = repair_attempts_used + 1,
-		    active_op_token = $1, active_op_until_ms = $2, status = $3,
-		    known_gauges_json = $4, updated_at_ms = $5, expires_at_ms = $6
-		WHERE job_id = $7`, s.jobsTable)
-	}
-	if _, err = tx.Exec(ctx, updateSQL,
-		opTokenToInt64(newToken), leaseUntilMs, string(spec.nextStatus), gaugesJSON, nowMs, expiresAtMs, spec.jobID); err != nil {
-		return BeginOpResult{}, wrapPostgresErr(opName, err)
-	}
-	if err := s.upsertSlotTx(ctx, tx, spec.owner.OrgID, slotID, oKey, leaseUntilMs); err != nil {
-		return BeginOpResult{}, wrapPostgresErr(opName, err)
+	if err := s.execBeginEditUpdateTx(ctx, tx, opName, spec, newToken, leaseUntilMs, nowMs, expiresAtMs, gaugesJSON, oKey, slotID); err != nil {
+		return BeginOpResult{}, err
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return BeginOpResult{}, wrapPostgresErr(opName, err)
@@ -782,14 +708,118 @@ func (s *PostgresStore) beginEditOpTx(ctx context.Context, opName string, spec b
 	}, nil
 }
 
-func (s *PostgresStore) SetStatus(ctx context.Context, owner Owner, jobID string, opToken uint64, status JobStatus, now time.Time, jobTTL time.Duration) error {
+func (s *PostgresStore) validateAndEnsureSchema(ctx context.Context, owner Owner, jobID string) error {
 	if err := validateOwner(owner); err != nil {
 		return err
 	}
 	if err := ValidateJobID(jobID); err != nil {
 		return err
 	}
-	if err := s.ensureSchema(ctx); err != nil {
+	return s.ensureSchema(ctx)
+}
+
+func mapDomainOrPostgresErr(opName string, err error) error {
+	if isDomainJobErr(err) {
+		return err
+	}
+	return wrapPostgresErr(opName, err)
+}
+
+func validateBeginEditRow(opName string, row *pgJobRow, spec beginEditSpec, nowMs int64) (ir.DashboardIR, *ir.ScopeFilter, map[string]bool, string, error) {
+	if row.jobKind == JobKindReport {
+		return ir.DashboardIR{}, nil, nil, "", ErrWrongJobKind
+	}
+	if row.currentIRJSON == "" {
+		return ir.DashboardIR{}, nil, nil, "", errors.New(spec.noDraftMsg)
+	}
+	var currentIR ir.DashboardIR
+	if err := json.Unmarshal([]byte(row.currentIRJSON), &currentIR); err != nil {
+		return ir.DashboardIR{}, nil, nil, "", wrapPostgresErr(opName, fmt.Errorf("unmarshal currentIR: %w", err))
+	}
+	if row.currentRev > 0 {
+		currentIR.Revision = row.currentRev
+	}
+	if spec.baseRevision != currentIR.Revision {
+		return ir.DashboardIR{}, nil, nil, "", formatRevisionConflict(spec.revPrefix, spec.baseRevision, currentIR.Revision)
+	}
+	if spec.targetPanelID != "" && (strings.ContainsAny(spec.targetPanelID, "\r\n") || !panelExists(currentIR.Panels, spec.targetPanelID)) {
+		return ir.DashboardIR{}, nil, nil, "", fmt.Errorf("%w: %q", ir.ErrPanelNotFound, spec.targetPanelID)
+	}
+	if row.isActive(nowMs) {
+		return ir.DashboardIR{}, nil, nil, "", ErrOperationInProgress
+	}
+	if spec.consumeRepair && row.repairAttemptsUsed >= row.maxRepairAttempts {
+		return ir.DashboardIR{}, nil, nil, "", fmt.Errorf("%w: used %d of %d repair attempts", ErrBudgetExhausted, row.repairAttemptsUsed, row.maxRepairAttempts)
+	}
+
+	// Parse scope and knownGauges BEFORE committing any budget decrement, lease, or slot.
+	var scope *ir.ScopeFilter
+	if row.scopeJSON != "" {
+		var sf ir.ScopeFilter
+		if err := json.Unmarshal([]byte(row.scopeJSON), &sf); err != nil {
+			return ir.DashboardIR{}, nil, nil, "", wrapPostgresErr(opName, fmt.Errorf("unmarshal scope: %w", err))
+		}
+		scope = &sf
+	}
+	knownGauges, err := unmarshalGaugeMap(row.knownGaugesJSON)
+	if err != nil {
+		return ir.DashboardIR{}, nil, nil, "", wrapPostgresErr(opName, fmt.Errorf("unmarshal knownGauges: %w", err))
+	}
+	mergeGaugeMapBounded(knownGauges, spec.catalogGauges)
+	gaugesJSON, err := marshalGaugeMap(knownGauges)
+	if err != nil {
+		return ir.DashboardIR{}, nil, nil, "", fmt.Errorf("marshal knownGauges: %w", err)
+	}
+	return currentIR, scope, knownGauges, gaugesJSON, nil
+}
+
+func (s *PostgresStore) acquireOrgSlotTx(ctx context.Context, tx pgx.Tx, opName string, orgID int64, oKey string, nowMs int64, limits StoreLimits) error {
+	if err := s.reapExpiredOrgSlotsTx(ctx, tx, orgID, nowMs); err != nil {
+		return wrapPostgresErr(opName, err)
+	}
+	canAcquire, err := s.canAcquireSlotTx(ctx, tx, orgID, oKey, nowMs, limits)
+	if err != nil {
+		return wrapPostgresErr(opName, err)
+	}
+	if !canAcquire {
+		return ErrConcurrencyLimited
+	}
+	return nil
+}
+
+func (s *PostgresStore) execBeginEditUpdateTx(
+	ctx context.Context,
+	tx pgx.Tx,
+	opName string,
+	spec beginEditSpec,
+	newToken uint64,
+	leaseUntilMs, nowMs, expiresAtMs int64,
+	gaugesJSON, oKey, slotID string,
+) error {
+	updateSQL := fmt.Sprintf(`UPDATE %s
+		SET active_op_token = $1, active_op_until_ms = $2, status = $3,
+		    known_gauges_json = $4, updated_at_ms = $5, expires_at_ms = $6
+		WHERE job_id = $7`, s.jobsTable)
+	if spec.consumeRepair {
+		// Atomically consume repair budget BEFORE calling the LLM.
+		updateSQL = fmt.Sprintf(`UPDATE %s
+		SET repair_attempts_used = repair_attempts_used + 1,
+		    active_op_token = $1, active_op_until_ms = $2, status = $3,
+		    known_gauges_json = $4, updated_at_ms = $5, expires_at_ms = $6
+		WHERE job_id = $7`, s.jobsTable)
+	}
+	if _, err := tx.Exec(ctx, updateSQL,
+		opTokenToInt64(newToken), leaseUntilMs, string(spec.nextStatus), gaugesJSON, nowMs, expiresAtMs, spec.jobID); err != nil {
+		return wrapPostgresErr(opName, err)
+	}
+	if err := s.upsertSlotTx(ctx, tx, spec.owner.OrgID, slotID, oKey, leaseUntilMs); err != nil {
+		return wrapPostgresErr(opName, err)
+	}
+	return nil
+}
+
+func (s *PostgresStore) SetStatus(ctx context.Context, owner Owner, jobID string, opToken uint64, status JobStatus, now time.Time, jobTTL time.Duration) error {
+	if err := s.validateAndEnsureSchema(ctx, owner, jobID); err != nil {
 		return err
 	}
 
@@ -806,10 +836,7 @@ func (s *PostgresStore) SetStatus(ctx context.Context, owner Owner, jobID string
 	}
 	row, err := s.verifyOwnedRowTx(ctx, tx, owner, jobID, nowMs, false)
 	if err != nil {
-		if isDomainJobErr(err) {
-			return err
-		}
-		return wrapPostgresErr("SetStatus", err)
+		return mapDomainOrPostgresErr("SetStatus", err)
 	}
 	if opToken > 0 && row.activeOpToken == opToken && row.isActive(nowMs) {
 		_, err = tx.Exec(ctx, fmt.Sprintf(`UPDATE %s SET status = $1, updated_at_ms = $2, expires_at_ms = $3 WHERE job_id = $4`, s.jobsTable),
@@ -824,57 +851,64 @@ func (s *PostgresStore) SetStatus(ctx context.Context, owner Owner, jobID string
 	return nil
 }
 
+type finishJobSerialized struct {
+	docJSON    string
+	docRev     int
+	hasDoc     bool
+	diffsJSON  string
+	warnsJSON  string
+	reportJSON string
+	hasReport  bool
+	metaJSON   string
+	hasMeta    bool
+}
+
+func marshalFinishJobFields(params FinishJobParams) (finishJobSerialized, error) {
+	var out finishJobSerialized
+	if params.Doc != nil {
+		b, err := json.Marshal(params.Doc)
+		if err != nil {
+			return finishJobSerialized{}, fmt.Errorf("marshal doc: %w", err)
+		}
+		out.docJSON = string(b)
+		out.docRev = params.Doc.Revision
+		out.hasDoc = true
+	}
+	var err error
+	if out.diffsJSON, err = marshalOptionalDiffs(params.Diffs); err != nil {
+		return finishJobSerialized{}, fmt.Errorf("marshal diffs: %w", err)
+	}
+	if out.warnsJSON, err = marshalOptionalStringSlice(params.Warnings); err != nil {
+		return finishJobSerialized{}, fmt.Errorf("marshal warnings: %w", err)
+	}
+	if params.Report != nil {
+		b, err := json.Marshal(params.Report)
+		if err != nil {
+			return finishJobSerialized{}, fmt.Errorf("%w: marshal report: %v", ErrStoreUnavailable, err)
+		}
+		out.reportJSON = string(b)
+		out.hasReport = true
+	}
+	if params.LLMMeta != nil {
+		b, err := json.Marshal(params.LLMMeta)
+		if err != nil {
+			return finishJobSerialized{}, fmt.Errorf("marshal llmMeta: %w", err)
+		}
+		out.metaJSON = string(b)
+		out.hasMeta = true
+	}
+	return out, nil
+}
+
 func (s *PostgresStore) FinishJob(ctx context.Context, params FinishJobParams) (JobSnapshot, error) {
-	if err := validateOwner(params.Owner); err != nil {
-		return JobSnapshot{}, err
-	}
-	if err := ValidateJobID(params.JobID); err != nil {
-		return JobSnapshot{}, err
-	}
-	if err := s.ensureSchema(ctx); err != nil {
+	if err := s.validateAndEnsureSchema(ctx, params.Owner, params.JobID); err != nil {
 		return JobSnapshot{}, err
 	}
 
 	ttlMs := maxInt64(normalizeJobTTL(params.JobTTL).Milliseconds(), 1)
-	var docJSON string
-	var docRev int
-	hasDoc := false
-	if params.Doc != nil {
-		b, err := json.Marshal(params.Doc)
-		if err != nil {
-			return JobSnapshot{}, fmt.Errorf("marshal doc: %w", err)
-		}
-		docJSON = string(b)
-		docRev = params.Doc.Revision
-		hasDoc = true
-	}
-	diffsJSON, err := marshalOptionalDiffs(params.Diffs)
+	ser, err := marshalFinishJobFields(params)
 	if err != nil {
-		return JobSnapshot{}, fmt.Errorf("marshal diffs: %w", err)
-	}
-	warnsJSON, err := marshalOptionalStringSlice(params.Warnings)
-	if err != nil {
-		return JobSnapshot{}, fmt.Errorf("marshal warnings: %w", err)
-	}
-	var reportJSON string
-	hasReport := false
-	if params.Report != nil {
-		b, err := json.Marshal(params.Report)
-		if err != nil {
-			return JobSnapshot{}, fmt.Errorf("%w: marshal report: %v", ErrStoreUnavailable, err)
-		}
-		reportJSON = string(b)
-		hasReport = true
-	}
-	var metaJSON string
-	hasMeta := false
-	if params.LLMMeta != nil {
-		b, err := json.Marshal(params.LLMMeta)
-		if err != nil {
-			return JobSnapshot{}, fmt.Errorf("marshal llmMeta: %w", err)
-		}
-		metaJSON = string(b)
-		hasMeta = true
+		return JobSnapshot{}, err
 	}
 
 	tx, err := s.pool.Begin(ctx)
@@ -889,10 +923,7 @@ func (s *PostgresStore) FinishJob(ctx context.Context, params FinishJobParams) (
 	}
 	row, err := s.verifyOwnedRowTx(ctx, tx, params.Owner, params.JobID, nowMs, false)
 	if err != nil {
-		if isDomainJobErr(err) {
-			return JobSnapshot{}, err
-		}
-		return JobSnapshot{}, wrapPostgresErr("FinishJob", err)
+		return JobSnapshot{}, mapDomainOrPostgresErr("FinishJob", err)
 	}
 	if params.OpToken == 0 || row.activeOpToken != params.OpToken || !row.isActive(nowMs) {
 		snap, snapErr := row.toSnapshot("FinishJob")
@@ -906,28 +937,42 @@ func (s *PostgresStore) FinishJob(ctx context.Context, params FinishJobParams) (
 	if err != nil {
 		return JobSnapshot{}, wrapPostgresErr("FinishJob", err)
 	}
+	applyFinishJobToRow(row, params, ser, newToken, nowMs, ttlMs)
+
+	if err := s.execFinishJobUpdateTx(ctx, tx, row, newToken, params.JobID); err != nil {
+		return JobSnapshot{}, wrapPostgresErr("FinishJob", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return JobSnapshot{}, wrapPostgresErr("FinishJob", err)
+	}
+	return row.toSnapshot("FinishJob")
+}
+
+func applyFinishJobToRow(row *pgJobRow, params FinishJobParams, ser finishJobSerialized, newToken uint64, nowMs, ttlMs int64) {
 	row.activeOpToken = newToken
 	row.activeOpUntilMs = 0
 	row.status = string(params.Status)
-	if hasDoc {
-		row.currentIRJSON = docJSON
-		row.currentRev = docRev
+	if ser.hasDoc {
+		row.currentIRJSON = ser.docJSON
+		row.currentRev = ser.docRev
 	}
-	if hasReport {
-		row.reportJSON = reportJSON
+	if ser.hasReport {
+		row.reportJSON = ser.reportJSON
 	}
-	row.lastDiffJSON = diffsJSON
+	row.lastDiffJSON = ser.diffsJSON
 	row.summary = params.Summary
-	row.warningsJSON = warnsJSON
+	row.warningsJSON = ser.warnsJSON
 	row.errorMessage = params.ErrorMessage
-	if hasMeta {
-		row.llmMetaJSON = metaJSON
+	if ser.hasMeta {
+		row.llmMetaJSON = ser.metaJSON
 	}
 	row.updatedAtMs = nowMs
 	row.expiresAtMs = nowMs + ttlMs
+}
 
+func (s *PostgresStore) execFinishJobUpdateTx(ctx context.Context, tx pgx.Tx, row *pgJobRow, newToken uint64, jobID string) error {
 	if s.supportsReportStorage.Load() {
-		_, err = tx.Exec(ctx, fmt.Sprintf(`UPDATE %s
+		_, err := tx.Exec(ctx, fmt.Sprintf(`UPDATE %s
 			SET active_op_token = $1, active_op_until_ms = 0, status = $2,
 			    current_ir_json = $3, current_rev = $4, last_diff_json = $5,
 			    summary = $6, warnings_json = $7, error_message = $8,
@@ -937,36 +982,61 @@ func (s *PostgresStore) FinishJob(ctx context.Context, params FinishJobParams) (
 			opTokenToInt64(newToken), row.status,
 			row.currentIRJSON, row.currentRev, row.lastDiffJSON,
 			row.summary, row.warningsJSON, row.errorMessage,
-			row.llmMetaJSON, row.updatedAtMs, row.expiresAtMs, row.reportJSON, params.JobID)
-	} else {
-		_, err = tx.Exec(ctx, fmt.Sprintf(`UPDATE %s
-			SET active_op_token = $1, active_op_until_ms = 0, status = $2,
-			    current_ir_json = $3, current_rev = $4, last_diff_json = $5,
-			    summary = $6, warnings_json = $7, error_message = $8,
-			    llm_meta_json = $9, updated_at_ms = $10, expires_at_ms = $11
-			WHERE job_id = $12`, s.jobsTable),
-			opTokenToInt64(newToken), row.status,
-			row.currentIRJSON, row.currentRev, row.lastDiffJSON,
-			row.summary, row.warningsJSON, row.errorMessage,
-			row.llmMetaJSON, row.updatedAtMs, row.expiresAtMs, params.JobID)
+			row.llmMetaJSON, row.updatedAtMs, row.expiresAtMs, row.reportJSON, jobID)
+		return err
 	}
+	_, err := tx.Exec(ctx, fmt.Sprintf(`UPDATE %s
+		SET active_op_token = $1, active_op_until_ms = 0, status = $2,
+		    current_ir_json = $3, current_rev = $4, last_diff_json = $5,
+		    summary = $6, warnings_json = $7, error_message = $8,
+		    llm_meta_json = $9, updated_at_ms = $10, expires_at_ms = $11
+		WHERE job_id = $12`, s.jobsTable),
+		opTokenToInt64(newToken), row.status,
+		row.currentIRJSON, row.currentRev, row.lastDiffJSON,
+		row.summary, row.warningsJSON, row.errorMessage,
+		row.llmMetaJSON, row.updatedAtMs, row.expiresAtMs, jobID)
+	return err
+}
+
+type commitRevisionSerialized struct {
+	nextDocJSON string
+	diffsJSON   string
+	warnsJSON   string
+	metaJSON    string
+	hasMeta     bool
+}
+
+func marshalCommitRevisionFields(params CommitRevisionParams) (commitRevisionSerialized, error) {
+	nextDocBytes, err := json.Marshal(params.NextIR)
 	if err != nil {
-		return JobSnapshot{}, wrapPostgresErr("FinishJob", err)
+		return commitRevisionSerialized{}, fmt.Errorf("marshal nextIR: %w", err)
 	}
-	if err := tx.Commit(ctx); err != nil {
-		return JobSnapshot{}, wrapPostgresErr("FinishJob", err)
+	diffsJSON, err := marshalOptionalDiffs(params.Diffs)
+	if err != nil {
+		return commitRevisionSerialized{}, fmt.Errorf("marshal diffs: %w", err)
 	}
-	return row.toSnapshot("FinishJob")
+	warnsJSON, err := marshalOptionalStringSlice(params.Warnings)
+	if err != nil {
+		return commitRevisionSerialized{}, fmt.Errorf("marshal warnings: %w", err)
+	}
+	out := commitRevisionSerialized{
+		nextDocJSON: string(nextDocBytes),
+		diffsJSON:   diffsJSON,
+		warnsJSON:   warnsJSON,
+	}
+	if params.LLMMeta != nil {
+		b, err := json.Marshal(params.LLMMeta)
+		if err != nil {
+			return commitRevisionSerialized{}, fmt.Errorf("marshal llmMeta: %w", err)
+		}
+		out.metaJSON = string(b)
+		out.hasMeta = true
+	}
+	return out, nil
 }
 
 func (s *PostgresStore) CommitRevision(ctx context.Context, params CommitRevisionParams) (JobSnapshot, error) {
-	if err := validateOwner(params.Owner); err != nil {
-		return JobSnapshot{}, err
-	}
-	if err := ValidateJobID(params.JobID); err != nil {
-		return JobSnapshot{}, err
-	}
-	if err := s.ensureSchema(ctx); err != nil {
+	if err := s.validateAndEnsureSchema(ctx, params.Owner, params.JobID); err != nil {
 		return JobSnapshot{}, err
 	}
 
@@ -976,27 +1046,9 @@ func (s *PostgresStore) CommitRevision(ctx context.Context, params CommitRevisio
 		maxHist = defaultMaxUndoHistory
 	}
 
-	nextDocBytes, err := json.Marshal(params.NextIR)
+	ser, err := marshalCommitRevisionFields(params)
 	if err != nil {
-		return JobSnapshot{}, fmt.Errorf("marshal nextIR: %w", err)
-	}
-	diffsJSON, err := marshalOptionalDiffs(params.Diffs)
-	if err != nil {
-		return JobSnapshot{}, fmt.Errorf("marshal diffs: %w", err)
-	}
-	warnsJSON, err := marshalOptionalStringSlice(params.Warnings)
-	if err != nil {
-		return JobSnapshot{}, fmt.Errorf("marshal warnings: %w", err)
-	}
-	var metaJSON string
-	hasMeta := false
-	if params.LLMMeta != nil {
-		b, err := json.Marshal(params.LLMMeta)
-		if err != nil {
-			return JobSnapshot{}, fmt.Errorf("marshal llmMeta: %w", err)
-		}
-		metaJSON = string(b)
-		hasMeta = true
+		return JobSnapshot{}, err
 	}
 
 	tx, err := s.pool.Begin(ctx)
@@ -1011,10 +1063,7 @@ func (s *PostgresStore) CommitRevision(ctx context.Context, params CommitRevisio
 	}
 	row, err := s.verifyOwnedRowTx(ctx, tx, params.Owner, params.JobID, nowMs, true)
 	if err != nil {
-		if isDomainJobErr(err) {
-			return JobSnapshot{}, err
-		}
-		return JobSnapshot{}, wrapPostgresErr("CommitRevision", err)
+		return JobSnapshot{}, mapDomainOrPostgresErr("CommitRevision", err)
 	}
 	if params.OpToken == 0 || row.activeOpToken != params.OpToken || !row.isActive(nowMs) {
 		snap, snapErr := row.toSnapshot("CommitRevision")
@@ -1024,46 +1073,12 @@ func (s *PostgresStore) CommitRevision(ctx context.Context, params CommitRevisio
 		return snap, ErrJobCancelled
 	}
 	if row.currentIRJSON == "" || row.currentRev != params.ExpectedRev {
-		newToken, tokErr := nextOpToken(row.activeOpToken)
-		if tokErr != nil {
-			return JobSnapshot{}, wrapPostgresErr("CommitRevision", tokErr)
-		}
-		_, updErr := tx.Exec(ctx, fmt.Sprintf(`UPDATE %s SET active_op_token = $1, active_op_until_ms = 0 WHERE job_id = $2`, s.jobsTable),
-			opTokenToInt64(newToken), params.JobID)
-		if updErr != nil {
-			return JobSnapshot{}, wrapPostgresErr("CommitRevision", updErr)
-		}
-		if commitErr := tx.Commit(ctx); commitErr != nil {
-			return JobSnapshot{}, wrapPostgresErr("CommitRevision", commitErr)
-		}
-		snap, snapErr := row.toSnapshot("CommitRevision")
-		if snapErr != nil {
-			return JobSnapshot{}, snapErr
-		}
-		return snap, ir.ErrRevisionConflict
+		return s.releaseOpOnRevisionConflictTx(ctx, tx, row, params.JobID)
 	}
 
-	var prevIR ir.DashboardIR
-	if err := json.Unmarshal([]byte(row.currentIRJSON), &prevIR); err != nil {
-		return JobSnapshot{}, wrapPostgresErr("CommitRevision", fmt.Errorf("unmarshal currentIR: %w", err))
-	}
-	if row.currentRev > 0 {
-		prevIR.Revision = row.currentRev
-	}
-
-	var history []ir.DashboardIR
-	if row.historyJSON != "" && row.historyJSON != "[]" {
-		if err := json.Unmarshal([]byte(row.historyJSON), &history); err != nil {
-			return JobSnapshot{}, wrapPostgresErr("CommitRevision", fmt.Errorf("unmarshal history: %w", err))
-		}
-	}
-	history = append(history, prevIR)
-	if len(history) > maxHist {
-		history = history[len(history)-maxHist:]
-	}
-	histBytes, err := json.Marshal(history)
+	histJSON, histLen, err := appendRevisionHistory(row, maxHist)
 	if err != nil {
-		return JobSnapshot{}, fmt.Errorf("marshal history: %w", err)
+		return JobSnapshot{}, err
 	}
 
 	newToken, err := nextOpToken(row.activeOpToken)
@@ -1072,17 +1087,17 @@ func (s *PostgresStore) CommitRevision(ctx context.Context, params CommitRevisio
 	}
 	row.activeOpToken = newToken
 	row.activeOpUntilMs = 0
-	row.currentIRJSON = string(nextDocBytes)
+	row.currentIRJSON = ser.nextDocJSON
 	row.currentRev = params.NextIR.Revision
-	row.historyJSON = string(histBytes)
-	row.historyLen = len(history)
-	row.lastDiffJSON = diffsJSON
+	row.historyJSON = histJSON
+	row.historyLen = histLen
+	row.lastDiffJSON = ser.diffsJSON
 	row.summary = params.Summary
-	row.warningsJSON = warnsJSON
+	row.warningsJSON = ser.warnsJSON
 	row.errorMessage = ""
 	row.status = string(StatusAwaitingPreview)
-	if hasMeta {
-		row.llmMetaJSON = metaJSON
+	if ser.hasMeta {
+		row.llmMetaJSON = ser.metaJSON
 	}
 	row.updatedAtMs = nowMs
 	row.expiresAtMs = nowMs + ttlMs
@@ -1104,6 +1119,52 @@ func (s *PostgresStore) CommitRevision(ctx context.Context, params CommitRevisio
 		return JobSnapshot{}, wrapPostgresErr("CommitRevision", err)
 	}
 	return row.toSnapshot("CommitRevision")
+}
+
+func (s *PostgresStore) releaseOpOnRevisionConflictTx(ctx context.Context, tx pgx.Tx, row *pgJobRow, jobID string) (JobSnapshot, error) {
+	newToken, tokErr := nextOpToken(row.activeOpToken)
+	if tokErr != nil {
+		return JobSnapshot{}, wrapPostgresErr("CommitRevision", tokErr)
+	}
+	_, updErr := tx.Exec(ctx, fmt.Sprintf(`UPDATE %s SET active_op_token = $1, active_op_until_ms = 0 WHERE job_id = $2`, s.jobsTable),
+		opTokenToInt64(newToken), jobID)
+	if updErr != nil {
+		return JobSnapshot{}, wrapPostgresErr("CommitRevision", updErr)
+	}
+	if commitErr := tx.Commit(ctx); commitErr != nil {
+		return JobSnapshot{}, wrapPostgresErr("CommitRevision", commitErr)
+	}
+	snap, snapErr := row.toSnapshot("CommitRevision")
+	if snapErr != nil {
+		return JobSnapshot{}, snapErr
+	}
+	return snap, ir.ErrRevisionConflict
+}
+
+func appendRevisionHistory(row *pgJobRow, maxHist int) (string, int, error) {
+	var prevIR ir.DashboardIR
+	if err := json.Unmarshal([]byte(row.currentIRJSON), &prevIR); err != nil {
+		return "", 0, wrapPostgresErr("CommitRevision", fmt.Errorf("unmarshal currentIR: %w", err))
+	}
+	if row.currentRev > 0 {
+		prevIR.Revision = row.currentRev
+	}
+
+	var history []ir.DashboardIR
+	if row.historyJSON != "" && row.historyJSON != "[]" {
+		if err := json.Unmarshal([]byte(row.historyJSON), &history); err != nil {
+			return "", 0, wrapPostgresErr("CommitRevision", fmt.Errorf("unmarshal history: %w", err))
+		}
+	}
+	history = append(history, prevIR)
+	if len(history) > maxHist {
+		history = history[len(history)-maxHist:]
+	}
+	histBytes, err := json.Marshal(history)
+	if err != nil {
+		return "", 0, fmt.Errorf("marshal history: %w", err)
+	}
+	return string(histBytes), len(history), nil
 }
 
 func (s *PostgresStore) RecordEditFailure(ctx context.Context, params RecordEditFailureParams) (JobSnapshot, error) {

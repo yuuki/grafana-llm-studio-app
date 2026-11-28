@@ -250,10 +250,26 @@ func ValidateStatusReport(report StatusReportIR, allowedEvidenceIDs map[string]b
 		}
 	}
 
-	if len(report.Timeline) > MaxReportTimelineItems {
-		issues = append(issues, fmt.Sprintf("timeline has %d items (max %d)", len(report.Timeline), MaxReportTimelineItems))
+	issues = append(issues, validateReportTimeline(report.Timeline, allowedEvidenceIDs)...)
+
+	declaredFindingIDs, findingIssues := validateReportFindings(report.OverallStatus, report.Findings, allowedEvidenceIDs)
+	issues = append(issues, findingIssues...)
+	issues = append(issues, validateReportHypotheses(report.Hypotheses, allowedEvidenceIDs)...)
+	issues = append(issues, validateReportActions(report.RecommendedActions, declaredFindingIDs)...)
+	issues = append(issues, validateReportDataGaps(report.DataGaps)...)
+
+	if len(issues) > 0 {
+		return fmt.Errorf("%w: %s", ErrInvalidReportIR, strings.Join(issues, "; "))
 	}
-	for i, item := range report.Timeline {
+	return nil
+}
+
+func validateReportTimeline(timeline []ReportTimelineItem, allowedEvidenceIDs map[string]bool) []string {
+	var issues []string
+	if len(timeline) > MaxReportTimelineItems {
+		issues = append(issues, fmt.Sprintf("timeline has %d items (max %d)", len(timeline), MaxReportTimelineItems))
+	}
+	for i, item := range timeline {
 		prefix := fmt.Sprintf("timeline[%d]", i)
 		if err := validateReportProse(prefix+".timestamp", item.Timestamp, 1, MaxReportTimestampRunes); err != nil {
 			issues = append(issues, err.Error())
@@ -263,16 +279,20 @@ func ValidateStatusReport(report StatusReportIR, allowedEvidenceIDs map[string]b
 		}
 		issues = append(issues, validateEvidenceIDRefs(prefix+".evidenceIds", item.EvidenceIDs, allowedEvidenceIDs)...)
 	}
+	return issues
+}
 
-	if len(report.Findings) > MaxReportFindings {
-		issues = append(issues, fmt.Sprintf("findings has %d items (max %d)", len(report.Findings), MaxReportFindings))
+func validateReportFindings(overallStatus string, findings []ReportFinding, allowedEvidenceIDs map[string]bool) (map[string]bool, []string) {
+	var issues []string
+	if len(findings) > MaxReportFindings {
+		issues = append(issues, fmt.Sprintf("findings has %d items (max %d)", len(findings), MaxReportFindings))
 	}
-	if (report.OverallStatus == "degraded" || report.OverallStatus == "critical") && len(report.Findings) == 0 {
-		issues = append(issues, fmt.Sprintf("overallStatus %q requires at least 1 grounded finding", report.OverallStatus))
+	if (overallStatus == "degraded" || overallStatus == "critical") && len(findings) == 0 {
+		issues = append(issues, fmt.Sprintf("overallStatus %q requires at least 1 grounded finding", overallStatus))
 	}
 
-	declaredFindingIDs := make(map[string]bool, len(report.Findings))
-	for i, f := range report.Findings {
+	declaredFindingIDs := make(map[string]bool, len(findings))
+	for i, f := range findings {
 		prefix := fmt.Sprintf("findings[%d]", i)
 		if !findingIDPattern.MatchString(f.ID) {
 			issues = append(issues, fmt.Sprintf("%s.id %q does not match ^f-[1-9][0-9]?$", prefix, f.ID))
@@ -295,11 +315,15 @@ func ValidateStatusReport(report StatusReportIR, allowedEvidenceIDs map[string]b
 		}
 		issues = append(issues, validateEvidenceIDRefs(prefix+".evidenceIds", f.EvidenceIDs, allowedEvidenceIDs)...)
 	}
+	return declaredFindingIDs, issues
+}
 
-	if len(report.Hypotheses) > MaxReportHypotheses {
-		issues = append(issues, fmt.Sprintf("hypotheses has %d items (max %d)", len(report.Hypotheses), MaxReportHypotheses))
+func validateReportHypotheses(hypotheses []ReportHypothesis, allowedEvidenceIDs map[string]bool) []string {
+	var issues []string
+	if len(hypotheses) > MaxReportHypotheses {
+		issues = append(issues, fmt.Sprintf("hypotheses has %d items (max %d)", len(hypotheses), MaxReportHypotheses))
 	}
-	for i, h := range report.Hypotheses {
+	for i, h := range hypotheses {
 		prefix := fmt.Sprintf("hypotheses[%d]", i)
 		if err := validateReportProse(prefix+".title", h.Title, 1, MaxReportHypTitleRunes); err != nil {
 			issues = append(issues, err.Error())
@@ -323,11 +347,15 @@ func ValidateStatusReport(report StatusReportIR, allowedEvidenceIDs map[string]b
 			}
 		}
 	}
+	return issues
+}
 
-	if len(report.RecommendedActions) > MaxReportActions {
-		issues = append(issues, fmt.Sprintf("recommendedActions has %d items (max %d)", len(report.RecommendedActions), MaxReportActions))
+func validateReportActions(actions []ReportAction, declaredFindingIDs map[string]bool) []string {
+	var issues []string
+	if len(actions) > MaxReportActions {
+		issues = append(issues, fmt.Sprintf("recommendedActions has %d items (max %d)", len(actions), MaxReportActions))
 	}
-	for i, act := range report.RecommendedActions {
+	for i, act := range actions {
 		prefix := fmt.Sprintf("recommendedActions[%d]", i)
 		if !allowedReportActionPriorities[act.Priority] {
 			issues = append(issues, fmt.Sprintf("%s.priority %q not allowed", prefix, act.Priority))
@@ -335,42 +363,48 @@ func ValidateStatusReport(report StatusReportIR, allowedEvidenceIDs map[string]b
 		if err := validateReportProse(prefix+".action", act.Action, 1, MaxReportActionRunes); err != nil {
 			issues = append(issues, err.Error())
 		}
-		if act.RelatedFindingIds == nil {
-			issues = append(issues, fmt.Sprintf("%s.relatedFindingIds array is required", prefix))
-		}
-		if len(act.RelatedFindingIds) > MaxReportRelatedFindings {
-			issues = append(issues, fmt.Sprintf("%s.relatedFindingIds has %d items (max %d)", prefix, len(act.RelatedFindingIds), MaxReportRelatedFindings))
-		}
-		seenRel := make(map[string]bool, len(act.RelatedFindingIds))
-		for j, fid := range act.RelatedFindingIds {
-			if !findingIDPattern.MatchString(fid) {
-				issues = append(issues, fmt.Sprintf("%s.relatedFindingIds[%d] %q invalid format", prefix, j, fid))
-				continue
-			}
-			if seenRel[fid] {
-				issues = append(issues, fmt.Sprintf("%s.relatedFindingIds contains duplicate %q", prefix, fid))
-				continue
-			}
-			seenRel[fid] = true
-			if !declaredFindingIDs[fid] {
-				issues = append(issues, fmt.Sprintf("%s.relatedFindingIds[%d] references unknown finding %q", prefix, j, fid))
-			}
-		}
+		issues = append(issues, validateRelatedFindingIDs(prefix, act.RelatedFindingIds, declaredFindingIDs)...)
 	}
+	return issues
+}
 
-	if len(report.DataGaps) > MaxReportDataGaps {
-		issues = append(issues, fmt.Sprintf("dataGaps has %d items (max %d)", len(report.DataGaps), MaxReportDataGaps))
+func validateRelatedFindingIDs(prefix string, relatedIDs []string, declaredFindingIDs map[string]bool) []string {
+	var issues []string
+	if relatedIDs == nil {
+		issues = append(issues, fmt.Sprintf("%s.relatedFindingIds array is required", prefix))
 	}
-	for i, gap := range report.DataGaps {
+	if len(relatedIDs) > MaxReportRelatedFindings {
+		issues = append(issues, fmt.Sprintf("%s.relatedFindingIds has %d items (max %d)", prefix, len(relatedIDs), MaxReportRelatedFindings))
+	}
+	seenRel := make(map[string]bool, len(relatedIDs))
+	for j, fid := range relatedIDs {
+		if !findingIDPattern.MatchString(fid) {
+			issues = append(issues, fmt.Sprintf("%s.relatedFindingIds[%d] %q invalid format", prefix, j, fid))
+			continue
+		}
+		if seenRel[fid] {
+			issues = append(issues, fmt.Sprintf("%s.relatedFindingIds contains duplicate %q", prefix, fid))
+			continue
+		}
+		seenRel[fid] = true
+		if !declaredFindingIDs[fid] {
+			issues = append(issues, fmt.Sprintf("%s.relatedFindingIds[%d] references unknown finding %q", prefix, j, fid))
+		}
+	}
+	return issues
+}
+
+func validateReportDataGaps(dataGaps []string) []string {
+	var issues []string
+	if len(dataGaps) > MaxReportDataGaps {
+		issues = append(issues, fmt.Sprintf("dataGaps has %d items (max %d)", len(dataGaps), MaxReportDataGaps))
+	}
+	for i, gap := range dataGaps {
 		if err := validateReportProse(fmt.Sprintf("dataGaps[%d]", i), gap, 1, MaxReportDataGapRunes); err != nil {
 			issues = append(issues, err.Error())
 		}
 	}
-
-	if len(issues) > 0 {
-		return fmt.Errorf("%w: %s", ErrInvalidReportIR, strings.Join(issues, "; "))
-	}
-	return nil
+	return issues
 }
 
 func validateEvidenceIDRefs(field string, ids []string, allowed map[string]bool) []string {
@@ -443,201 +477,265 @@ func hasVisibleText(s string) bool {
 // ValidateAnalyzePayload validates pre-flight invariants on AnalyzeStatusPayload and returns
 // the authoritative set of citable evidence IDs present in the request.
 func ValidateAnalyzePayload(p AnalyzeStatusPayload) (map[string]bool, error) {
-	if !allowedReportWindows[p.Window] {
-		return nil, fmt.Errorf("%w: unsupported window %q", ErrInvalidAnalyzeRequest, p.Window)
+	if err := validateAnalyzeHeader(p); err != nil {
+		return nil, err
 	}
-	if !allowedBaselineModes[p.BaselineMode] {
-		return nil, fmt.Errorf("%w: unsupported baselineMode %q", ErrInvalidAnalyzeRequest, p.BaselineMode)
+	if err := validateAnalyzeDashboardContext(p.DashboardContext); err != nil {
+		return nil, err
 	}
-	if !allowedReportLanguages[p.Language] {
-		return nil, fmt.Errorf("%w: unsupported language %q", ErrInvalidAnalyzeRequest, p.Language)
-	}
-	if p.Scope != nil {
-		if err := validateScopeFilter(p.Scope); err != nil {
-			return nil, fmt.Errorf("%w: %v", ErrInvalidAnalyzeRequest, err)
-		}
-	}
-	if !utf8.ValidString(p.UserFocus) {
-		return nil, fmt.Errorf("%w: userFocus contains invalid UTF-8", ErrInvalidAnalyzeRequest)
-	}
-	if utf8.RuneCountInString(p.UserFocus) > MaxAnalyzeFocusRunes {
-		return nil, fmt.Errorf("%w: userFocus exceeds max %d runes", ErrInvalidAnalyzeRequest, MaxAnalyzeFocusRunes)
-	}
-	if err := validateRFC3339("evidence.collectedAt", p.Evidence.CollectedAt, true); err != nil {
-		return nil, fmt.Errorf("%w: %v", ErrInvalidAnalyzeRequest, err)
-	}
-
-	if p.CollectionStatus.TotalRulesEvaluated < 0 || p.CollectionStatus.ActiveAlertsTotal < 0 || p.CollectionStatus.AbnormalRulesTotal < 0 {
-		return nil, fmt.Errorf("%w: collectionStatus counters must be non-negative", ErrInvalidAnalyzeRequest)
-	}
-	if !p.CollectionStatus.AlertsChecked && !p.CollectionStatus.RulesChecked && len(p.Evidence.Metrics) == 0 {
-		return nil, fmt.Errorf("%w: alerting and dashboard metric collection all failed or returned no sources", ErrInsufficientEvidence)
-	}
-
-	if p.DashboardContext != nil {
-		if !hasVisibleText(p.DashboardContext.Title) || utf8.RuneCountInString(p.DashboardContext.Title) > MaxTitleLen {
-			return nil, fmt.Errorf("%w: dashboardContext.title must be 1..%d runes", ErrInvalidAnalyzeRequest, MaxTitleLen)
-		}
-		if p.DashboardContext.UID != "" && utf8.RuneCountInString(p.DashboardContext.UID) > 64 {
-			return nil, fmt.Errorf("%w: dashboardContext.uid exceeds 64 runes", ErrInvalidAnalyzeRequest)
-		}
-		if p.DashboardContext.PanelCount < 0 || p.DashboardContext.AnalyzedPanelCount < 0 {
-			return nil, fmt.Errorf("%w: dashboardContext panel counts must be non-negative", ErrInvalidAnalyzeRequest)
-		}
-		if p.DashboardContext.AnalyzedPanelCount > p.DashboardContext.PanelCount {
-			return nil, fmt.Errorf("%w: dashboardContext.analyzedPanelCount (%d) exceeds panelCount (%d)", ErrInvalidAnalyzeRequest, p.DashboardContext.AnalyzedPanelCount, p.DashboardContext.PanelCount)
-		}
-	}
-
-	if len(p.Evidence.Alerts) > MaxAlertEvidenceItems {
-		return nil, fmt.Errorf("%w: evidence.alerts has %d items (max %d)", ErrInvalidAnalyzeRequest, len(p.Evidence.Alerts), MaxAlertEvidenceItems)
-	}
-	if len(p.Evidence.Rules) > MaxRuleEvidenceItems {
-		return nil, fmt.Errorf("%w: evidence.rules has %d items (max %d)", ErrInvalidAnalyzeRequest, len(p.Evidence.Rules), MaxRuleEvidenceItems)
-	}
-	if len(p.Evidence.Metrics) > MaxMetricEvidenceItems {
-		return nil, fmt.Errorf("%w: evidence.metrics has %d items (max %d)", ErrInvalidAnalyzeRequest, len(p.Evidence.Metrics), MaxMetricEvidenceItems)
-	}
-	if len(p.Evidence.StatusNotes) > MaxStatusNoteItems {
-		return nil, fmt.Errorf("%w: evidence.statusNotes has %d items (max %d)", ErrInvalidAnalyzeRequest, len(p.Evidence.StatusNotes), MaxStatusNoteItems)
-	}
-	if len(p.CollectionWarnings) > MaxCollectionWarnings {
-		return nil, fmt.Errorf("%w: collectionWarnings has %d items (max %d)", ErrInvalidAnalyzeRequest, len(p.CollectionWarnings), MaxCollectionWarnings)
+	if err := validateAnalyzeEvidenceCounts(p); err != nil {
+		return nil, err
 	}
 
 	allowedIDs := make(map[string]bool, len(p.Evidence.Alerts)+len(p.Evidence.Rules)+len(p.Evidence.Metrics)+len(p.Evidence.StatusNotes)+len(p.CollectionWarnings))
-	registerID := func(field, id string, pat *regexp.Regexp) error {
-		if !pat.MatchString(id) {
-			return fmt.Errorf("%s %q has invalid ID format", field, id)
-		}
-		if allowedIDs[id] {
-			return fmt.Errorf("duplicate evidence ID %q", id)
-		}
-		allowedIDs[id] = true
-		return nil
+	if err := validateAlertEvidences(p.Evidence.Alerts, allowedIDs); err != nil {
+		return nil, err
 	}
-
-	for i, a := range p.Evidence.Alerts {
-		prefix := fmt.Sprintf("evidence.alerts[%d]", i)
-		if err := registerID(prefix+".id", a.ID, alertEvidenceIDPattern); err != nil {
-			return nil, fmt.Errorf("%w: %v", ErrInvalidAnalyzeRequest, err)
-		}
-		if !hasVisibleText(a.AlertName) || utf8.RuneCountInString(a.AlertName) > 128 {
-			return nil, fmt.Errorf("%w: %s.alertName must be 1..128 runes", ErrInvalidAnalyzeRequest, prefix)
-		}
-		if !allowedAlertStates[a.State] {
-			return nil, fmt.Errorf("%w: %s.state %q not allowed", ErrInvalidAnalyzeRequest, prefix, a.State)
-		}
-		if err := validateRFC3339(prefix+".startsAt", a.StartsAt, false); err != nil {
-			return nil, fmt.Errorf("%w: %v", ErrInvalidAnalyzeRequest, err)
-		}
-		if len(a.Labels) > MaxEvidenceLabels {
-			return nil, fmt.Errorf("%w: %s.labels has %d entries (max %d)", ErrInvalidAnalyzeRequest, prefix, len(a.Labels), MaxEvidenceLabels)
-		}
-		for k, v := range a.Labels {
-			if !labelNamePattern.MatchString(k) {
-				return nil, fmt.Errorf("%w: %s.labels key %q invalid", ErrInvalidAnalyzeRequest, prefix, k)
-			}
-			if utf8.RuneCountInString(v) > MaxEvidenceLabelValRune {
-				return nil, fmt.Errorf("%w: %s.labels[%q] exceeds %d runes", ErrInvalidAnalyzeRequest, prefix, k, MaxEvidenceLabelValRune)
-			}
-		}
+	if err := validateRuleEvidences(p.Evidence.Rules, allowedIDs); err != nil {
+		return nil, err
 	}
-
-	for i, r := range p.Evidence.Rules {
-		prefix := fmt.Sprintf("evidence.rules[%d]", i)
-		if err := registerID(prefix+".id", r.ID, ruleEvidenceIDPattern); err != nil {
-			return nil, fmt.Errorf("%w: %v", ErrInvalidAnalyzeRequest, err)
-		}
-		if !hasVisibleText(r.RuleName) || utf8.RuneCountInString(r.RuleName) > 128 {
-			return nil, fmt.Errorf("%w: %s.ruleName must be 1..128 runes", ErrInvalidAnalyzeRequest, prefix)
-		}
-		if !allowedRuleStates[r.State] {
-			return nil, fmt.Errorf("%w: %s.state %q not allowed", ErrInvalidAnalyzeRequest, prefix, r.State)
-		}
-		if !allowedRuleHealths[r.Health] {
-			return nil, fmt.Errorf("%w: %s.health %q not allowed", ErrInvalidAnalyzeRequest, prefix, r.Health)
-		}
-		if r.ActiveAlertsCount < 0 {
-			return nil, fmt.Errorf("%w: %s.activeAlertsCount must be non-negative", ErrInvalidAnalyzeRequest, prefix)
-		}
+	if err := validateMetricEvidences(p.Evidence.Metrics, allowedIDs); err != nil {
+		return nil, err
 	}
-
-	for i, m := range p.Evidence.Metrics {
-		prefix := fmt.Sprintf("evidence.metrics[%d]", i)
-		if err := registerID(prefix+".id", m.ID, metricEvidenceIDPat); err != nil {
-			return nil, fmt.Errorf("%w: %v", ErrInvalidAnalyzeRequest, err)
-		}
-		if !hasVisibleText(m.PanelTitle) || utf8.RuneCountInString(m.PanelTitle) > MaxTitleLen {
-			return nil, fmt.Errorf("%w: %s.panelTitle must be 1..%d runes", ErrInvalidAnalyzeRequest, prefix, MaxTitleLen)
-		}
-		if !allowedMetricQueryStatuses[m.QueryStatus] {
-			return nil, fmt.Errorf("%w: %s.queryStatus %q not allowed", ErrInvalidAnalyzeRequest, prefix, m.QueryStatus)
-		}
-		if !allowedMetricTrends[m.Trend] {
-			return nil, fmt.Errorf("%w: %s.trend %q not allowed", ErrInvalidAnalyzeRequest, prefix, m.Trend)
-		}
-		if !allowedThresholdBreaches[m.ThresholdBreached] {
-			return nil, fmt.Errorf("%w: %s.thresholdBreached %q not allowed", ErrInvalidAnalyzeRequest, prefix, m.ThresholdBreached)
-		}
-		if !allowedAnomalyHints[m.AnomalyHint] {
-			return nil, fmt.Errorf("%w: %s.anomalyHint %q not allowed", ErrInvalidAnalyzeRequest, prefix, m.AnomalyHint)
-		}
-		if m.Current != nil {
-			if err := validateWindowStats(prefix+".current", m.Current); err != nil {
-				return nil, fmt.Errorf("%w: %v", ErrInvalidAnalyzeRequest, err)
-			}
-		}
-		if m.Baseline != nil {
-			if err := checkFiniteFloat(prefix+".baseline.avg", m.Baseline.Avg); err != nil {
-				return nil, fmt.Errorf("%w: %v", ErrInvalidAnalyzeRequest, err)
-			}
-			if err := checkFiniteFloat(prefix+".baseline.p95", m.Baseline.P95); err != nil {
-				return nil, fmt.Errorf("%w: %v", ErrInvalidAnalyzeRequest, err)
-			}
-			if err := checkFiniteFloat(prefix+".baseline.max", m.Baseline.Max); err != nil {
-				return nil, fmt.Errorf("%w: %v", ErrInvalidAnalyzeRequest, err)
-			}
-		}
-		if m.DeltaPctAvg != nil {
-			if err := checkFiniteFloat(prefix+".deltaPctAvg", *m.DeltaPctAvg); err != nil {
-				return nil, fmt.Errorf("%w: %v", ErrInvalidAnalyzeRequest, err)
-			}
-		}
-		if m.DeltaPctP95 != nil {
-			if err := checkFiniteFloat(prefix+".deltaPctP95", *m.DeltaPctP95); err != nil {
-				return nil, fmt.Errorf("%w: %v", ErrInvalidAnalyzeRequest, err)
-			}
-		}
+	if err := validateStatusNoteEvidences(p.Evidence.StatusNotes, allowedIDs); err != nil {
+		return nil, err
 	}
-
-	for i, s := range p.Evidence.StatusNotes {
-		prefix := fmt.Sprintf("evidence.statusNotes[%d]", i)
-		if err := registerID(prefix+".id", s.ID, statusEvidenceIDPat); err != nil {
-			return nil, fmt.Errorf("%w: %v", ErrInvalidAnalyzeRequest, err)
-		}
-		if strings.TrimSpace(s.Message) == "" || utf8.RuneCountInString(s.Message) > MaxEvidenceSummaryRunes {
-			return nil, fmt.Errorf("%w: %s.message must be 1..%d runes", ErrInvalidAnalyzeRequest, prefix, MaxEvidenceSummaryRunes)
-		}
-	}
-
-	for i, w := range p.CollectionWarnings {
-		prefix := fmt.Sprintf("collectionWarnings[%d]", i)
-		if err := registerID(prefix+".id", w.ID, warnEvidenceIDPattern); err != nil {
-			return nil, fmt.Errorf("%w: %v", ErrInvalidAnalyzeRequest, err)
-		}
-		if !allowedCollectionWarningCodes[w.Code] {
-			return nil, fmt.Errorf("%w: %s.code %q not allowed", ErrInvalidAnalyzeRequest, prefix, w.Code)
-		}
-		if strings.TrimSpace(w.Message) == "" || utf8.RuneCountInString(w.Message) > MaxEvidenceSummaryRunes {
-			return nil, fmt.Errorf("%w: %s.message must be 1..%d runes", ErrInvalidAnalyzeRequest, prefix, MaxEvidenceSummaryRunes)
-		}
+	if err := validateCollectionWarnings(p.CollectionWarnings, allowedIDs); err != nil {
+		return nil, err
 	}
 
 	if len(allowedIDs) == 0 {
 		return nil, fmt.Errorf("%w: at least one evidence item or status note is required", ErrInsufficientEvidence)
 	}
 	return allowedIDs, nil
+}
+
+func validateAnalyzeHeader(p AnalyzeStatusPayload) error {
+	if !allowedReportWindows[p.Window] {
+		return fmt.Errorf("%w: unsupported window %q", ErrInvalidAnalyzeRequest, p.Window)
+	}
+	if !allowedBaselineModes[p.BaselineMode] {
+		return fmt.Errorf("%w: unsupported baselineMode %q", ErrInvalidAnalyzeRequest, p.BaselineMode)
+	}
+	if !allowedReportLanguages[p.Language] {
+		return fmt.Errorf("%w: unsupported language %q", ErrInvalidAnalyzeRequest, p.Language)
+	}
+	if p.Scope != nil {
+		if err := validateScopeFilter(p.Scope); err != nil {
+			return fmt.Errorf("%w: %v", ErrInvalidAnalyzeRequest, err)
+		}
+	}
+	if !utf8.ValidString(p.UserFocus) {
+		return fmt.Errorf("%w: userFocus contains invalid UTF-8", ErrInvalidAnalyzeRequest)
+	}
+	if utf8.RuneCountInString(p.UserFocus) > MaxAnalyzeFocusRunes {
+		return fmt.Errorf("%w: userFocus exceeds max %d runes", ErrInvalidAnalyzeRequest, MaxAnalyzeFocusRunes)
+	}
+	if err := validateRFC3339("evidence.collectedAt", p.Evidence.CollectedAt, true); err != nil {
+		return fmt.Errorf("%w: %v", ErrInvalidAnalyzeRequest, err)
+	}
+	if p.CollectionStatus.TotalRulesEvaluated < 0 || p.CollectionStatus.ActiveAlertsTotal < 0 || p.CollectionStatus.AbnormalRulesTotal < 0 {
+		return fmt.Errorf("%w: collectionStatus counters must be non-negative", ErrInvalidAnalyzeRequest)
+	}
+	if !p.CollectionStatus.AlertsChecked && !p.CollectionStatus.RulesChecked && len(p.Evidence.Metrics) == 0 {
+		return fmt.Errorf("%w: alerting and dashboard metric collection all failed or returned no sources", ErrInsufficientEvidence)
+	}
+	return nil
+}
+
+func validateAnalyzeDashboardContext(ctx *ReportDashboardContext) error {
+	if ctx == nil {
+		return nil
+	}
+	if !hasVisibleText(ctx.Title) || utf8.RuneCountInString(ctx.Title) > MaxTitleLen {
+		return fmt.Errorf("%w: dashboardContext.title must be 1..%d runes", ErrInvalidAnalyzeRequest, MaxTitleLen)
+	}
+	if ctx.UID != "" && utf8.RuneCountInString(ctx.UID) > 64 {
+		return fmt.Errorf("%w: dashboardContext.uid exceeds 64 runes", ErrInvalidAnalyzeRequest)
+	}
+	if ctx.PanelCount < 0 || ctx.AnalyzedPanelCount < 0 {
+		return fmt.Errorf("%w: dashboardContext panel counts must be non-negative", ErrInvalidAnalyzeRequest)
+	}
+	if ctx.AnalyzedPanelCount > ctx.PanelCount {
+		return fmt.Errorf("%w: dashboardContext.analyzedPanelCount (%d) exceeds panelCount (%d)", ErrInvalidAnalyzeRequest, ctx.AnalyzedPanelCount, ctx.PanelCount)
+	}
+	return nil
+}
+
+func validateAnalyzeEvidenceCounts(p AnalyzeStatusPayload) error {
+	if len(p.Evidence.Alerts) > MaxAlertEvidenceItems {
+		return fmt.Errorf("%w: evidence.alerts has %d items (max %d)", ErrInvalidAnalyzeRequest, len(p.Evidence.Alerts), MaxAlertEvidenceItems)
+	}
+	if len(p.Evidence.Rules) > MaxRuleEvidenceItems {
+		return fmt.Errorf("%w: evidence.rules has %d items (max %d)", ErrInvalidAnalyzeRequest, len(p.Evidence.Rules), MaxRuleEvidenceItems)
+	}
+	if len(p.Evidence.Metrics) > MaxMetricEvidenceItems {
+		return fmt.Errorf("%w: evidence.metrics has %d items (max %d)", ErrInvalidAnalyzeRequest, len(p.Evidence.Metrics), MaxMetricEvidenceItems)
+	}
+	if len(p.Evidence.StatusNotes) > MaxStatusNoteItems {
+		return fmt.Errorf("%w: evidence.statusNotes has %d items (max %d)", ErrInvalidAnalyzeRequest, len(p.Evidence.StatusNotes), MaxStatusNoteItems)
+	}
+	if len(p.CollectionWarnings) > MaxCollectionWarnings {
+		return fmt.Errorf("%w: collectionWarnings has %d items (max %d)", ErrInvalidAnalyzeRequest, len(p.CollectionWarnings), MaxCollectionWarnings)
+	}
+	return nil
+}
+
+func registerEvidenceID(allowedIDs map[string]bool, field, id string, pat *regexp.Regexp) error {
+	if !pat.MatchString(id) {
+		return fmt.Errorf("%w: %s %q has invalid ID format", ErrInvalidAnalyzeRequest, field, id)
+	}
+	if allowedIDs[id] {
+		return fmt.Errorf("%w: duplicate evidence ID %q", ErrInvalidAnalyzeRequest, id)
+	}
+	allowedIDs[id] = true
+	return nil
+}
+
+func validateAlertEvidences(alerts []AlertEvidenceItem, allowedIDs map[string]bool) error {
+	for i, a := range alerts {
+		prefix := fmt.Sprintf("evidence.alerts[%d]", i)
+		if err := registerEvidenceID(allowedIDs, prefix+".id", a.ID, alertEvidenceIDPattern); err != nil {
+			return err
+		}
+		if !hasVisibleText(a.AlertName) || utf8.RuneCountInString(a.AlertName) > 128 {
+			return fmt.Errorf("%w: %s.alertName must be 1..128 runes", ErrInvalidAnalyzeRequest, prefix)
+		}
+		if !allowedAlertStates[a.State] {
+			return fmt.Errorf("%w: %s.state %q not allowed", ErrInvalidAnalyzeRequest, prefix, a.State)
+		}
+		if err := validateRFC3339(prefix+".startsAt", a.StartsAt, false); err != nil {
+			return fmt.Errorf("%w: %v", ErrInvalidAnalyzeRequest, err)
+		}
+		if err := validateEvidenceLabels(prefix, a.Labels); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func validateEvidenceLabels(prefix string, labels map[string]string) error {
+	if len(labels) > MaxEvidenceLabels {
+		return fmt.Errorf("%w: %s.labels has %d entries (max %d)", ErrInvalidAnalyzeRequest, prefix, len(labels), MaxEvidenceLabels)
+	}
+	for k, v := range labels {
+		if !labelNamePattern.MatchString(k) {
+			return fmt.Errorf("%w: %s.labels key %q invalid", ErrInvalidAnalyzeRequest, prefix, k)
+		}
+		if utf8.RuneCountInString(v) > MaxEvidenceLabelValRune {
+			return fmt.Errorf("%w: %s.labels[%q] exceeds %d runes", ErrInvalidAnalyzeRequest, prefix, k, MaxEvidenceLabelValRune)
+		}
+	}
+	return nil
+}
+
+func validateRuleEvidences(rules []RuleEvidenceItem, allowedIDs map[string]bool) error {
+	for i, r := range rules {
+		prefix := fmt.Sprintf("evidence.rules[%d]", i)
+		if err := registerEvidenceID(allowedIDs, prefix+".id", r.ID, ruleEvidenceIDPattern); err != nil {
+			return err
+		}
+		if !hasVisibleText(r.RuleName) || utf8.RuneCountInString(r.RuleName) > 128 {
+			return fmt.Errorf("%w: %s.ruleName must be 1..128 runes", ErrInvalidAnalyzeRequest, prefix)
+		}
+		if !allowedRuleStates[r.State] {
+			return fmt.Errorf("%w: %s.state %q not allowed", ErrInvalidAnalyzeRequest, prefix, r.State)
+		}
+		if !allowedRuleHealths[r.Health] {
+			return fmt.Errorf("%w: %s.health %q not allowed", ErrInvalidAnalyzeRequest, prefix, r.Health)
+		}
+		if r.ActiveAlertsCount < 0 {
+			return fmt.Errorf("%w: %s.activeAlertsCount must be non-negative", ErrInvalidAnalyzeRequest, prefix)
+		}
+	}
+	return nil
+}
+
+func validateMetricEvidences(metrics []MetricEvidenceItem, allowedIDs map[string]bool) error {
+	for i, m := range metrics {
+		prefix := fmt.Sprintf("evidence.metrics[%d]", i)
+		if err := registerEvidenceID(allowedIDs, prefix+".id", m.ID, metricEvidenceIDPat); err != nil {
+			return err
+		}
+		if !hasVisibleText(m.PanelTitle) || utf8.RuneCountInString(m.PanelTitle) > MaxTitleLen {
+			return fmt.Errorf("%w: %s.panelTitle must be 1..%d runes", ErrInvalidAnalyzeRequest, prefix, MaxTitleLen)
+		}
+		if !allowedMetricQueryStatuses[m.QueryStatus] {
+			return fmt.Errorf("%w: %s.queryStatus %q not allowed", ErrInvalidAnalyzeRequest, prefix, m.QueryStatus)
+		}
+		if !allowedMetricTrends[m.Trend] {
+			return fmt.Errorf("%w: %s.trend %q not allowed", ErrInvalidAnalyzeRequest, prefix, m.Trend)
+		}
+		if !allowedThresholdBreaches[m.ThresholdBreached] {
+			return fmt.Errorf("%w: %s.thresholdBreached %q not allowed", ErrInvalidAnalyzeRequest, prefix, m.ThresholdBreached)
+		}
+		if !allowedAnomalyHints[m.AnomalyHint] {
+			return fmt.Errorf("%w: %s.anomalyHint %q not allowed", ErrInvalidAnalyzeRequest, prefix, m.AnomalyHint)
+		}
+		if err := validateMetricStats(prefix, m); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func validateMetricStats(prefix string, m MetricEvidenceItem) error {
+	if m.Current != nil {
+		if err := validateWindowStats(prefix+".current", m.Current); err != nil {
+			return fmt.Errorf("%w: %v", ErrInvalidAnalyzeRequest, err)
+		}
+	}
+	if m.Baseline != nil {
+		if err := checkFiniteFloat(prefix+".baseline.avg", m.Baseline.Avg); err != nil {
+			return fmt.Errorf("%w: %v", ErrInvalidAnalyzeRequest, err)
+		}
+		if err := checkFiniteFloat(prefix+".baseline.p95", m.Baseline.P95); err != nil {
+			return fmt.Errorf("%w: %v", ErrInvalidAnalyzeRequest, err)
+		}
+		if err := checkFiniteFloat(prefix+".baseline.max", m.Baseline.Max); err != nil {
+			return fmt.Errorf("%w: %v", ErrInvalidAnalyzeRequest, err)
+		}
+	}
+	if m.DeltaPctAvg != nil {
+		if err := checkFiniteFloat(prefix+".deltaPctAvg", *m.DeltaPctAvg); err != nil {
+			return fmt.Errorf("%w: %v", ErrInvalidAnalyzeRequest, err)
+		}
+	}
+	if m.DeltaPctP95 != nil {
+		if err := checkFiniteFloat(prefix+".deltaPctP95", *m.DeltaPctP95); err != nil {
+			return fmt.Errorf("%w: %v", ErrInvalidAnalyzeRequest, err)
+		}
+	}
+	return nil
+}
+
+func validateStatusNoteEvidences(notes []StatusNoteEvidenceItem, allowedIDs map[string]bool) error {
+	for i, s := range notes {
+		prefix := fmt.Sprintf("evidence.statusNotes[%d]", i)
+		if err := registerEvidenceID(allowedIDs, prefix+".id", s.ID, statusEvidenceIDPat); err != nil {
+			return err
+		}
+		if strings.TrimSpace(s.Message) == "" || utf8.RuneCountInString(s.Message) > MaxEvidenceSummaryRunes {
+			return fmt.Errorf("%w: %s.message must be 1..%d runes", ErrInvalidAnalyzeRequest, prefix, MaxEvidenceSummaryRunes)
+		}
+	}
+	return nil
+}
+
+func validateCollectionWarnings(warnings []CollectionWarningItem, allowedIDs map[string]bool) error {
+	for i, w := range warnings {
+		prefix := fmt.Sprintf("collectionWarnings[%d]", i)
+		if err := registerEvidenceID(allowedIDs, prefix+".id", w.ID, warnEvidenceIDPattern); err != nil {
+			return err
+		}
+		if !allowedCollectionWarningCodes[w.Code] {
+			return fmt.Errorf("%w: %s.code %q not allowed", ErrInvalidAnalyzeRequest, prefix, w.Code)
+		}
+		if strings.TrimSpace(w.Message) == "" || utf8.RuneCountInString(w.Message) > MaxEvidenceSummaryRunes {
+			return fmt.Errorf("%w: %s.message must be 1..%d runes", ErrInvalidAnalyzeRequest, prefix, MaxEvidenceSummaryRunes)
+		}
+	}
+	return nil
 }
 
 func validateScopeFilter(scope *ScopeFilter) error {
