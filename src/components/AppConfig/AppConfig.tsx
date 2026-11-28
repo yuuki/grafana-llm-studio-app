@@ -1,741 +1,28 @@
-import React, { useState } from 'react';
+import React from 'react';
 import { AppPluginMeta, PluginConfigPageProps } from '@grafana/data';
-import { getBackendSrv } from '@grafana/runtime';
-import {
-  Alert,
-  Button,
-  Checkbox,
-  Field,
-  FieldSet,
-  Input,
-  SecretInput,
-  Select,
-} from '@grafana/ui';
-import { lastValueFrom } from 'rxjs';
-import { extractApiError } from '../../api/studioClient';
+import { Alert, Button } from '@grafana/ui';
 import { useStudioTranslation } from '../../i18n';
-import { QueryKind } from '../../ir/types';
+import { BudgetsAndLimitsSection } from './sections/BudgetsAndLimitsSection';
+import { DatasourceAllowlistSection } from './sections/DatasourceAllowlistSection';
+import { JobStorageSection } from './sections/JobStorageSection';
+import { LlmConnectionSection } from './sections/LlmConnectionSection';
+import { StudioJsonData } from './types';
+import { useAppConfigState } from './useAppConfigState';
 
-export type JobStoreBackend = 'memory' | 'redis' | 'postgres';
-export type PostgresSslMode = 'disable' | 'prefer' | 'require' | 'verify-ca' | 'verify-full';
-
-export interface StudioJsonData {
-  allowedDatasourceUids?: string[];
-  datasourceDialects?: Record<string, QueryKind>;
-  llmMode?: 'grafana-llm-app' | 'mock';
-  allowMockInDev?: boolean;
-  grafanaUrl?: string;
-  modelTier?: 'base' | 'large';
-  structuredOutputMode?: 'json_schema' | 'json_object';
-  tokenLimitField?: 'max_completion_tokens' | 'max_tokens';
-  reasoningEffort?: string;
-  maxPanels?: number;
-  maxRepairAttempts?: number;
-  maxOutputTokens?: number;
-  llmTimeoutSeconds?: number;
-  jobDeadlineSeconds?: number;
-  maxConcurrentJobs?: number;
-  validationTimeoutSeconds?: number;
-  maxConcurrentQueries?: number;
-  enableSseProgress?: boolean;
-  jobStoreBackend?: JobStoreBackend;
-  jobTtlMinutes?: number;
-  redisAddr?: string;
-  redisDb?: number;
-  redisKeyPrefix?: string;
-  redisTls?: boolean;
-  redisUsername?: string;
-  postgresAddr?: string;
-  postgresDatabase?: string;
-  postgresSchema?: string;
-  postgresTablePrefix?: string;
-  postgresUsername?: string;
-  postgresSslMode?: PostgresSslMode;
-}
-
-const REDIS_KEY_PREFIX_RE = /^[a-zA-Z0-9:_-]{1,64}$/;
-const REDIS_PORT_RE = /^[1-9]\d{0,4}$/;
-const REDIS_HOSTNAME_RE = /^[a-zA-Z0-9](?:[a-zA-Z0-9.-]*[a-zA-Z0-9])?$/;
-const IPV6_HEXTET_RE = /^[0-9a-fA-F]{1,4}$/;
-const IPV4_OCTET_RE = /^(?:0|[1-9]\d{0,2})$/;
-const POSTGRES_SCHEMA_RE = /^[a-z_][a-z0-9_]{0,62}$/;
-const POSTGRES_TABLE_PREFIX_RE = /^[a-z_][a-z0-9_]{0,31}$/;
-const ALLOWED_POSTGRES_SSL_MODES: ReadonlySet<string> = new Set([
-  'disable',
-  'prefer',
-  'require',
-  'verify-ca',
-  'verify-full',
-]);
-export const BOUND_REDIS_PASSWORD_PREFIX = 'llmstudio-redis-bound-v1:';
-export const BOUND_POSTGRES_PASSWORD_PREFIX = 'llmstudio-postgres-bound-v1:';
-export const BOUND_GRAFANA_TOKEN_PREFIX = 'llmstudio-grafana-bound-v1:';
-
-function utf8ByteLength(raw: string): number {
-  if (typeof TextEncoder !== 'undefined') {
-    return new TextEncoder().encode(raw).length;
-  }
-  let bytes = 0;
-  for (let i = 0; i < raw.length; i++) {
-    const code = raw.charCodeAt(i);
-    if (code <= 0x7f) {
-      bytes += 1;
-    } else if (code <= 0x7ff) {
-      bytes += 2;
-    } else if (code >= 0xd800 && code <= 0xdbff && i + 1 < raw.length) {
-      bytes += 4;
-      i++;
-    } else {
-      bytes += 3;
-    }
-  }
-  return bytes;
-}
-
-function hasForbiddenTextChar(raw: string, disallowSpace: boolean): boolean {
-  for (let i = 0; i < raw.length; i++) {
-    const code = raw.charCodeAt(i);
-    if (code < 0x20 || code === 0x7f || (code >= 0x80 && code <= 0x9f) || code === 0xfeff) {
-      return true;
-    }
-    if (disallowSpace && (code === 0x20 || code === 0x09 || code === 0x0a || code === 0x0d)) {
-      return true;
-    }
-  }
-  return false;
-}
-
-function isValidIpv4Literal(raw: string): boolean {
-  const parts = raw.split('.');
-  if (parts.length !== 4) {
-    return false;
-  }
-  for (const p of parts) {
-    if (!IPV4_OCTET_RE.test(p)) {
-      return false;
-    }
-    const n = Number(p);
-    if (n < 0 || n > 255) {
-      return false;
-    }
-  }
-  return true;
-}
-
-function isValidIpv6Literal(host: string): boolean {
-  if (!host || !host.includes(':')) {
-    return false;
-  }
-  // Reject triple colon or more than one "::" compression marker.
-  if (host.includes(':::')) {
-    return false;
-  }
-  const doubleColonParts = host.split('::');
-  if (doubleColonParts.length > 2) {
-    return false;
-  }
-  const hasCompression = doubleColonParts.length === 2;
-
-  const parseSide = (side: string, allowTrailingIpv4: boolean): number | null => {
-    if (side === '') {
-      return 0;
-    }
-    const groups = side.split(':');
-    let count = 0;
-    for (let i = 0; i < groups.length; i++) {
-      const g = groups[i];
-      if (g === '') {
-        return null;
-      }
-      if (allowTrailingIpv4 && i === groups.length - 1 && g.includes('.')) {
-        if (!isValidIpv4Literal(g)) {
-          return null;
-        }
-        count += 2;
-      } else if (IPV6_HEXTET_RE.test(g)) {
-        count += 1;
-      } else {
-        return null;
-      }
-    }
-    return count;
-  };
-
-  if (hasCompression) {
-    const leftCount = parseSide(doubleColonParts[0], false);
-    const rightCount = parseSide(doubleColonParts[1], true);
-    if (leftCount === null || rightCount === null) {
-      return false;
-    }
-    // "::" must replace at least one 16-bit group.
-    return leftCount + rightCount < 8;
-  }
-
-  const totalCount = parseSide(host, true);
-  return totalCount === 8;
-}
-
-function parseNumberInput(raw: string): number {
-  const trimmed = raw.trim();
-  if (trimmed === '') {
-    return Number.NaN;
-  }
-  return Number(trimmed);
-}
-
-function formatNumberValue(val: number): string | number {
-  return Number.isNaN(val) ? '' : val;
-}
-
-function canonicalRedisAddrForCompare(raw: string): string {
-  const trimmed = raw.trim();
-  if (!trimmed) {
-    return '';
-  }
-  if (trimmed.startsWith('[')) {
-    const closeIdx = trimmed.indexOf(']');
-    if (closeIdx > 1 && trimmed[closeIdx + 1] === ':') {
-      const host = trimmed.slice(1, closeIdx).toLowerCase();
-      const port = trimmed.slice(closeIdx + 2);
-      return `[${host}]:${port}`;
-    }
-  }
-  const lastColon = trimmed.lastIndexOf(':');
-  if (lastColon > 0) {
-    return `${trimmed.slice(0, lastColon).toLowerCase()}:${trimmed.slice(lastColon + 1)}`;
-  }
-  return trimmed.toLowerCase();
-}
-
-function canonicalGrafanaUrlForCompare(raw: string): string {
-  const trimmed = raw.trim();
-  if (!trimmed) {
-    return '';
-  }
-  try {
-    const u = new URL(trimmed);
-    const scheme = u.protocol.toLowerCase();
-    const port = u.port || (scheme === 'https:' ? '443' : scheme === 'http:' ? '80' : '');
-    const path = u.pathname.replace(/\/+$/, '');
-    return `${scheme}//${u.hostname.toLowerCase()}:${port}${path}${u.search}${u.hash}`;
-  } catch {
-    return trimmed.replace(/\/+$/, '').toLowerCase();
-  }
-}
-
-export function encodeBoundRedisPassword(addr: string, tls: boolean, password: string): string {
-  return (
-    BOUND_REDIS_PASSWORD_PREFIX +
-    JSON.stringify({
-      addr: addr.trim(),
-      tls,
-      password,
-    })
-  );
-}
-
-export function encodeBoundPostgresPassword(
-  addr: string,
-  sslMode: PostgresSslMode,
-  password: string
-): string {
-  return (
-    BOUND_POSTGRES_PASSWORD_PREFIX +
-    JSON.stringify({
-      addr: addr.trim(),
-      sslMode,
-      password,
-    })
-  );
-}
-
-export function encodeBoundGrafanaToken(grafanaUrl: string, token: string): string {
-  return (
-    BOUND_GRAFANA_TOKEN_PREFIX +
-    JSON.stringify({
-      url: grafanaUrl.trim(),
-      token: token.trim(),
-    })
-  );
-}
-
-export function isValidRedisHostPort(raw: string): boolean {
-  const addr = raw.trim();
-  if (!addr || addr.includes('://') || addr.includes('@')) {
-    return false;
-  }
-  for (let i = 0; i < addr.length; i++) {
-    const code = addr.charCodeAt(i);
-    if (code <= 0x20 || code === 0x7f || addr[i] === '/' || addr[i] === '?' || addr[i] === '#') {
-      return false;
-    }
-  }
-
-  let host = '';
-  let portStr = '';
-  if (addr.startsWith('[')) {
-    const closeIdx = addr.indexOf(']');
-    if (closeIdx <= 1 || addr[closeIdx + 1] !== ':') {
-      return false;
-    }
-    host = addr.slice(1, closeIdx);
-    portStr = addr.slice(closeIdx + 2);
-    if (!isValidIpv6Literal(host)) {
-      return false;
-    }
-  } else {
-    if (addr.includes('[') || addr.includes(']')) {
-      return false;
-    }
-    const firstColon = addr.indexOf(':');
-    const lastColon = addr.lastIndexOf(':');
-    // Unbracketed multi-colon addresses (like ::1:6379) are rejected by Go net.SplitHostPort.
-    if (firstColon <= 0 || firstColon !== lastColon || lastColon === addr.length - 1) {
-      return false;
-    }
-    host = addr.slice(0, lastColon);
-    portStr = addr.slice(lastColon + 1);
-    if (!REDIS_HOSTNAME_RE.test(host) || host.includes('..')) {
-      return false;
-    }
-  }
-
-  if (!REDIS_PORT_RE.test(portStr)) {
-    return false;
-  }
-  const port = Number(portStr);
-  return Number.isInteger(port) && port >= 1 && port <= 65535;
-}
+export type { JobStoreBackend, PostgresSslMode, StudioJsonData } from './types';
+export {
+  BOUND_GRAFANA_TOKEN_PREFIX,
+  BOUND_POSTGRES_PASSWORD_PREFIX,
+  BOUND_REDIS_PASSWORD_PREFIX,
+  encodeBoundGrafanaToken,
+  encodeBoundPostgresPassword,
+  encodeBoundRedisPassword,
+} from './secretBinding';
+export { isValidRedisHostPort } from './validation';
 
 export const AppConfig: React.FC<PluginConfigPageProps<AppPluginMeta<StudioJsonData>>> = ({ plugin }) => {
   const { t } = useStudioTranslation();
-  const { enabled, pinned, jsonData, secureJsonFields } = plugin.meta;
-
-  // Track the latest saved jsonData snapshot locally so multiple saves without a page reload
-  // never revert or wipe previously saved fields for inactive job store backends.
-  const [savedJsonData, setSavedJsonData] = useState<StudioJsonData>(() => ({ ...(jsonData ?? {}) }));
-
-  const [allowedDsText, setAllowedDsText] = useState((jsonData?.allowedDatasourceUids ?? []).join(', '));
-  const [datasourceDialects, setDatasourceDialects] = useState<Record<string, QueryKind | ''>>(() => {
-    const init: Record<string, QueryKind | ''> = {};
-    if (jsonData?.datasourceDialects) {
-      for (const [uid, rawKind] of Object.entries(jsonData.datasourceDialects)) {
-        const normalizedKind = String(rawKind ?? '')
-          .trim()
-          .toLowerCase();
-        if (uid.trim() && (normalizedKind === 'promql' || normalizedKind === 'metricsql')) {
-          init[uid.trim()] = normalizedKind;
-        }
-      }
-    }
-    return init;
-  });
-  const [llmMode, setLlmMode] = useState<'grafana-llm-app' | 'mock'>(
-    jsonData?.llmMode === 'mock' ? 'mock' : 'grafana-llm-app'
-  );
-  const [allowMockInDev, setAllowMockInDev] = useState(Boolean(jsonData?.allowMockInDev));
-  // Default empty so the Go backend uses Grafana's trusted AppURL automatically without hardcoding localhost:3000.
-  const [grafanaUrl, setGrafanaUrl] = useState(jsonData?.grafanaUrl ?? '');
-  const [savedGrafanaUrl, setSavedGrafanaUrl] = useState((jsonData?.grafanaUrl ?? '').trim());
-  const [modelTier, setModelTier] = useState<'base' | 'large'>(
-    jsonData?.modelTier === 'large' ? 'large' : 'base'
-  );
-  const [structuredOutputMode, setStructuredOutputMode] = useState<'json_schema' | 'json_object'>(() => {
-    const normalized = String(jsonData?.structuredOutputMode ?? '')
-      .trim()
-      .toLowerCase();
-    return normalized === 'json_object' ? 'json_object' : 'json_schema';
-  });
-  const [tokenLimitField, setTokenLimitField] = useState<'max_completion_tokens' | 'max_tokens'>(() => {
-    const normalized = String(jsonData?.tokenLimitField ?? '')
-      .trim()
-      .toLowerCase();
-    return normalized === 'max_tokens' ? 'max_tokens' : 'max_completion_tokens';
-  });
-  const [reasoningEffort, setReasoningEffort] = useState(() =>
-    String(jsonData?.reasoningEffort ?? '')
-      .trim()
-      .toLowerCase()
-  );
-  const [maxPanels, setMaxPanels] = useState(jsonData?.maxPanels ?? 6);
-  const [maxRepairAttempts, setMaxRepairAttempts] = useState(jsonData?.maxRepairAttempts ?? 2);
-  const [maxOutputTokens, setMaxOutputTokens] = useState(jsonData?.maxOutputTokens ?? 2048);
-  const [llmTimeoutSeconds, setLlmTimeoutSeconds] = useState(jsonData?.llmTimeoutSeconds ?? 45);
-  const [jobDeadlineSeconds, setJobDeadlineSeconds] = useState(jsonData?.jobDeadlineSeconds ?? 90);
-  const [maxConcurrentJobs, setMaxConcurrentJobs] = useState(jsonData?.maxConcurrentJobs ?? 4);
-  const [validationTimeoutSeconds, setValidationTimeoutSeconds] = useState(
-    jsonData?.validationTimeoutSeconds ?? 10
-  );
-  const [maxConcurrentQueries, setMaxConcurrentQueries] = useState(
-    jsonData?.maxConcurrentQueries ?? 2
-  );
-  const [enableSseProgress, setEnableSseProgress] = useState(Boolean(jsonData?.enableSseProgress));
-
-  const [jobStoreBackend, setJobStoreBackend] = useState<JobStoreBackend>(() => {
-    const normalized = String(jsonData?.jobStoreBackend ?? '')
-      .trim()
-      .toLowerCase();
-    if (normalized === 'redis') {
-      return 'redis';
-    }
-    if (normalized === 'postgres') {
-      return 'postgres';
-    }
-    return 'memory';
-  });
-  const [jobTtlMinutes, setJobTtlMinutes] = useState(jsonData?.jobTtlMinutes ?? 30);
-  const [redisAddr, setRedisAddr] = useState(jsonData?.redisAddr ?? '');
-  const [savedRedisAddr, setSavedRedisAddr] = useState((jsonData?.redisAddr ?? '').trim());
-  const [redisDb, setRedisDb] = useState(jsonData?.redisDb ?? 0);
-  const [redisKeyPrefix, setRedisKeyPrefix] = useState(jsonData?.redisKeyPrefix ?? 'llmstudio:jobs');
-  const [redisTls, setRedisTls] = useState(Boolean(jsonData?.redisTls));
-  const [savedRedisTls, setSavedRedisTls] = useState(Boolean(jsonData?.redisTls));
-  const [redisUsername, setRedisUsername] = useState(jsonData?.redisUsername ?? '');
-
-  const initialPostgresSslMode = (() => {
-    const normalized = String(jsonData?.postgresSslMode ?? '')
-      .trim()
-      .toLowerCase();
-    return ALLOWED_POSTGRES_SSL_MODES.has(normalized) ? (normalized as PostgresSslMode) : 'prefer';
-  })();
-  const [postgresAddr, setPostgresAddr] = useState(jsonData?.postgresAddr ?? '');
-  const [savedPostgresAddr, setSavedPostgresAddr] = useState((jsonData?.postgresAddr ?? '').trim());
-  const [postgresDatabase, setPostgresDatabase] = useState(jsonData?.postgresDatabase ?? '');
-  const [postgresSchema, setPostgresSchema] = useState(jsonData?.postgresSchema ?? 'public');
-  const [postgresTablePrefix, setPostgresTablePrefix] = useState(
-    jsonData?.postgresTablePrefix ?? 'llm_studio_'
-  );
-  const [postgresUsername, setPostgresUsername] = useState(jsonData?.postgresUsername ?? '');
-  const [postgresSslMode, setPostgresSslMode] = useState<PostgresSslMode>(initialPostgresSslMode);
-  const [savedPostgresSslMode, setSavedPostgresSslMode] = useState<PostgresSslMode>(initialPostgresSslMode);
-
-  const [isTokenConfigured, setIsTokenConfigured] = useState(
-    Boolean(secureJsonFields?.llmServiceAccountToken)
-  );
-  const [wasTokenReset, setWasTokenReset] = useState(false);
-  const [llmServiceAccountToken, setLlmServiceAccountToken] = useState('');
-
-  const [savedRedisPasswordConfigured, setSavedRedisPasswordConfigured] = useState(
-    Boolean(secureJsonFields?.redisPassword)
-  );
-  const [isRedisPasswordConfigured, setIsRedisPasswordConfigured] = useState(
-    Boolean(secureJsonFields?.redisPassword)
-  );
-  const [wasRedisPasswordReset, setWasRedisPasswordReset] = useState(false);
-  const [redisPassword, setRedisPassword] = useState('');
-
-  const [savedPostgresPasswordConfigured, setSavedPostgresPasswordConfigured] = useState(
-    Boolean(secureJsonFields?.postgresPassword)
-  );
-  const [isPostgresPasswordConfigured, setIsPostgresPasswordConfigured] = useState(
-    Boolean(secureJsonFields?.postgresPassword)
-  );
-  const [wasPostgresPasswordReset, setWasPostgresPasswordReset] = useState(false);
-  const [postgresPassword, setPostgresPassword] = useState('');
-
-  const [saving, setSaving] = useState(false);
-  const [statusMessage, setStatusMessage] = useState<{ severity: 'success' | 'error'; text: string } | null>(
-    null
-  );
-
-  // Switching away from a backend discards unsaved secret edits/reset flags for the hidden backend
-  // so switching back later never silently clears a password still stored on the server.
-  const handleJobStoreBackendChange = (nextBackend: JobStoreBackend) => {
-    if (nextBackend !== 'redis') {
-      setRedisPassword('');
-      setWasRedisPasswordReset(false);
-      setIsRedisPasswordConfigured(savedRedisPasswordConfigured);
-    }
-    if (nextBackend !== 'postgres') {
-      setPostgresPassword('');
-      setWasPostgresPasswordReset(false);
-      setIsPostgresPasswordConfigured(savedPostgresPasswordConfigured);
-    }
-    setJobStoreBackend(nextBackend);
-  };
-
-  const parsedAllowedUids = Array.from(
-    new Set(
-      allowedDsText
-        .split(',')
-        .map((s) => s.trim())
-        .filter(Boolean)
-    )
-  );
-
-  const validateBeforeSave = (): string | null => {
-    if (llmMode === 'mock' && !allowMockInDev) {
-      return t('appConfig.validation.allowMockRequired');
-    }
-    if (
-      isTokenConfigured &&
-      canonicalGrafanaUrlForCompare(grafanaUrl) !== canonicalGrafanaUrlForCompare(savedGrafanaUrl)
-    ) {
-      return t('appConfig.validation.saTokenReentryRequired');
-    }
-    const checks: Array<[string, number, number, number]> = [
-      [t('appConfig.validation.fields.maxPanels'), maxPanels, 1, 6],
-      [t('appConfig.validation.fields.maxRepairAttempts'), maxRepairAttempts, 0, 2],
-      [t('appConfig.validation.fields.maxOutputTokens'), maxOutputTokens, 256, 8192],
-      [t('appConfig.validation.fields.llmTimeoutSeconds'), llmTimeoutSeconds, 5, 120],
-      [t('appConfig.validation.fields.jobDeadlineSeconds'), jobDeadlineSeconds, 10, 180],
-      [t('appConfig.validation.fields.maxConcurrentJobs'), maxConcurrentJobs, 1, 16],
-      [t('appConfig.validation.fields.validationTimeoutSeconds'), validationTimeoutSeconds, 2, 30],
-      [t('appConfig.validation.fields.maxConcurrentQueries'), maxConcurrentQueries, 1, 4],
-      [t('appConfig.validation.fields.jobTtlMinutes'), jobTtlMinutes, 1, 1440],
-    ];
-    if (jobStoreBackend === 'redis') {
-      checks.push([t('appConfig.validation.fields.redisDb'), redisDb, 0, 15]);
-    }
-    for (const [label, val, minVal, maxVal] of checks) {
-      if (!Number.isInteger(val) || val < minVal || val > maxVal) {
-        return t('appConfig.validation.numberRange', { label, min: minVal, max: maxVal });
-      }
-    }
-    const normalizedEffort = reasoningEffort.trim().toLowerCase();
-    if (!['', 'low', 'medium', 'high'].includes(normalizedEffort)) {
-      return t('appConfig.validation.reasoningEffort');
-    }
-    if (jobStoreBackend === 'redis') {
-      if (!isValidRedisHostPort(redisAddr)) {
-        return t('appConfig.validation.redisAddrRequired');
-      }
-      const trimmedPrefix = redisKeyPrefix.trim();
-      if (trimmedPrefix && !REDIS_KEY_PREFIX_RE.test(trimmedPrefix)) {
-        return t('appConfig.validation.redisKeyPrefixInvalid');
-      }
-      if (utf8ByteLength(redisUsername.trim()) > 128) {
-        return t('appConfig.validation.redisUsernameTooLong');
-      }
-      if (
-        isRedisPasswordConfigured &&
-        (canonicalRedisAddrForCompare(redisAddr) !== canonicalRedisAddrForCompare(savedRedisAddr) ||
-          redisTls !== savedRedisTls)
-      ) {
-        return t('appConfig.validation.redisPasswordReentryRequired');
-      }
-    }
-    if (jobStoreBackend === 'postgres') {
-      if (!isValidRedisHostPort(postgresAddr)) {
-        return t('appConfig.validation.postgresAddrRequired');
-      }
-      const trimmedDb = postgresDatabase.trim();
-      if (!trimmedDb || utf8ByteLength(trimmedDb) > 63 || hasForbiddenTextChar(trimmedDb, true)) {
-        return t('appConfig.validation.postgresDatabaseRequired');
-      }
-      const trimmedUser = postgresUsername.trim();
-      if (!trimmedUser || utf8ByteLength(trimmedUser) > 128 || hasForbiddenTextChar(trimmedUser, false)) {
-        return t('appConfig.validation.postgresUsernameRequired');
-      }
-      const trimmedSchema = postgresSchema.trim();
-      if (
-        trimmedSchema &&
-        (!POSTGRES_SCHEMA_RE.test(trimmedSchema) ||
-          trimmedSchema.startsWith('pg_') ||
-          trimmedSchema === 'information_schema')
-      ) {
-        return t('appConfig.validation.postgresSchemaInvalid');
-      }
-      const trimmedTablePrefix = postgresTablePrefix.trim();
-      if (trimmedTablePrefix && !POSTGRES_TABLE_PREFIX_RE.test(trimmedTablePrefix)) {
-        return t('appConfig.validation.postgresTablePrefixInvalid');
-      }
-      if (!ALLOWED_POSTGRES_SSL_MODES.has(postgresSslMode)) {
-        return t('appConfig.validation.postgresSslModeInvalid');
-      }
-      if (
-        isPostgresPasswordConfigured &&
-        (canonicalRedisAddrForCompare(postgresAddr) !== canonicalRedisAddrForCompare(savedPostgresAddr) ||
-          postgresSslMode !== savedPostgresSslMode)
-      ) {
-        return t('appConfig.validation.postgresPasswordReentryRequired');
-      }
-    }
-    return null;
-  };
-
-  const handleSave = async () => {
-    const validationErr = validateBeforeSave();
-    if (validationErr) {
-      setStatusMessage({ severity: 'error', text: validationErr });
-      return;
-    }
-
-    setSaving(true);
-    setStatusMessage(null);
-    try {
-      const allowedDatasourceUids = parsedAllowedUids;
-      // Always write an explicit object (even `{}`) so H-11 `...savedJsonData` spread
-      // never retains previously pinned dialects when all UIDs are reset back to Auto.
-      const cleanedDialects: Record<string, QueryKind> = {};
-      for (const uid of allowedDatasourceUids) {
-        const d = datasourceDialects[uid];
-        if (d === 'promql' || d === 'metricsql') {
-          cleanedDialects[uid] = d;
-        }
-      }
-
-      const effectiveRedisKeyPrefix = redisKeyPrefix.trim() || 'llmstudio:jobs';
-      const effectivePostgresSchema = postgresSchema.trim() || 'public';
-      const effectivePostgresTablePrefix = postgresTablePrefix.trim() || 'llm_studio_';
-
-      // Preserve any existing/previously saved jsonData fields (H-11), strip dev-only mockDelayMs (L-1),
-      // and normalize allowMockInDev=false outside mock mode (M-13).
-      // Only write backend-specific jsonData/secureJsonData fields for the active jobStoreBackend so switching
-      // backends never overwrites saved settings with unvalidated hidden fields or resets hidden passwords.
-      const { mockDelayMs: _stripMockDelayMs, ...preservedJsonData } = savedJsonData as StudioJsonData & {
-        mockDelayMs?: unknown;
-      };
-      const trimmedGrafanaUrl = grafanaUrl.trim();
-      const trimmedRedisAddr = redisAddr.trim();
-      const trimmedPostgresAddr = postgresAddr.trim();
-      const nextJsonData: StudioJsonData = {
-        ...preservedJsonData,
-        allowedDatasourceUids,
-        datasourceDialects: cleanedDialects,
-        llmMode,
-        allowMockInDev: llmMode === 'mock' ? allowMockInDev : false,
-        grafanaUrl: trimmedGrafanaUrl,
-        modelTier,
-        structuredOutputMode,
-        tokenLimitField,
-        reasoningEffort: reasoningEffort.trim().toLowerCase(),
-        maxPanels,
-        maxRepairAttempts,
-        maxOutputTokens,
-        llmTimeoutSeconds,
-        jobDeadlineSeconds,
-        maxConcurrentJobs,
-        validationTimeoutSeconds,
-        maxConcurrentQueries,
-        enableSseProgress,
-        jobStoreBackend,
-        jobTtlMinutes,
-        ...(jobStoreBackend === 'redis'
-          ? {
-              redisAddr: trimmedRedisAddr,
-              redisDb,
-              redisKeyPrefix: effectiveRedisKeyPrefix,
-              redisTls,
-              redisUsername: redisUsername.trim(),
-            }
-          : {}),
-        ...(jobStoreBackend === 'postgres'
-          ? {
-              postgresAddr: trimmedPostgresAddr,
-              postgresDatabase: postgresDatabase.trim(),
-              postgresSchema: effectivePostgresSchema,
-              postgresTablePrefix: effectivePostgresTablePrefix,
-              postgresUsername: postgresUsername.trim(),
-              postgresSslMode,
-            }
-          : {}),
-      };
-
-      // Explicitly send empty string on reset so Grafana clears the stored encrypted secret (H-11).
-      // Bind newly saved credentials to their destination inside the encrypted secret value so changing
-      // the target endpoint via UI or direct API cannot redirect an existing secret to another server.
-      const secureJsonData: Record<string, string> = {};
-      if (llmServiceAccountToken.trim().length > 0) {
-        secureJsonData.llmServiceAccountToken = encodeBoundGrafanaToken(
-          trimmedGrafanaUrl,
-          llmServiceAccountToken.trim()
-        );
-      } else if (wasTokenReset) {
-        secureJsonData.llmServiceAccountToken = '';
-      }
-      if (jobStoreBackend === 'redis') {
-        if (redisPassword.length > 0) {
-          secureJsonData.redisPassword = encodeBoundRedisPassword(
-            trimmedRedisAddr,
-            redisTls,
-            redisPassword
-          );
-        } else if (wasRedisPasswordReset) {
-          secureJsonData.redisPassword = '';
-        }
-      }
-      if (jobStoreBackend === 'postgres') {
-        if (postgresPassword.length > 0) {
-          secureJsonData.postgresPassword = encodeBoundPostgresPassword(
-            trimmedPostgresAddr,
-            postgresSslMode,
-            postgresPassword
-          );
-        } else if (wasPostgresPasswordReset) {
-          secureJsonData.postgresPassword = '';
-        }
-      }
-      const hasSecureJsonData = Object.keys(secureJsonData).length > 0;
-
-      await lastValueFrom(
-        getBackendSrv().fetch({
-          url: `/api/plugins/${plugin.meta.id}/settings`,
-          method: 'POST',
-          showErrorAlert: false,
-          data: {
-            enabled,
-            pinned,
-            jsonData: nextJsonData,
-            ...(hasSecureJsonData ? { secureJsonData } : {}),
-          },
-        })
-      );
-
-      setSavedJsonData(nextJsonData);
-      setSavedGrafanaUrl(trimmedGrafanaUrl);
-      if (llmServiceAccountToken.trim().length > 0) {
-        setIsTokenConfigured(true);
-        setWasTokenReset(false);
-        setLlmServiceAccountToken('');
-      } else if (wasTokenReset) {
-        setIsTokenConfigured(false);
-        setWasTokenReset(false);
-      }
-      if (jobStoreBackend === 'redis') {
-        setRedisKeyPrefix(effectiveRedisKeyPrefix);
-        setSavedRedisAddr(trimmedRedisAddr);
-        setSavedRedisTls(redisTls);
-        if (redisPassword.length > 0) {
-          setSavedRedisPasswordConfigured(true);
-          setIsRedisPasswordConfigured(true);
-          setWasRedisPasswordReset(false);
-          setRedisPassword('');
-        } else if (wasRedisPasswordReset) {
-          setSavedRedisPasswordConfigured(false);
-          setIsRedisPasswordConfigured(false);
-          setWasRedisPasswordReset(false);
-        }
-      }
-      if (jobStoreBackend === 'postgres') {
-        setPostgresSchema(effectivePostgresSchema);
-        setPostgresTablePrefix(effectivePostgresTablePrefix);
-        setSavedPostgresAddr(trimmedPostgresAddr);
-        setSavedPostgresSslMode(postgresSslMode);
-        if (postgresPassword.length > 0) {
-          setSavedPostgresPasswordConfigured(true);
-          setIsPostgresPasswordConfigured(true);
-          setWasPostgresPasswordReset(false);
-          setPostgresPassword('');
-        } else if (wasPostgresPasswordReset) {
-          setSavedPostgresPasswordConfigured(false);
-          setIsPostgresPasswordConfigured(false);
-          setWasPostgresPasswordReset(false);
-        }
-      }
-      setStatusMessage({
-        severity: 'success',
-        text: t('appConfig.status.savedMessage'),
-      });
-    } catch (err: unknown) {
-      setStatusMessage({
-        severity: 'error',
-        text: t('appConfig.status.saveFailed', { error: extractApiError(err) }),
-      });
-    } finally {
-      setSaving(false);
-    }
-  };
+  const state = useAppConfigState(plugin.meta, t);
 
   return (
     <div style={{ maxWidth: 760 }}>
@@ -743,438 +30,114 @@ export const AppConfig: React.FC<PluginConfigPageProps<AppPluginMeta<StudioJsonD
         {t('appConfig.securityAlert.body')}
       </Alert>
 
-      {statusMessage && (
+      {state.statusMessage && (
         <Alert
           title={
-            statusMessage.severity === 'success'
+            state.statusMessage.severity === 'success'
               ? t('appConfig.status.savedTitle')
               : t('appConfig.status.errorTitle')
           }
-          severity={statusMessage.severity}
+          severity={state.statusMessage.severity}
         >
-          {statusMessage.text}
+          {state.statusMessage.text}
         </Alert>
       )}
 
-      <FieldSet label={t('appConfig.datasource.fieldset')}>
-        <Field
-          label={t('appConfig.datasource.allowedUidsLabel')}
-          description={t('appConfig.datasource.allowedUidsDescription')}
-        >
-          <Input
-            value={allowedDsText}
-            onChange={(e) => setAllowedDsText(e.currentTarget.value)}
-            placeholder="prom-main"
-          />
-        </Field>
+      <DatasourceAllowlistSection
+        t={t}
+        allowedDsText={state.allowedDsText}
+        onAllowedDsTextChange={state.setAllowedDsText}
+        parsedAllowedUids={state.parsedAllowedUids}
+        datasourceDialects={state.datasourceDialects}
+        onDialectChange={(uid, dialect) =>
+          state.setDatasourceDialects((prev) => ({ ...prev, [uid]: dialect }))
+        }
+      />
 
-        {parsedAllowedUids.length > 0 && (
-          <Field
-            label={t('appConfig.datasource.dialectsLabel')}
-            description={t('appConfig.datasource.dialectsDescription')}
-          >
-            <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
-              {parsedAllowedUids.map((uid) => (
-                <div
-                  key={uid}
-                  style={{ display: 'grid', gridTemplateColumns: '180px 1fr', gap: 8, alignItems: 'center' }}
-                >
-                  <code style={{ fontSize: 12 }}>{uid}</code>
-                  <Select
-                    aria-label={`Query dialect for ${uid}`}
-                    options={[
-                      { label: t('appConfig.datasource.dialectAuto'), value: '' },
-                      { label: t('appConfig.datasource.dialectPromql'), value: 'promql' },
-                      { label: t('appConfig.datasource.dialectMetricsql'), value: 'metricsql' },
-                    ]}
-                    value={datasourceDialects[uid] ?? ''}
-                    onChange={(v) => {
-                      const nextVal = (v.value ?? '') as QueryKind | '';
-                      setDatasourceDialects((prev) => ({ ...prev, [uid]: nextVal }));
-                    }}
-                  />
-                </div>
-              ))}
-            </div>
-          </Field>
-        )}
-      </FieldSet>
+      <LlmConnectionSection
+        t={t}
+        llmMode={state.llmMode}
+        onLlmModeChange={state.setLlmMode}
+        allowMockInDev={state.allowMockInDev}
+        onAllowMockInDevChange={state.setAllowMockInDev}
+        grafanaUrl={state.grafanaUrl}
+        onGrafanaUrlChange={state.setGrafanaUrl}
+        modelTier={state.modelTier}
+        onModelTierChange={state.setModelTier}
+        structuredOutputMode={state.structuredOutputMode}
+        onStructuredOutputModeChange={state.setStructuredOutputMode}
+        tokenLimitField={state.tokenLimitField}
+        onTokenLimitFieldChange={state.setTokenLimitField}
+        reasoningEffort={state.reasoningEffort}
+        onReasoningEffortChange={state.setReasoningEffort}
+        isTokenConfigured={state.isTokenConfigured}
+        llmServiceAccountToken={state.llmServiceAccountToken}
+        onLlmServiceAccountTokenChange={state.setLlmServiceAccountToken}
+        onResetLlmToken={state.resetLlmToken}
+        enableSseProgress={state.enableSseProgress}
+        onEnableSseProgressChange={state.setEnableSseProgress}
+      />
 
-      <FieldSet label={t('appConfig.llm.fieldset')}>
-        <Field label={t('appConfig.llm.modeLabel')}>
-          <Select
-            options={[
-              { label: t('appConfig.llm.modeGrafanaLlmApp'), value: 'grafana-llm-app' },
-              { label: t('appConfig.llm.modeMock'), value: 'mock' },
-            ]}
-            value={llmMode}
-            onChange={(v) => setLlmMode((v.value as 'grafana-llm-app' | 'mock') ?? 'grafana-llm-app')}
-          />
-        </Field>
+      <BudgetsAndLimitsSection
+        t={t}
+        maxPanels={state.maxPanels}
+        onMaxPanelsChange={state.setMaxPanels}
+        maxRepairAttempts={state.maxRepairAttempts}
+        onMaxRepairAttemptsChange={state.setMaxRepairAttempts}
+        maxOutputTokens={state.maxOutputTokens}
+        onMaxOutputTokensChange={state.setMaxOutputTokens}
+        llmTimeoutSeconds={state.llmTimeoutSeconds}
+        onLlmTimeoutSecondsChange={state.setLlmTimeoutSeconds}
+        jobDeadlineSeconds={state.jobDeadlineSeconds}
+        onJobDeadlineSecondsChange={state.setJobDeadlineSeconds}
+        maxConcurrentJobs={state.maxConcurrentJobs}
+        onMaxConcurrentJobsChange={state.setMaxConcurrentJobs}
+        validationTimeoutSeconds={state.validationTimeoutSeconds}
+        onValidationTimeoutSecondsChange={state.setValidationTimeoutSeconds}
+        maxConcurrentQueries={state.maxConcurrentQueries}
+        onMaxConcurrentQueriesChange={state.setMaxConcurrentQueries}
+      />
 
-        {llmMode === 'mock' && (
-          <Field
-            label={t('appConfig.llm.allowMockLabel')}
-            description={t('appConfig.llm.allowMockDescription')}
-          >
-            <Checkbox
-              value={allowMockInDev}
-              onChange={(e) => setAllowMockInDev(e.currentTarget.checked)}
-              label={t('appConfig.llm.allowMockCheckbox')}
-            />
-          </Field>
-        )}
+      <JobStorageSection
+        t={t}
+        jobStoreBackend={state.jobStoreBackend}
+        onJobStoreBackendChange={state.handleJobStoreBackendChange}
+        jobTtlMinutes={state.jobTtlMinutes}
+        onJobTtlMinutesChange={state.setJobTtlMinutes}
+        redisAddr={state.redisAddr}
+        onRedisAddrChange={state.setRedisAddr}
+        redisDb={state.redisDb}
+        onRedisDbChange={state.setRedisDb}
+        redisKeyPrefix={state.redisKeyPrefix}
+        onRedisKeyPrefixChange={state.setRedisKeyPrefix}
+        redisUsername={state.redisUsername}
+        onRedisUsernameChange={state.setRedisUsername}
+        isRedisPasswordConfigured={state.isRedisPasswordConfigured}
+        redisPassword={state.redisPassword}
+        onRedisPasswordChange={state.setRedisPassword}
+        onResetRedisPassword={state.resetRedisPassword}
+        redisTls={state.redisTls}
+        onRedisTlsChange={state.setRedisTls}
+        postgresAddr={state.postgresAddr}
+        onPostgresAddrChange={state.setPostgresAddr}
+        postgresDatabase={state.postgresDatabase}
+        onPostgresDatabaseChange={state.setPostgresDatabase}
+        postgresSchema={state.postgresSchema}
+        onPostgresSchemaChange={state.setPostgresSchema}
+        postgresTablePrefix={state.postgresTablePrefix}
+        onPostgresTablePrefixChange={state.setPostgresTablePrefix}
+        postgresUsername={state.postgresUsername}
+        onPostgresUsernameChange={state.setPostgresUsername}
+        isPostgresPasswordConfigured={state.isPostgresPasswordConfigured}
+        postgresPassword={state.postgresPassword}
+        onPostgresPasswordChange={state.setPostgresPassword}
+        onResetPostgresPassword={state.resetPostgresPassword}
+        postgresSslMode={state.postgresSslMode}
+        onPostgresSslModeChange={state.setPostgresSslMode}
+      />
 
-        <Field
-          label={t('appConfig.llm.grafanaUrlLabel')}
-          description={t('appConfig.llm.grafanaUrlDescription')}
-        >
-          <Input
-            value={grafanaUrl}
-            onChange={(e) => setGrafanaUrl(e.currentTarget.value)}
-            placeholder="http://localhost:3000"
-          />
-        </Field>
-
-        <Field label={t('appConfig.llm.modelTierLabel')}>
-          <Select
-            options={[
-              { label: t('appConfig.llm.modelTierBase'), value: 'base' },
-              { label: t('appConfig.llm.modelTierLarge'), value: 'large' },
-            ]}
-            value={modelTier}
-            onChange={(v) => setModelTier((v.value as 'base' | 'large') ?? 'base')}
-          />
-        </Field>
-
-        <Field
-          label={t('appConfig.llm.structuredOutputLabel')}
-          description={t('appConfig.llm.structuredOutputDescription')}
-        >
-          <Select
-            options={[
-              { label: t('appConfig.llm.structuredOutputSchema'), value: 'json_schema' },
-              { label: t('appConfig.llm.structuredOutputObject'), value: 'json_object' },
-            ]}
-            value={structuredOutputMode}
-            onChange={(v) => setStructuredOutputMode((v.value as 'json_schema' | 'json_object') ?? 'json_schema')}
-          />
-        </Field>
-
-        <Field
-          label={t('appConfig.llm.tokenLimitLabel')}
-          description={t('appConfig.llm.tokenLimitDescription')}
-        >
-          <Select
-            options={[
-              { label: t('appConfig.llm.tokenLimitCompletion'), value: 'max_completion_tokens' },
-              { label: t('appConfig.llm.tokenLimitLegacy'), value: 'max_tokens' },
-            ]}
-            value={tokenLimitField}
-            onChange={(v) =>
-              setTokenLimitField((v.value as 'max_completion_tokens' | 'max_tokens') ?? 'max_completion_tokens')
-            }
-          />
-        </Field>
-
-        <Field
-          label={t('appConfig.llm.reasoningEffortLabel')}
-          description={t('appConfig.llm.reasoningEffortDescription')}
-        >
-          <Select
-            options={[
-              { label: t('appConfig.llm.reasoningEffortAuto'), value: '' },
-              { label: t('appConfig.llm.reasoningEffortLow'), value: 'low' },
-              { label: t('appConfig.llm.reasoningEffortMedium'), value: 'medium' },
-              { label: t('appConfig.llm.reasoningEffortHigh'), value: 'high' },
-            ]}
-            value={reasoningEffort}
-            onChange={(v) => setReasoningEffort(v.value ?? '')}
-          />
-        </Field>
-
-        <Field
-          label={t('appConfig.llm.saTokenLabel')}
-          description={t('appConfig.llm.saTokenDescription')}
-        >
-          <SecretInput
-            isConfigured={isTokenConfigured}
-            value={llmServiceAccountToken}
-            onChange={(e) => setLlmServiceAccountToken(e.currentTarget.value)}
-            onReset={() => {
-              setIsTokenConfigured(false);
-              setWasTokenReset(true);
-              setLlmServiceAccountToken('');
-            }}
-            placeholder="glsa_..."
-          />
-        </Field>
-
-        <Field
-          label={t('appConfig.llm.sseProgressLabel')}
-          description={t('appConfig.llm.sseProgressDescription')}
-        >
-          <Checkbox
-            value={enableSseProgress}
-            onChange={(e) => setEnableSseProgress(e.currentTarget.checked)}
-            label={t('appConfig.llm.sseProgressCheckbox')}
-          />
-        </Field>
-      </FieldSet>
-
-      <FieldSet label={t('appConfig.limits.fieldset')}>
-        <Field label={t('appConfig.limits.maxPanels')}>
-          <Input
-            type="number"
-            min={1}
-            max={6}
-            value={formatNumberValue(maxPanels)}
-            onChange={(e) => setMaxPanels(parseNumberInput(e.currentTarget.value))}
-          />
-        </Field>
-        <Field label={t('appConfig.limits.maxRepairAttempts')}>
-          <Input
-            type="number"
-            min={0}
-            max={2}
-            value={formatNumberValue(maxRepairAttempts)}
-            onChange={(e) => setMaxRepairAttempts(parseNumberInput(e.currentTarget.value))}
-          />
-        </Field>
-        <Field label={t('appConfig.limits.maxOutputTokens')}>
-          <Input
-            type="number"
-            min={256}
-            max={8192}
-            value={formatNumberValue(maxOutputTokens)}
-            onChange={(e) => setMaxOutputTokens(parseNumberInput(e.currentTarget.value))}
-          />
-        </Field>
-        <Field label={t('appConfig.limits.llmTimeoutSeconds')}>
-          <Input
-            type="number"
-            min={5}
-            max={120}
-            value={formatNumberValue(llmTimeoutSeconds)}
-            onChange={(e) => setLlmTimeoutSeconds(parseNumberInput(e.currentTarget.value))}
-          />
-        </Field>
-        <Field label={t('appConfig.limits.jobDeadlineSeconds')}>
-          <Input
-            type="number"
-            min={10}
-            max={180}
-            value={formatNumberValue(jobDeadlineSeconds)}
-            onChange={(e) => setJobDeadlineSeconds(parseNumberInput(e.currentTarget.value))}
-          />
-        </Field>
-        <Field label={t('appConfig.limits.maxConcurrentJobs')}>
-          <Input
-            type="number"
-            min={1}
-            max={16}
-            value={formatNumberValue(maxConcurrentJobs)}
-            onChange={(e) => setMaxConcurrentJobs(parseNumberInput(e.currentTarget.value))}
-          />
-        </Field>
-        <Field label={t('appConfig.limits.validationTimeoutSeconds')}>
-          <Input
-            type="number"
-            min={2}
-            max={30}
-            value={formatNumberValue(validationTimeoutSeconds)}
-            onChange={(e) => setValidationTimeoutSeconds(parseNumberInput(e.currentTarget.value))}
-          />
-        </Field>
-        <Field label={t('appConfig.limits.maxConcurrentQueries')}>
-          <Input
-            type="number"
-            min={1}
-            max={4}
-            value={formatNumberValue(maxConcurrentQueries)}
-            onChange={(e) => setMaxConcurrentQueries(parseNumberInput(e.currentTarget.value))}
-          />
-        </Field>
-      </FieldSet>
-
-      <FieldSet label={t('appConfig.jobStorage.fieldset')}>
-        <Field
-          label={t('appConfig.jobStorage.backendLabel')}
-          description={t('appConfig.jobStorage.backendDescription')}
-        >
-          <Select
-            aria-label={t('appConfig.jobStorage.backendLabel')}
-            options={[
-              { label: t('appConfig.jobStorage.backendMemory'), value: 'memory' },
-              { label: t('appConfig.jobStorage.backendRedis'), value: 'redis' },
-              { label: t('appConfig.jobStorage.backendPostgres'), value: 'postgres' },
-            ]}
-            value={jobStoreBackend}
-            onChange={(v) => handleJobStoreBackendChange((v.value as JobStoreBackend) ?? 'memory')}
-          />
-        </Field>
-        <Field label={t('appConfig.jobStorage.jobTtlMinutesLabel')}>
-          <Input
-            type="number"
-            min={1}
-            max={1440}
-            value={formatNumberValue(jobTtlMinutes)}
-            onChange={(e) => setJobTtlMinutes(parseNumberInput(e.currentTarget.value))}
-          />
-        </Field>
-
-        {jobStoreBackend === 'redis' && (
-          <>
-            <Field
-              label={t('appConfig.jobStorage.redisAddrLabel')}
-              description={t('appConfig.jobStorage.redisAddrDescription')}
-            >
-              <Input
-                value={redisAddr}
-                onChange={(e) => setRedisAddr(e.currentTarget.value)}
-                placeholder="redis:6379"
-              />
-            </Field>
-            <Field label={t('appConfig.jobStorage.redisDbLabel')}>
-              <Input
-                type="number"
-                min={0}
-                max={15}
-                value={formatNumberValue(redisDb)}
-                onChange={(e) => setRedisDb(parseNumberInput(e.currentTarget.value))}
-              />
-            </Field>
-            <Field
-              label={t('appConfig.jobStorage.redisKeyPrefixLabel')}
-              description={t('appConfig.jobStorage.redisKeyPrefixDescription')}
-            >
-              <Input
-                value={redisKeyPrefix}
-                onChange={(e) => setRedisKeyPrefix(e.currentTarget.value)}
-                placeholder="llmstudio:jobs"
-              />
-            </Field>
-            <Field label={t('appConfig.jobStorage.redisUsernameLabel')}>
-              <Input
-                value={redisUsername}
-                onChange={(e) => setRedisUsername(e.currentTarget.value)}
-                placeholder="default"
-              />
-            </Field>
-            <Field
-              label={t('appConfig.jobStorage.redisPasswordLabel')}
-              description={t('appConfig.jobStorage.redisPasswordDescription')}
-            >
-              <SecretInput
-                isConfigured={isRedisPasswordConfigured}
-                value={redisPassword}
-                onChange={(e) => setRedisPassword(e.currentTarget.value)}
-                onReset={() => {
-                  setIsRedisPasswordConfigured(false);
-                  setWasRedisPasswordReset(true);
-                  setRedisPassword('');
-                }}
-                placeholder="redis-password"
-              />
-            </Field>
-            <Field label={t('appConfig.jobStorage.redisTlsLabel')}>
-              <Checkbox
-                value={redisTls}
-                onChange={(e) => setRedisTls(e.currentTarget.checked)}
-                label={t('appConfig.jobStorage.redisTlsCheckbox')}
-              />
-            </Field>
-          </>
-        )}
-
-        {jobStoreBackend === 'postgres' && (
-          <>
-            <Field
-              label={t('appConfig.jobStorage.postgresAddrLabel')}
-              description={t('appConfig.jobStorage.postgresAddrDescription')}
-            >
-              <Input
-                value={postgresAddr}
-                onChange={(e) => setPostgresAddr(e.currentTarget.value)}
-                placeholder="postgres:5432"
-              />
-            </Field>
-            <Field
-              label={t('appConfig.jobStorage.postgresDatabaseLabel')}
-              description={t('appConfig.jobStorage.postgresDatabaseDescription')}
-            >
-              <Input
-                value={postgresDatabase}
-                onChange={(e) => setPostgresDatabase(e.currentTarget.value)}
-                placeholder="grafana"
-              />
-            </Field>
-            <Field
-              label={t('appConfig.jobStorage.postgresSchemaLabel')}
-              description={t('appConfig.jobStorage.postgresSchemaDescription')}
-            >
-              <Input
-                value={postgresSchema}
-                onChange={(e) => setPostgresSchema(e.currentTarget.value)}
-                placeholder="public"
-              />
-            </Field>
-            <Field
-              label={t('appConfig.jobStorage.postgresTablePrefixLabel')}
-              description={t('appConfig.jobStorage.postgresTablePrefixDescription')}
-            >
-              <Input
-                value={postgresTablePrefix}
-                onChange={(e) => setPostgresTablePrefix(e.currentTarget.value)}
-                placeholder="llm_studio_"
-              />
-            </Field>
-            <Field label={t('appConfig.jobStorage.postgresUsernameLabel')}>
-              <Input
-                value={postgresUsername}
-                onChange={(e) => setPostgresUsername(e.currentTarget.value)}
-                placeholder="grafana"
-              />
-            </Field>
-            <Field
-              label={t('appConfig.jobStorage.postgresPasswordLabel')}
-              description={t('appConfig.jobStorage.postgresPasswordDescription')}
-            >
-              <SecretInput
-                isConfigured={isPostgresPasswordConfigured}
-                value={postgresPassword}
-                onChange={(e) => setPostgresPassword(e.currentTarget.value)}
-                onReset={() => {
-                  setIsPostgresPasswordConfigured(false);
-                  setWasPostgresPasswordReset(true);
-                  setPostgresPassword('');
-                }}
-                placeholder="postgres-password"
-              />
-            </Field>
-            <Field
-              label={t('appConfig.jobStorage.postgresSslModeLabel')}
-              description={t('appConfig.jobStorage.postgresSslModeDescription')}
-            >
-              <Select
-                aria-label={t('appConfig.jobStorage.postgresSslModeLabel')}
-                options={[
-                  { label: t('appConfig.jobStorage.postgresSslModeDisable'), value: 'disable' },
-                  { label: t('appConfig.jobStorage.postgresSslModePrefer'), value: 'prefer' },
-                  { label: t('appConfig.jobStorage.postgresSslModeRequire'), value: 'require' },
-                  { label: t('appConfig.jobStorage.postgresSslModeVerifyCa'), value: 'verify-ca' },
-                  { label: t('appConfig.jobStorage.postgresSslModeVerifyFull'), value: 'verify-full' },
-                ]}
-                value={postgresSslMode}
-                onChange={(v) => setPostgresSslMode((v.value as PostgresSslMode) ?? 'prefer')}
-              />
-            </Field>
-          </>
-        )}
-      </FieldSet>
-
-      <Button onClick={handleSave} disabled={saving}>
-        {saving ? t('appConfig.actions.saving') : t('appConfig.actions.save')}
+      <Button onClick={state.handleSave} disabled={state.saving}>
+        {state.saving ? t('appConfig.actions.saving') : t('appConfig.actions.save')}
       </Button>
     </div>
   );

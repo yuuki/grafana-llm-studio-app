@@ -241,16 +241,63 @@ func (s *MemoryStore) GetRepairCandidate(_ context.Context, owner Owner, jobID s
 	}, nil
 }
 
+type beginEditSpec struct {
+	owner         Owner
+	jobID         string
+	baseRevision  int
+	revPrefix     string
+	noDraftMsg    string
+	targetPanelID string
+	consumeRepair bool
+	nextStatus    JobStatus
+	catalogGauges []string
+	slotID        string
+	now           time.Time
+	limits        StoreLimits
+}
+
 func (s *MemoryStore) BeginPatch(_ context.Context, params BeginPatchParams) (BeginOpResult, error) {
-	if err := validateOwner(params.Owner); err != nil {
+	return s.beginEditOp(beginEditSpec{
+		owner:         params.Owner,
+		jobID:         params.JobID,
+		baseRevision:  params.BaseRevision,
+		revPrefix:     "",
+		noDraftMsg:    "job has no active IR draft to patch",
+		targetPanelID: params.TargetPanelID,
+		nextStatus:    StatusGenerating,
+		catalogGauges: params.CatalogGauges,
+		slotID:        params.SlotID,
+		now:           params.Now,
+		limits:        params.Limits,
+	})
+}
+
+func (s *MemoryStore) BeginRepair(_ context.Context, params BeginRepairParams) (BeginOpResult, error) {
+	return s.beginEditOp(beginEditSpec{
+		owner:         params.Owner,
+		jobID:         params.JobID,
+		baseRevision:  params.BaseRevision,
+		revPrefix:     "repair",
+		noDraftMsg:    "job has no active IR draft to repair",
+		consumeRepair: true,
+		nextStatus:    StatusRepairing,
+		catalogGauges: params.CatalogGauges,
+		slotID:        params.SlotID,
+		now:           params.Now,
+		limits:        params.Limits,
+	})
+}
+
+func (s *MemoryStore) beginEditOp(spec beginEditSpec) (BeginOpResult, error) {
+	if err := validateOwner(spec.owner); err != nil {
 		return BeginOpResult{}, err
 	}
-	if err := ValidateJobID(params.JobID); err != nil {
+	if err := ValidateJobID(spec.jobID); err != nil {
 		return BeginOpResult{}, err
 	}
-	limits := params.Limits.normalized()
-	now := normalizeTimestamp(params.Now)
-	slotID := params.SlotID
+	limits := spec.limits.normalized()
+	now := normalizeTimestamp(spec.now)
+	slotID := spec.slotID
 	if slotID == "" {
 		slotID = newSlotID()
 	}
@@ -258,7 +305,7 @@ func (s *MemoryStore) BeginPatch(_ context.Context, params BeginPatchParams) (Be
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	rec, err := s.getOwnedLocked(params.Owner, params.JobID, now)
+	rec, err := s.getOwnedLocked(spec.owner, spec.jobID, now)
 	if err != nil {
 		return BeginOpResult{}, err
 	}
@@ -266,108 +313,44 @@ func (s *MemoryStore) BeginPatch(_ context.Context, params BeginPatchParams) (Be
 		return BeginOpResult{}, ErrWrongJobKind
 	}
 	if rec.currentIR == nil {
-		return BeginOpResult{}, errors.New("job has no active IR draft to patch")
+		return BeginOpResult{}, errors.New(spec.noDraftMsg)
 	}
-	if params.BaseRevision != rec.currentIR.Revision {
-		return BeginOpResult{}, formatRevisionConflict("", params.BaseRevision, rec.currentIR.Revision)
+	if spec.baseRevision != rec.currentIR.Revision {
+		return BeginOpResult{}, formatRevisionConflict(spec.revPrefix, spec.baseRevision, rec.currentIR.Revision)
 	}
-	if params.TargetPanelID != "" {
-		if strings.ContainsAny(params.TargetPanelID, "\r\n") || !panelExists(rec.currentIR.Panels, params.TargetPanelID) {
-			return BeginOpResult{}, fmt.Errorf("%w: %q", ir.ErrPanelNotFound, params.TargetPanelID)
+	if spec.targetPanelID != "" {
+		if strings.ContainsAny(spec.targetPanelID, "\r\n") || !panelExists(rec.currentIR.Panels, spec.targetPanelID) {
+			return BeginOpResult{}, fmt.Errorf("%w: %q", ir.ErrPanelNotFound, spec.targetPanelID)
 		}
 	}
 	if rec.isActive(now) {
 		return BeginOpResult{}, ErrOperationInProgress
 	}
-
-	s.reapExpiredSlotsLocked(now)
-	if !s.canAcquireSlotLocked(params.Owner, limits) {
-		return BeginOpResult{}, ErrConcurrencyLimited
-	}
-
-	if rec.knownGauges == nil {
-		rec.knownGauges = make(map[string]bool)
-	}
-	mergeGaugeMapBounded(rec.knownGauges, params.CatalogGauges)
-
-	leaseUntil := now.Add(limits.OpLeaseTTL).Truncate(time.Millisecond)
-	rec.activeOpToken++
-	rec.activeOpUntil = leaseUntil
-	rec.status = StatusGenerating
-	rec.updatedAt = now
-	rec.expiresAt = now.Add(limits.JobTTL).Truncate(time.Millisecond)
-	s.acquireSlotLocked(params.Owner, slotID, leaseUntil)
-
-	qKind := rec.queryKind
-	if qKind == "" {
-		qKind = query.KindPromQL
-	}
-	return BeginOpResult{
-		OpToken:     rec.activeOpToken,
-		SlotID:      slotID,
-		CurrentIR:   rec.currentIR.Clone(),
-		Scope:       cloneScope(rec.scope),
-		QueryKind:   qKind,
-		KnownGauges: cloneStringBoolMap(rec.knownGauges),
-	}, nil
-}
-
-func (s *MemoryStore) BeginRepair(_ context.Context, params BeginRepairParams) (BeginOpResult, error) {
-	if err := validateOwner(params.Owner); err != nil {
-		return BeginOpResult{}, err
-	}
-	if err := ValidateJobID(params.JobID); err != nil {
-		return BeginOpResult{}, err
-	}
-	limits := params.Limits.normalized()
-	now := normalizeTimestamp(params.Now)
-	slotID := params.SlotID
-	if slotID == "" {
-		slotID = newSlotID()
-	}
-
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	rec, err := s.getOwnedLocked(params.Owner, params.JobID, now)
-	if err != nil {
-		return BeginOpResult{}, err
-	}
-	if rec.jobKind == JobKindReport {
-		return BeginOpResult{}, ErrWrongJobKind
-	}
-	if rec.currentIR == nil {
-		return BeginOpResult{}, errors.New("job has no active IR draft to repair")
-	}
-	if params.BaseRevision != rec.currentIR.Revision {
-		return BeginOpResult{}, formatRevisionConflict("repair", params.BaseRevision, rec.currentIR.Revision)
-	}
-	if rec.isActive(now) {
-		return BeginOpResult{}, ErrOperationInProgress
-	}
-	if rec.repairAttemptsUsed >= rec.maxRepairAttempts {
+	if spec.consumeRepair && rec.repairAttemptsUsed >= rec.maxRepairAttempts {
 		return BeginOpResult{}, fmt.Errorf("%w: used %d of %d repair attempts", ErrBudgetExhausted, rec.repairAttemptsUsed, rec.maxRepairAttempts)
 	}
 
 	s.reapExpiredSlotsLocked(now)
-	if !s.canAcquireSlotLocked(params.Owner, limits) {
+	if !s.canAcquireSlotLocked(spec.owner, limits) {
 		return BeginOpResult{}, ErrConcurrencyLimited
 	}
 
 	if rec.knownGauges == nil {
 		rec.knownGauges = make(map[string]bool)
 	}
-	mergeGaugeMapBounded(rec.knownGauges, params.CatalogGauges)
+	mergeGaugeMapBounded(rec.knownGauges, spec.catalogGauges)
 
 	// Atomically consume repair budget BEFORE calling LLM so concurrent requests across replicas cannot bypass budget.
 	leaseUntil := now.Add(limits.OpLeaseTTL).Truncate(time.Millisecond)
-	rec.repairAttemptsUsed++
+	if spec.consumeRepair {
+		rec.repairAttemptsUsed++
+	}
 	rec.activeOpToken++
 	rec.activeOpUntil = leaseUntil
-	rec.status = StatusRepairing
+	rec.status = spec.nextStatus
 	rec.updatedAt = now
 	rec.expiresAt = now.Add(limits.JobTTL).Truncate(time.Millisecond)
-	s.acquireSlotLocked(params.Owner, slotID, leaseUntil)
+	s.acquireSlotLocked(spec.owner, slotID, leaseUntil)
 
 	qKind := rec.queryKind
 	if qKind == "" {
@@ -794,6 +777,18 @@ func (s *MemoryStore) acquireSlotLocked(owner Owner, slotID string, leaseUntil t
 // evicting active jobs, NEVER touching another organization's jobs, and NEVER deleting any job
 // if the final capacity constraint cannot be satisfied.
 func (s *MemoryStore) ensureCapacityLocked(caller Owner, now time.Time, limits StoreLimits) error {
+	return s.ensureOrgCapacityLocked(caller, now, limits, true)
+}
+
+// ensureImportCapacityLocked transactionally enforces per-user and per-org caps for Import jobs.
+// Unlike Generate, Import does not consume an LLM concurrency slot, so it MUST NEVER evict
+// another user's non-expired job (preventing cross-user job-eviction DoS) and MUST NEVER
+// delete any job if capacity cannot be satisfied.
+func (s *MemoryStore) ensureImportCapacityLocked(caller Owner, now time.Time, limits StoreLimits) error {
+	return s.ensureOrgCapacityLocked(caller, now, limits, false)
+}
+
+func (s *MemoryStore) ensureOrgCapacityLocked(caller Owner, now time.Time, limits StoreLimits, allowOtherOrgEviction bool) error {
 	var callerInactive []*memJobRecord
 	var otherOrgInactive []*memJobRecord
 	userCount := 0
@@ -809,93 +804,31 @@ func (s *MemoryStore) ensureCapacityLocked(caller Owner, now time.Time, limits S
 			if !rec.isActive(now) {
 				callerInactive = append(callerInactive, rec)
 			}
-		} else if !rec.isActive(now) {
+		} else if allowOtherOrgEviction && !rec.isActive(now) {
 			otherOrgInactive = append(otherOrgInactive, rec)
 		}
 	}
 
 	sortByOldestUpdated(callerInactive)
-	sortByOldestUpdated(otherOrgInactive)
-
-	needUserEvict := 0
-	if userCount >= limits.MaxJobsPerUser {
-		needUserEvict = userCount - limits.MaxJobsPerUser + 1
+	callerIDs := make([]string, len(callerInactive))
+	for i, rec := range callerInactive {
+		callerIDs[i] = rec.id
 	}
-	if needUserEvict > len(callerInactive) {
-		return ErrConcurrencyLimited
-	}
-
-	var victims []string
-	for i := 0; i < needUserEvict; i++ {
-		victims = append(victims, callerInactive[i].id)
-	}
-	remainingCaller := callerInactive[needUserEvict:]
-	remainingOrgCount := orgCount - needUserEvict
-
-	needOrgEvict := 0
-	if remainingOrgCount >= limits.MaxJobs {
-		needOrgEvict = remainingOrgCount - limits.MaxJobs + 1
-	}
-	if needOrgEvict > len(remainingCaller)+len(otherOrgInactive) {
-		return ErrConcurrencyLimited
+	var otherIDs []string
+	if allowOtherOrgEviction {
+		sortByOldestUpdated(otherOrgInactive)
+		otherIDs = make([]string, len(otherOrgInactive))
+		for i, rec := range otherOrgInactive {
+			otherIDs[i] = rec.id
+		}
 	}
 
-	// Evict caller's own inactive jobs first, then oldest inactive jobs within the same OrgID.
-	for i := 0; i < len(remainingCaller) && needOrgEvict > 0; i++ {
-		victims = append(victims, remainingCaller[i].id)
-		needOrgEvict--
+	victims, err := selectEvictionVictims(orgCount, userCount, callerIDs, otherIDs, limits, allowOtherOrgEviction)
+	if err != nil {
+		return err
 	}
-	for i := 0; i < len(otherOrgInactive) && needOrgEvict > 0; i++ {
-		victims = append(victims, otherOrgInactive[i].id)
-		needOrgEvict--
-	}
-
 	for _, id := range victims {
 		delete(s.jobs, id)
-	}
-	return nil
-}
-
-// ensureImportCapacityLocked transactionally enforces per-user and per-org caps for Import jobs.
-// Unlike Generate, Import does not consume an LLM concurrency slot, so it MUST NEVER evict
-// another user's non-expired job (preventing cross-user job-eviction DoS) and MUST NEVER
-// delete any job if capacity cannot be satisfied.
-func (s *MemoryStore) ensureImportCapacityLocked(caller Owner, now time.Time, limits StoreLimits) error {
-	var callerInactive []*memJobRecord
-	userCount := 0
-	orgCount := 0
-
-	for _, rec := range s.jobs {
-		if rec.owner.OrgID != caller.OrgID {
-			continue
-		}
-		orgCount++
-		if rec.owner == caller {
-			userCount++
-			if !rec.isActive(now) {
-				callerInactive = append(callerInactive, rec)
-			}
-		}
-	}
-	sortByOldestUpdated(callerInactive)
-
-	needUserEvict := 0
-	if userCount >= limits.MaxJobsPerUser {
-		needUserEvict = userCount - limits.MaxJobsPerUser + 1
-	}
-	needOrgEvict := 0
-	if orgCount >= limits.MaxJobs {
-		needOrgEvict = orgCount - limits.MaxJobs + 1
-	}
-	needTotal := needUserEvict
-	if needOrgEvict > needTotal {
-		needTotal = needOrgEvict
-	}
-	if needTotal > len(callerInactive) {
-		return ErrConcurrencyLimited
-	}
-	for i := 0; i < needTotal; i++ {
-		delete(s.jobs, callerInactive[i].id)
 	}
 	return nil
 }
