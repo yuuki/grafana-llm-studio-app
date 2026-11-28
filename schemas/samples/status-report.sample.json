@@ -1,0 +1,50 @@
+{
+  "schemaVersion": "1.0",
+  "overallStatus": "degraded",
+  "confidence": "medium",
+  "executiveSummary": "checkout-api shows elevated HTTP 5xx error rates (+420% vs baseline) with HighErrorRate firing since 13:05 UTC.",
+  "timeline": [
+    {
+      "timestamp": "2026-11-27T13:05:00Z",
+      "event": "HighErrorRate alert fired for checkout-api.",
+      "evidenceIds": ["ev-alert-1"]
+    },
+    {
+      "timestamp": "2026-11-27T13:06:30Z",
+      "event": "p95 latency peaked at 890ms compared to 180ms baseline.",
+      "evidenceIds": ["ev-metric-1"]
+    }
+  ],
+  "findings": [
+    {
+      "id": "f-1",
+      "category": "incident",
+      "severity": "critical",
+      "title": "checkout-api HTTP 5xx error rate spike",
+      "detail": "Error rate reached 4.8% (baseline 0.9%, > 4x increase) while HighErrorRate remains active.",
+      "evidenceIds": ["ev-alert-1", "ev-metric-1"]
+    }
+  ],
+  "hypotheses": [
+    {
+      "title": "Downstream dependency latency causing checkout-api 5xx responses",
+      "likelihood": "medium",
+      "rationale": "Latency and 5xx errors rose together during the same window.",
+      "evidenceIds": ["ev-alert-1", "ev-metric-1"],
+      "verificationSteps": [
+        "Inspect recent deployments and downstream database connection saturation for checkout-api."
+      ]
+    }
+  ],
+  "recommendedActions": [
+    {
+      "priority": "immediate",
+      "action": "Verify recent checkout-api rollout status and downstream dependency health.",
+      "relatedFindingIds": ["f-1"]
+    }
+  ],
+  "dataGaps": [
+    "Logs and distributed traces are not included in this report."
+  ],
+  "suggestedInvestigationIntent": "Show HTTP 5xx error rate by status code, p95 latency, and saturation metrics for checkout-api"
+}

@@ -135,6 +135,13 @@ func (g *gatedLLMClient) RepairPanels(ctx context.Context, req llm.RepairRequest
 	return g.delegate.RepairPanels(ctx, req)
 }
 
+func (g *gatedLLMClient) AnalyzeStatus(ctx context.Context, req llm.AnalyzeStatusRequest) ([]byte, llm.CompletionMeta, error) {
+	if g.failErr != nil {
+		return nil, llm.CompletionMeta{ProviderMode: "mock"}, g.failErr
+	}
+	return g.delegate.AnalyzeStatus(ctx, req)
+}
+
 func testAuthCtx() backend.PluginContext {
 	return backend.PluginContext{
 		OrgID: 1,

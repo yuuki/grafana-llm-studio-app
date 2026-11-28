@@ -582,3 +582,155 @@ func TestPostgresStore_LeastPrivilegeDMLOnlyRoleAndExternalPoolOwnership(t *test
 		t.Fatalf("external pool was closed by PostgresStore.Close(): %v", err)
 	}
 }
+
+func TestPostgresStore_StatusReport_LifecycleAndDMLOnlyMultiReplica(t *testing.T) {
+	cfg, ok := testPostgresConfigFromEnv(t)
+	if !ok {
+		t.Skip("set LLM_STUDIO_TEST_POSTGRES_ADDR to run live PostgreSQL integration tests")
+	}
+	defer dropTestPostgresSchema(cfg)
+	ctx := context.Background()
+
+	// Step 1: Pre-create legacy jobs table WITHOUT job_kind / report_json columns and a DML-only role.
+	adminPool, err := pgxpool.New(ctx, buildTestPostgresDSN(cfg))
+	if err != nil {
+		t.Fatalf("admin pgxpool.New: %v", err)
+	}
+	var rnd [4]byte
+	_, _ = rand.Read(rnd[:])
+	roleName := "llmstudio_repdml_" + hex.EncodeToString(rnd[:])
+	rolePass := "rep-dml-pass-123"
+	roleIdent := pgx.Identifier{roleName}.Sanitize()
+	schemaIdent := pgx.Identifier{cfg.Schema}.Sanitize()
+	jobsTable := pgx.Identifier{cfg.Schema, cfg.TablePrefix + "jobs"}.Sanitize()
+	slotsTable := pgx.Identifier{cfg.Schema, cfg.TablePrefix + "slots"}.Sanitize()
+
+	defer func() {
+		_, _ = adminPool.Exec(ctx, "REVOKE ALL PRIVILEGES ON ALL TABLES IN SCHEMA "+schemaIdent+" FROM "+roleIdent)
+		_, _ = adminPool.Exec(ctx, "REVOKE ALL PRIVILEGES ON SCHEMA "+schemaIdent+" FROM "+roleIdent)
+		_, _ = adminPool.Exec(ctx, "DROP ROLE IF EXISTS "+roleIdent)
+		adminPool.Close()
+	}()
+
+	// Let an admin store create the schema first, then drop the two additive report columns to simulate an older schema.
+	initStore, err := jobs.NewPostgresStore(cfg)
+	if err != nil {
+		t.Fatalf("init NewPostgresStore: %v", err)
+	}
+	if err := initStore.Ping(ctx); err != nil {
+		t.Fatalf("init Ping: %v", err)
+	}
+	_ = initStore.Close()
+
+	for _, stmt := range []string{
+		fmt.Sprintf("ALTER TABLE %s DROP COLUMN IF EXISTS job_kind, DROP COLUMN IF EXISTS report_json", jobsTable),
+		fmt.Sprintf("CREATE ROLE %s LOGIN PASSWORD '%s'", roleIdent, rolePass),
+		fmt.Sprintf("GRANT USAGE ON SCHEMA %s TO %s", schemaIdent, roleIdent),
+		fmt.Sprintf("GRANT SELECT, INSERT, UPDATE, DELETE ON %s, %s TO %s", jobsTable, slotsTable, roleIdent),
+	} {
+		if _, err := adminPool.Exec(ctx, stmt); err != nil {
+			t.Fatalf("setup legacy DML schema (%s): %v", stmt, err)
+		}
+	}
+
+	// Step 2: Start TWO DML-only replicas (MaxConns=2 to also verify zero pool self-deadlock on H-2!).
+	dmlCfg := cfg
+	dmlCfg.Username = roleName
+	dmlCfg.Password = rolePass
+	dmlCfg.MaxConns = 2
+	replicaA, err := jobs.NewPostgresStore(dmlCfg)
+	if err != nil {
+		t.Fatalf("replicaA NewPostgresStore: %v", err)
+	}
+	defer func() { _ = replicaA.Close() }()
+	replicaB, err := jobs.NewPostgresStore(dmlCfg)
+	if err != nil {
+		t.Fatalf("replicaB NewPostgresStore: %v", err)
+	}
+	defer func() { _ = replicaB.Close() }()
+
+	if err := replicaA.Ping(ctx); err != nil {
+		t.Fatalf("replicaA Ping on legacy schema must succeed: %v", err)
+	}
+	if err := replicaB.Ping(ctx); err != nil {
+		t.Fatalf("replicaB Ping on legacy schema must succeed: %v", err)
+	}
+
+	mgrA := jobs.NewManager(&llm.MockClient{}, jobs.Config{AllowedDSUIDs: []string{"prom-main"}, Store: replicaA})
+	defer mgrA.Close()
+	mgrB := jobs.NewManager(&llm.MockClient{}, jobs.Config{AllowedDSUIDs: []string{"prom-main"}, Store: replicaB})
+	defer mgrB.Close()
+
+	alice := jobs.Owner{OrgID: 1, UserLogin: "alice"}
+	payload := ir.AnalyzeStatusPayload{
+		DatasourceUID:    "prom-main",
+		Window:           "1h",
+		BaselineMode:     "preceding",
+		Language:         "en",
+		CollectionStatus: ir.ReportCollectionStatus{AlertsChecked: true, RulesChecked: true, TotalRulesEvaluated: 1},
+		Evidence: ir.ReportEvidenceBundle{
+			CollectedAt: "2026-11-27T00:00:00Z",
+			Alerts:      []ir.AlertEvidenceItem{{ID: "ev-alert-1", AlertName: "HighErrorRate", State: "active", Severity: "critical"}},
+		},
+	}
+
+	// Before DBA migration: AnalyzeStatus returns ErrReportStorageMigrationRequired, while Studio Generate works.
+	if _, err := mgrA.AnalyzeStatus(ctx, alice, payload); !errors.Is(err, jobs.ErrReportStorageMigrationRequired) {
+		t.Fatalf("expected ErrReportStorageMigrationRequired before DBA migration, got %v", err)
+	}
+	if _, err := mgrA.Generate(ctx, alice, jobs.GenerateInput{
+		DatasourceUID: "prom-main",
+		Scope:         &ir.ScopeFilter{LabelName: "service", LabelValue: "checkout-api"},
+		UserIntent:    "Show request rate",
+		Catalog:       testCatalog(),
+	}); err != nil {
+		t.Fatalf("Studio Generate must keep working on unmigrated DML-only schema: %v", err)
+	}
+
+	// Step 3: DBA adds columns online without restarting replicas; force probe window ready on replicaA.
+	if _, err := adminPool.Exec(ctx, fmt.Sprintf("ALTER TABLE %s ADD COLUMN IF NOT EXISTS job_kind TEXT NOT NULL DEFAULT '', ADD COLUMN IF NOT EXISTS report_json TEXT NOT NULL DEFAULT ''", jobsTable)); err != nil {
+		t.Fatalf("DBA ALTER TABLE failed: %v", err)
+	}
+	// Create fresh replicaA (or wait) vs untouched replicaB that STILL has supportsReportStorage=false!
+	replicaA2, err := jobs.NewPostgresStore(dmlCfg)
+	if err != nil {
+		t.Fatalf("replicaA2 NewPostgresStore: %v", err)
+	}
+	defer func() { _ = replicaA2.Close() }()
+	mgrA2 := jobs.NewManager(&llm.MockClient{}, jobs.Config{AllowedDSUIDs: []string{"prom-main"}, Store: replicaA2})
+	defer mgrA2.Close()
+
+	reportSnap, err := mgrA2.AnalyzeStatus(ctx, alice, payload)
+	if err != nil {
+		t.Fatalf("AnalyzeStatus after DBA migration failed: %v", err)
+	}
+	if reportSnap.Status != jobs.StatusReady || reportSnap.StatusReport == nil {
+		t.Fatalf("expected ready report from mgrA2, got %#v", reportSnap)
+	}
+
+	// Step 4 (H-1 regression): Replica B started BEFORE migration and NEVER ran AnalyzeStatus.
+	// GET, Cancel (no-op on terminal ready), and Patch (ErrWrongJobKind) on Replica B MUST all see the report cleanly!
+	gotB, err := mgrB.Get(alice, reportSnap.JobID)
+	if err != nil {
+		t.Fatalf("replicaB Get failed: %v", err)
+	}
+	if gotB.JobKind != jobs.JobKindReport || gotB.StatusReport == nil {
+		t.Fatalf("replicaB split-brain: expected JobKindReport + non-nil StatusReport, got kind=%q report=%v", gotB.JobKind, gotB.StatusReport)
+	}
+
+	cancelB, err := mgrB.Cancel(alice, reportSnap.JobID)
+	if err != nil {
+		t.Fatalf("replicaB Cancel failed: %v", err)
+	}
+	if cancelB.Status != jobs.StatusReady || cancelB.StatusReport == nil {
+		t.Fatalf("replicaB Cancel clobbered completed report: status=%q report=%v", cancelB.Status, cancelB.StatusReport)
+	}
+
+	if _, err := mgrB.Patch(ctx, alice, reportSnap.JobID, jobs.PatchInput{
+		BaseRevision: 1,
+		EditIntent:   "change panel",
+		Catalog:      testCatalog(),
+	}); !errors.Is(err, jobs.ErrWrongJobKind) {
+		t.Fatalf("replicaB Patch expected ErrWrongJobKind, got %v", err)
+	}
+}

@@ -141,6 +141,14 @@ func (c *GrafanaLLMClient) RepairPanels(ctx context.Context, req RepairRequest) 
 	return c.callStructured(ctx, msgs, "dashboard_patch", schemas.DashboardPatchSchemaJSON)
 }
 
+func (c *GrafanaLLMClient) AnalyzeStatus(ctx context.Context, req AnalyzeStatusRequest) ([]byte, CompletionMeta, error) {
+	msgs, err := prompt.BuildAnalyzeStatusMessages(req.Payload)
+	if err != nil {
+		return nil, CompletionMeta{ProviderMode: "grafana-llm-app"}, err
+	}
+	return c.callStructured(ctx, msgs, "status_report", schemas.StatusReportSchemaJSON)
+}
+
 func (c *GrafanaLLMClient) callStructured(
 	ctx context.Context,
 	messages []openai.ChatCompletionMessage,
@@ -213,8 +221,14 @@ func (c *GrafanaLLMClient) callStructured(
 		if lastErr == nil {
 			break
 		}
-		if attemptTimedOut || !isRetryableTransportError(ctx, lastErr) || attempt+1 >= attempts {
-			return nil, CompletionMeta{ProviderMode: "grafana-llm-app"}, fmt.Errorf("grafana-llm-app chat completion failed: %w", lastErr)
+		if attemptTimedOut || errors.Is(lastErr, context.DeadlineExceeded) {
+			return nil, CompletionMeta{ProviderMode: "grafana-llm-app"}, fmt.Errorf("%w: grafana-llm-app chat completion timed out: %v", context.DeadlineExceeded, lastErr)
+		}
+		if errors.Is(lastErr, context.Canceled) || errors.Is(ctx.Err(), context.Canceled) {
+			return nil, CompletionMeta{ProviderMode: "grafana-llm-app"}, context.Canceled
+		}
+		if !isRetryableTransportError(ctx, lastErr) || attempt+1 >= attempts {
+			return nil, CompletionMeta{ProviderMode: "grafana-llm-app"}, fmt.Errorf("%w: grafana-llm-app chat completion failed: %v", ErrLLMUnavailable, lastErr)
 		}
 		select {
 		case <-ctx.Done():
@@ -224,7 +238,7 @@ func (c *GrafanaLLMClient) callStructured(
 	}
 
 	if len(resp.Choices) == 0 {
-		return nil, CompletionMeta{ProviderMode: "grafana-llm-app"}, errors.New("LLM returned zero choices")
+		return nil, CompletionMeta{ProviderMode: "grafana-llm-app"}, fmt.Errorf("%w: LLM returned zero choices", ErrLLMUnavailable)
 	}
 
 	choice := resp.Choices[0]
@@ -246,12 +260,12 @@ func (c *GrafanaLLMClient) callStructured(
 		return nil, meta, ErrOutputRefused
 	}
 	if choice.FinishReason != "" && choice.FinishReason != openai.FinishReasonStop {
-		return nil, meta, fmt.Errorf("unexpected LLM finish_reason %q", choice.FinishReason)
+		return nil, meta, fmt.Errorf("%w: unexpected LLM finish_reason %q", ErrLLMUnavailable, choice.FinishReason)
 	}
 
 	content := stripJSONCodeFence(strings.TrimSpace(choice.Message.Content))
 	if content == "" {
-		return nil, meta, errors.New("LLM returned empty content")
+		return nil, meta, fmt.Errorf("%w: LLM returned empty content", ErrLLMUnavailable)
 	}
 	return []byte(content), meta, nil
 }

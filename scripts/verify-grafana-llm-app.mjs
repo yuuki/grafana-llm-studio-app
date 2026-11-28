@@ -14,6 +14,7 @@
  */
 
 import { execFileSync } from 'node:child_process';
+import fs from 'node:fs';
 import assert from 'node:assert/strict';
 
 const grafanaUrl = (process.env.GRAFANA_URL || 'http://127.0.0.1:3000').replace(/\/+$/, '');
@@ -273,6 +274,84 @@ async function main() {
   assert.ok(truncRes.stdout.includes('finish_reason'), 'report must classify truncation under finish_reason stage');
   assert.ok(truncRes.stdout.includes('`length`: 1'), 'report must count finish_reason=length');
   console.log('[PASS] Real grafana-llm-app verified: finish_reason=length cleanly detected as ErrOutputTruncated');
+
+  // 7. Verify status_report JSON Schema and json_object wire relay through real grafana-llm-app
+  await fetchJSON(`${stubUrl}/_reset`, { method: 'POST' });
+  console.log('\n--- Verifying status_report json_schema & json_object wire relay ---');
+  const statusReportSchema = JSON.parse(fs.readFileSync('schemas/status-report.schema.json', 'utf8'));
+  const chatEndpoint = `${grafanaUrl}/api/plugins/grafana-llm-app/resources/llm/v1/chat/completions`;
+  const statusUserPayload = JSON.stringify({
+    task: 'analyze_operational_status',
+    language: 'en',
+    window: '1h',
+    evidence: {
+      alerts: [{ id: 'ev-alert-1', alertName: 'HighErrorRate', state: 'active', severity: 'critical' }],
+    },
+  });
+
+  const repSchemaRes = await fetchJSON(chatEndpoint, {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${saToken}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      model: 'base',
+      messages: [
+        { role: 'system', content: 'Return JSON matching status_report schema.' },
+        { role: 'user', content: statusUserPayload },
+      ],
+      max_completion_tokens: 2048,
+      response_format: {
+        type: 'json_schema',
+        json_schema: {
+          name: 'status_report',
+          strict: false,
+          schema: statusReportSchema,
+        },
+      },
+    }),
+  });
+  assert.equal(repSchemaRes.ok, true, `status_report json_schema relay failed: HTTP ${repSchemaRes.status} ${repSchemaRes.text}`);
+  const parsedReport = JSON.parse(repSchemaRes.json?.choices?.[0]?.message?.content || '{}');
+  assert.equal(parsedReport.schemaVersion, '1.0');
+  assert.match(parsedReport.findings?.[0]?.id || '', /^f-[1-9][0-9]?$/);
+  assert.deepEqual(parsedReport.findings?.[0]?.evidenceIds, ['ev-alert-1']);
+
+  const repObjRes = await fetchJSON(chatEndpoint, {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${saToken}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      model: 'base',
+      messages: [
+        { role: 'system', content: `Return JSON matching JSON Schema:\n${JSON.stringify(statusReportSchema)}` },
+        { role: 'user', content: statusUserPayload },
+      ],
+      max_tokens: 2048,
+      response_format: { type: 'json_object' },
+    }),
+  });
+  assert.equal(repObjRes.ok, true, `status_report json_object relay failed: HTTP ${repObjRes.status} ${repObjRes.text}`);
+
+  const capReport = (await fetchJSON(`${stubUrl}/_captured`)).json;
+  assert.equal(capReport.length, 2, `expected 2 status_report upstream calls, got ${capReport.length}`);
+  const relayedSchema = capReport[0].body?.response_format?.json_schema;
+  assert.equal(relayedSchema?.name, 'status_report');
+  assert.deepEqual(
+    relayedSchema?.schema?.properties?.overallStatus?.enum,
+    ['healthy', 'degraded', 'critical', 'insufficient_data'],
+    'status_report overallStatus string enum must survive real grafana-llm-app relay'
+  );
+  assert.deepEqual(
+    relayedSchema?.schema?.properties?.findings?.items?.properties?.category?.enum,
+    ['alert', 'performance', 'incident', 'monitoring_gap'],
+    'status_report findings.category string enum must survive real grafana-llm-app relay'
+  );
+  assert.equal(capReport[1].body?.response_format?.type, 'json_object');
+  console.log('[PASS] Real grafana-llm-app verified: status_report json_schema + json_object wire relay');
 
   console.log('\nALL REAL grafana-llm-app PROTOCOL & BENCHMARK VERIFICATIONS PASSED!');
 }

@@ -18,6 +18,7 @@ var _ JobStore = (*MemoryStore)(nil)
 
 type memJobRecord struct {
 	id                 string
+	jobKind            string
 	owner              Owner
 	datasourceUID      string
 	queryKind          query.Kind
@@ -25,6 +26,7 @@ type memJobRecord struct {
 	importSource       *ir.ImportSource
 	status             JobStatus
 	currentIR          *ir.DashboardIR
+	statusReport       *ir.StatusReportIR
 	history            []ir.DashboardIR
 	lastDiff           []ir.DiffEntry
 	summary            string
@@ -105,13 +107,19 @@ func (s *MemoryStore) CreateGenerating(_ context.Context, params CreateGeneratin
 	mergeGaugeMapBounded(gauges, params.KnownGauges)
 
 	leaseUntil := now.Add(limits.OpLeaseTTL).Truncate(time.Millisecond)
+	initStatus := StatusGenerating
+	jobKind := params.JobKind
+	if jobKind == JobKindReport {
+		initStatus = StatusAnalyzing
+	}
 	rec := &memJobRecord{
 		id:                params.JobID,
+		jobKind:           jobKind,
 		owner:             params.Owner,
 		datasourceUID:     params.DatasourceUID,
 		queryKind:         params.QueryKind,
 		scope:             cloneScope(params.Scope),
-		status:            StatusGenerating,
+		status:            initStatus,
 		maxRepairAttempts: params.MaxRepairAttempts,
 		knownGauges:       gauges,
 		createdAt:         now,
@@ -212,6 +220,9 @@ func (s *MemoryStore) GetRepairCandidate(_ context.Context, owner Owner, jobID s
 	if err != nil {
 		return RepairCandidate{}, err
 	}
+	if rec.jobKind == JobKindReport {
+		return RepairCandidate{}, ErrWrongJobKind
+	}
 	var irCopy *ir.DashboardIR
 	if rec.currentIR != nil {
 		c := rec.currentIR.Clone()
@@ -250,6 +261,9 @@ func (s *MemoryStore) BeginPatch(_ context.Context, params BeginPatchParams) (Be
 	rec, err := s.getOwnedLocked(params.Owner, params.JobID, now)
 	if err != nil {
 		return BeginOpResult{}, err
+	}
+	if rec.jobKind == JobKindReport {
+		return BeginOpResult{}, ErrWrongJobKind
 	}
 	if rec.currentIR == nil {
 		return BeginOpResult{}, errors.New("job has no active IR draft to patch")
@@ -318,6 +332,9 @@ func (s *MemoryStore) BeginRepair(_ context.Context, params BeginRepairParams) (
 	rec, err := s.getOwnedLocked(params.Owner, params.JobID, now)
 	if err != nil {
 		return BeginOpResult{}, err
+	}
+	if rec.jobKind == JobKindReport {
+		return BeginOpResult{}, ErrWrongJobKind
 	}
 	if rec.currentIR == nil {
 		return BeginOpResult{}, errors.New("job has no active IR draft to repair")
@@ -418,6 +435,10 @@ func (s *MemoryStore) FinishJob(_ context.Context, params FinishJobParams) (JobS
 	if params.Doc != nil {
 		c := params.Doc.Clone()
 		rec.currentIR = &c
+	}
+	if params.Report != nil {
+		rc := params.Report.Clone()
+		rec.statusReport = &rc
 	}
 	if len(params.Diffs) > 0 {
 		rec.lastDiff = make([]ir.DiffEntry, len(params.Diffs))
@@ -556,12 +577,16 @@ func (s *MemoryStore) RevertOnCancel(_ context.Context, owner Owner, jobID strin
 	if opToken > 0 && rec.activeOpToken == opToken && rec.isActive(now) {
 		rec.activeOpToken++
 		rec.activeOpUntil = time.Time{}
-		if rec.currentIR != nil {
+		if rec.jobKind == JobKindReport {
+			rec.status = StatusCancelled
+			rec.summary = "Status analysis was cancelled."
+		} else if rec.currentIR != nil {
 			rec.status = StatusAwaitingPreview
+			rec.summary = "処理がキャンセルされたためドラフトは変更されていません。"
 		} else {
 			rec.status = StatusCancelled
+			rec.summary = "処理がキャンセルされたためドラフトは変更されていません。"
 		}
-		rec.summary = "処理がキャンセルされたためドラフトは変更されていません。"
 		rec.updatedAt = now
 		rec.expiresAt = now.Add(ttl).Truncate(time.Millisecond)
 	}
@@ -584,6 +609,9 @@ func (s *MemoryStore) Undo(_ context.Context, owner Owner, jobID string, now tim
 	rec, err := s.getOwnedLocked(owner, jobID, now)
 	if err != nil {
 		return MutationResult{}, err
+	}
+	if rec.jobKind == JobKindReport {
+		return MutationResult{}, ErrWrongJobKind
 	}
 	if len(rec.history) == 0 || rec.currentIR == nil {
 		return MutationResult{}, ErrNoUndoHistory
@@ -632,14 +660,21 @@ func (s *MemoryStore) Cancel(_ context.Context, owner Owner, jobID string, now t
 	if err != nil {
 		return MutationResult{}, err
 	}
+	if rec.jobKind == JobKindReport && !rec.isActive(now) && isTerminalReportStatus(rec.status) {
+		return MutationResult{Snapshot: memSnapshotLocked(rec), OpToken: rec.activeOpToken}, nil
+	}
 	rec.activeOpToken++
 	rec.activeOpUntil = time.Time{}
-	if rec.currentIR == nil {
+	if rec.jobKind == JobKindReport {
 		rec.status = StatusCancelled
+		rec.summary = "Status analysis was cancelled."
+	} else if rec.currentIR == nil {
+		rec.status = StatusCancelled
+		rec.summary = "実行中の処理をキャンセルしました。"
 	} else {
 		rec.status = StatusAwaitingPreview
+		rec.summary = "実行中の処理をキャンセルしました。"
 	}
-	rec.summary = "実行中の処理をキャンセルしました。"
 	rec.updatedAt = now
 	rec.expiresAt = now.Add(ttl).Truncate(time.Millisecond)
 	return MutationResult{Snapshot: memSnapshotLocked(rec), OpToken: rec.activeOpToken}, nil
@@ -874,11 +909,20 @@ func sortByOldestUpdated(recs []*memJobRecord) {
 	})
 }
 
+func isTerminalReportStatus(st JobStatus) bool {
+	return st == StatusReady || st == StatusFailed || st == StatusCancelled
+}
+
 func memSnapshotLocked(rec *memJobRecord) JobSnapshot {
 	var irCopy *ir.DashboardIR
 	if rec.currentIR != nil {
 		c := rec.currentIR.Clone()
 		irCopy = &c
+	}
+	var reportCopy *ir.StatusReportIR
+	if rec.statusReport != nil {
+		rc := rec.statusReport.Clone()
+		reportCopy = &rc
 	}
 	var diffs []ir.DiffEntry
 	if len(rec.lastDiff) > 0 {
@@ -896,17 +940,19 @@ func memSnapshotLocked(rec *memJobRecord) JobSnapshot {
 		metaCopy = &mc
 	}
 	qKind := rec.queryKind
-	if qKind == "" {
+	if qKind == "" && rec.jobKind != JobKindReport {
 		qKind = query.KindPromQL
 	}
 	return JobSnapshot{
 		JobID:              rec.id,
+		JobKind:            rec.jobKind,
 		Status:             rec.status,
 		DatasourceUID:      rec.datasourceUID,
 		QueryKind:          string(qKind),
 		Scope:              cloneScope(rec.scope),
 		ImportSource:       cloneImportSource(rec.importSource),
 		CurrentIR:          irCopy,
+		StatusReport:       reportCopy,
 		LastDiff:           diffs,
 		Summary:            rec.summary,
 		Warnings:           warns,

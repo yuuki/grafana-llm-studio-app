@@ -1,0 +1,224 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/yuuki/grafana-llm-studio-app/schemas/status-report.schema.json",
+  "title": "StatusReportIR",
+  "description": "Restricted intermediate representation (v1.0) for evidence-grounded operational status and incident analysis reports.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion",
+    "overallStatus",
+    "confidence",
+    "executiveSummary",
+    "timeline",
+    "findings",
+    "hypotheses",
+    "recommendedActions",
+    "dataGaps"
+  ],
+  "properties": {
+    "schemaVersion": {
+      "type": "string",
+      "enum": ["1.0"],
+      "description": "StatusReportIR schema version."
+    },
+    "overallStatus": {
+      "type": "string",
+      "enum": ["healthy", "degraded", "critical", "insufficient_data"],
+      "description": "Overall operational assessment derived strictly from supplied evidence."
+    },
+    "confidence": {
+      "type": "string",
+      "enum": ["high", "medium", "low"],
+      "description": "Confidence level of the assessment."
+    },
+    "executiveSummary": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 400,
+      "description": "Concise single-line plain-text summary in the requested report language (no HTML or URLs)."
+    },
+    "timeline": {
+      "type": "array",
+      "maxItems": 8,
+      "description": "Ordered key events observed in the supplied evidence.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["timestamp", "event", "evidenceIds"],
+        "properties": {
+          "timestamp": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 40,
+            "description": "Event timestamp (RFC3339 or concise window label from supplied evidence)."
+          },
+          "event": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 160,
+            "description": "Short plain-text description of the event."
+          },
+          "evidenceIds": {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": 6,
+            "items": {
+              "type": "string",
+              "minLength": 5,
+              "maxLength": 32
+            },
+            "description": "Exact ev-* identifiers from the input evidence bundle supporting this timeline entry."
+          }
+        }
+      }
+    },
+    "findings": {
+      "type": "array",
+      "maxItems": 6,
+      "description": "Grounded operational findings. Required to be non-empty when overallStatus is degraded or critical.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "category", "severity", "title", "detail", "evidenceIds"],
+        "properties": {
+          "id": {
+            "type": "string",
+            "pattern": "^f-[1-9][0-9]?$",
+            "description": "Unique finding identifier (e.g., f-1, f-2)."
+          },
+          "category": {
+            "type": "string",
+            "enum": ["alert", "performance", "incident", "monitoring_gap"],
+            "description": "Finding classification."
+          },
+          "severity": {
+            "type": "string",
+            "enum": ["critical", "warning", "info"],
+            "description": "Finding severity."
+          },
+          "title": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 100,
+            "description": "Concise finding headline."
+          },
+          "detail": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 350,
+            "description": "Plain-text explanation citing observed figures and states from supplied evidence."
+          },
+          "evidenceIds": {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": 6,
+            "items": {
+              "type": "string",
+              "minLength": 5,
+              "maxLength": 32
+            },
+            "description": "Exact ev-* identifiers from the input evidence bundle supporting this finding."
+          }
+        }
+      }
+    },
+    "hypotheses": {
+      "type": "array",
+      "maxItems": 3,
+      "description": "Plausible root-cause hypotheses grounded strictly in supplied evidence.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["title", "likelihood", "rationale", "evidenceIds", "verificationSteps"],
+        "properties": {
+          "title": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 100,
+            "description": "Short hypothesis title."
+          },
+          "likelihood": {
+            "type": "string",
+            "enum": ["high", "medium", "low"],
+            "description": "Relative likelihood based on supplied evidence."
+          },
+          "rationale": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 300,
+            "description": "Plain-text reasoning connecting the cited evidence."
+          },
+          "evidenceIds": {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": 6,
+            "items": {
+              "type": "string",
+              "minLength": 5,
+              "maxLength": 32
+            },
+            "description": "Exact ev-* identifiers supporting this hypothesis."
+          },
+          "verificationSteps": {
+            "type": "array",
+            "maxItems": 3,
+            "items": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 140
+            },
+            "description": "Concrete checks an operator can run to confirm or rule out this hypothesis."
+          }
+        }
+      }
+    },
+    "recommendedActions": {
+      "type": "array",
+      "maxItems": 5,
+      "description": "Prioritized operational next steps.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["priority", "action", "relatedFindingIds"],
+        "properties": {
+          "priority": {
+            "type": "string",
+            "enum": ["immediate", "short_term", "follow_up"],
+            "description": "Action urgency."
+          },
+          "action": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 200,
+            "description": "Concrete plain-text operational step."
+          },
+          "relatedFindingIds": {
+            "type": "array",
+            "maxItems": 4,
+            "items": {
+              "type": "string",
+              "pattern": "^f-[1-9][0-9]?$"
+            },
+            "description": "Finding IDs from findings[] that this action addresses."
+          }
+        }
+      }
+    },
+    "dataGaps": {
+      "type": "array",
+      "maxItems": 6,
+      "items": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 160
+      },
+      "description": "Explicitly acknowledged blind spots, missing telemetry signals, or collection warnings."
+    },
+    "suggestedInvestigationIntent": {
+      "type": "string",
+      "maxLength": 250,
+      "description": "Optional natural-language prompt suggestion to open in Dashboard Studio for follow-up visualization (no raw PromQL)."
+    }
+  }
+}

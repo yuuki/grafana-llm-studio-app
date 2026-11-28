@@ -96,11 +96,18 @@ jest.mock('../save/saveDashboard', () => ({
   })),
 }));
 
+let mockLocationSearch = '';
+const mockLocationPartial = jest.fn();
+
 jest.mock('@grafana/runtime', () => ({
   config: { bootData: { user: { orgId: 1 } } },
   getDataSourceSrv: () => ({
     getList: () => [{ uid: 'prom-main', name: 'Prometheus', type: 'prometheus' }],
   }),
+  locationService: {
+    getLocation: () => ({ search: mockLocationSearch }),
+    partial: (...args: unknown[]) => mockLocationPartial(...args),
+  },
 }));
 
 jest.mock('@grafana/ui', () => ({
@@ -774,5 +781,32 @@ describe('StudioPage v1.1 safe import & variable cache invalidation', () => {
     await waitFor(() =>
       expect((screen.getByText('Generate Dashboard Draft') as HTMLButtonElement).disabled).toBe(false)
     );
+  });
+
+  test('consumes Status Report handoff query params without wiping scopeLabelValue and strips consumed params', async () => {
+    mockLocationSearch =
+      '?datasource=prom-main&scopeLabel=job&scopeValue=checkout-api&intent=Investigate+checkout+5xx+spike';
+    mockLocationPartial.mockClear();
+
+    try {
+      render(<StudioPage />);
+
+      await waitFor(() => {
+        expect(screen.getByTestId('studio-handoff-alert')).toBeTruthy();
+      });
+
+      const scopeValueInput = screen.getByPlaceholderText('checkout-api') as HTMLInputElement;
+      expect(scopeValueInput.value).toBe('checkout-api');
+
+      const promptInput = screen.getByLabelText('What would you like to build or modify?') as HTMLTextAreaElement;
+      expect(promptInput.value).toBe('Investigate checkout 5xx spike');
+
+      expect(mockLocationPartial).toHaveBeenCalledWith(
+        { datasource: null, scopeLabel: null, scopeValue: null, intent: null },
+        true
+      );
+    } finally {
+      mockLocationSearch = '';
+    }
   });
 });

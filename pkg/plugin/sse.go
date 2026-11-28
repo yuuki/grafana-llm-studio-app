@@ -227,13 +227,13 @@ func (s *sseStreamWriter) FinishError(err error, snap jobs.JobSnapshot) {
 
 	if !s.started {
 		s.w.Header().Set("Vary", "Accept")
-		writeJobError(s.w, err, snap)
+		writeJobErrorForContext(s.ctx, s.w, err, snap)
 		return
 	}
 	if s.ctx.Err() != nil {
 		return
 	}
-	status, payload := buildJobErrorPayload(err, snap)
+	status, payload := buildJobErrorPayloadForContext(s.ctx, err, snap)
 	payload["status"] = status
 	raw, mErr := json.Marshal(payload)
 	if mErr != nil {

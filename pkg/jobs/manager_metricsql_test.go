@@ -26,6 +26,9 @@ func (s *stubDialectLLM) GeneratePatch(_ context.Context, _ llm.PatchRequest) ([
 func (s *stubDialectLLM) RepairPanels(_ context.Context, _ llm.RepairRequest) ([]byte, llm.CompletionMeta, error) {
 	return s.rawRepair, llm.CompletionMeta{FinishReason: "stop", ProviderMode: "stub"}, nil
 }
+func (s *stubDialectLLM) AnalyzeStatus(_ context.Context, _ llm.AnalyzeStatusRequest) ([]byte, llm.CompletionMeta, error) {
+	return nil, llm.CompletionMeta{ProviderMode: "stub"}, nil
+}
 
 func TestManager_MetricsQLGeneratePatchImportAndAdminPinning(t *testing.T) {
 	owner := Owner{OrgID: 1, UserLogin: "alice"}

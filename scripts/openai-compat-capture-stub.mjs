@@ -193,6 +193,49 @@ function buildResponseContent(reqBody) {
       });
     }
 
+    case 'analyze_operational_status':
+      return JSON.stringify({
+        schemaVersion: '1.0',
+        overallStatus: 'degraded',
+        confidence: 'high',
+        executiveSummary: 'Checkout API is degraded with HighErrorRate active.',
+        timeline: [
+          {
+            timestamp: '2026-11-27T00:05:00Z',
+            event: 'HighErrorRate alert fired on checkout-api',
+            evidenceIds: ['ev-alert-1'],
+          },
+        ],
+        findings: [
+          {
+            id: 'f-1',
+            category: 'alert',
+            severity: 'critical',
+            title: 'HighErrorRate firing',
+            detail: 'Checkout API 5xx ratio exceeded 5 percent.',
+            evidenceIds: ['ev-alert-1'],
+          },
+        ],
+        hypotheses: [
+          {
+            title: 'Upstream dependency timeout',
+            likelihood: 'high',
+            rationale: 'Error alert correlates with recent latency increase.',
+            evidenceIds: ['ev-alert-1'],
+            verificationSteps: ['Check upstream payment gateway latency'],
+          },
+        ],
+        recommendedActions: [
+          {
+            priority: 'immediate',
+            action: 'Inspect recent checkout-api rollout',
+            relatedFindingIds: ['f-1'],
+          },
+        ],
+        dataGaps: ['Only Grafana Unified Alerting evidence provided'],
+        suggestedInvestigationIntent: 'Build a troubleshooting dashboard for checkout-api 5xx errors',
+      });
+
     default:
       // Fallback for grafana-llm-app health check probe ("Hello" / short test message)
       return JSON.stringify({ ok: true });

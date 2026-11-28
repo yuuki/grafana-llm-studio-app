@@ -110,9 +110,15 @@ type RepairCandidate struct {
 	QueryKind          query.Kind
 }
 
-// CreateGeneratingParams specifies parameters for creating a new generating job.
+const (
+	JobKindDashboard = "dashboard"
+	JobKindReport    = "report"
+)
+
+// CreateGeneratingParams specifies parameters for creating a new generating or analyzing job.
 type CreateGeneratingParams struct {
 	JobID             string
+	JobKind           string
 	Owner             Owner
 	DatasourceUID     string
 	QueryKind         query.Kind
@@ -165,13 +171,14 @@ type BeginRepairParams struct {
 	Limits        StoreLimits
 }
 
-// FinishJobParams specifies parameters for completing an initial Generate job.
+// FinishJobParams specifies parameters for completing an initial Generate or Analyze job.
 type FinishJobParams struct {
 	Owner        Owner
 	JobID        string
 	OpToken      uint64
 	Status       JobStatus
 	Doc          *ir.DashboardIR
+	Report       *ir.StatusReportIR
 	Diffs        []ir.DiffEntry
 	Summary      string
 	Warnings     []string

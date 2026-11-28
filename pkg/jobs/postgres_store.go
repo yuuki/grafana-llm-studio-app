@@ -229,8 +229,10 @@ type PostgresStore struct {
 	slotsTable    string
 	cancelChannel string
 
-	schemaReady atomic.Bool
-	schemaSem   chan struct{}
+	schemaReady           atomic.Bool
+	supportsReportStorage atomic.Bool
+	lastReportProbeNs     atomic.Int64
+	schemaSem             chan struct{}
 
 	closeMu     sync.Mutex
 	closed      bool
@@ -484,10 +486,100 @@ func closePgConnBounded(conn *pgx.Conn) {
 	_ = conn.Close(closeCtx)
 }
 
+const postgresReportProbeInterval = 30 * time.Second
+
+func isPgInsufficientPrivilege(err error) bool {
+	var pgErr *pgconn.PgError
+	return errors.As(err, &pgErr) && pgErr.Code == "42501"
+}
+
+// probeReportColumnsWith checks pg_attribute for both job_kind and report_json on s.jobsTable
+// using the caller's query runner (pool or active tx) so probing inside a transaction never
+// acquires a second pool connection.
+func (s *PostgresStore) probeReportColumnsWith(ctx context.Context, q pgQueryRower) (bool, error) {
+	var colCount int
+	err := q.QueryRow(ctx, `
+		SELECT COUNT(*) FROM pg_attribute
+		WHERE attrelid = to_regclass($1)
+		  AND attname IN ('job_kind', 'report_json')
+		  AND NOT attisdropped`, s.jobsTable).Scan(&colCount)
+	if err != nil {
+		return false, err
+	}
+	supported := colCount == 2
+	s.supportsReportStorage.Store(supported)
+	s.lastReportProbeNs.Store(time.Now().UnixNano())
+	return supported, nil
+}
+
+// probeReportColumns checks pg_attribute for both job_kind and report_json on s.jobsTable.
+func (s *PostgresStore) probeReportColumns(ctx context.Context) (bool, error) {
+	return s.probeReportColumnsWith(ctx, s.pool)
+}
+
+// tryMigrateReportColumns attempts idempotent ADD COLUMN IF NOT EXISTS on an existing jobs table.
+// Under least-privilege DML-only roles (PostgreSQL 42501), it cleanly records supportsReportStorage=false
+// without failing ensureSchema so Dashboard Studio continues operating uninterrupted.
+func (s *PostgresStore) tryMigrateReportColumns(ctx context.Context) error {
+	supported, err := s.probeReportColumns(ctx)
+	if err != nil {
+		return err
+	}
+	if supported {
+		return nil
+	}
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer rollbackTx(ctx, tx)
+
+	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock($1)`, s.schemaLockKey()); err != nil {
+		return err
+	}
+	_, err = tx.Exec(ctx, fmt.Sprintf(`ALTER TABLE %s
+		ADD COLUMN IF NOT EXISTS job_kind TEXT NOT NULL DEFAULT '',
+		ADD COLUMN IF NOT EXISTS report_json TEXT NOT NULL DEFAULT ''`, s.jobsTable))
+	if err != nil {
+		if isPgInsufficientPrivilege(err) {
+			// Least-privilege DML-only role: leave supportsReportStorage=false and keep Studio working.
+			s.supportsReportStorage.Store(false)
+			s.lastReportProbeNs.Store(time.Now().UnixNano())
+			return nil
+		}
+		return err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return err
+	}
+	s.supportsReportStorage.Store(true)
+	s.lastReportProbeNs.Store(time.Now().UnixNano())
+	return nil
+}
+
+// ensureReportStorageReady checks whether job_kind and report_json exist, performing a
+// rate-limited re-probe so a DBA migration applied after startup takes effect without restart.
+func (s *PostgresStore) ensureReportStorageReady(ctx context.Context) error {
+	if s.supportsReportStorage.Load() {
+		return nil
+	}
+	last := s.lastReportProbeNs.Load()
+	if last == 0 || time.Since(time.Unix(0, last)) >= postgresReportProbeInterval {
+		supported, err := s.probeReportColumns(ctx)
+		if err != nil {
+			return wrapPostgresErr("probeReportColumns", err)
+		}
+		if supported {
+			return nil
+		}
+	}
+	return fmt.Errorf("%w: run ALTER TABLE %s ADD COLUMN IF NOT EXISTS job_kind TEXT NOT NULL DEFAULT '', ADD COLUMN IF NOT EXISTS report_json TEXT NOT NULL DEFAULT ''", ErrReportStorageMigrationRequired, s.jobsTable)
+}
+
 // ensureSchema idempotently initializes the plugin tables and indexes inside a serialized
 // transaction so concurrent multi-replica startups never race on CREATE TABLE IF NOT EXISTS.
 // If both tables already exist (e.g. pre-created by a DBA for a least-privilege DML-only role),
-// ensureSchema marks itself ready without executing any DDL statements.
+// ensureSchema probes report columns safely without failing on 42501 permission denial.
 func (s *PostgresStore) ensureSchema(ctx context.Context) error {
 	if s.schemaReady.Load() {
 		return nil
@@ -512,6 +604,9 @@ func (s *PostgresStore) ensureSchema(ctx context.Context) error {
 		return wrapPostgresErr("ensureSchema", err)
 	}
 	if bothExist {
+		if err := s.tryMigrateReportColumns(ctx); err != nil {
+			return wrapPostgresErr("ensureSchema", err)
+		}
 		s.schemaReady.Store(true)
 		return nil
 	}
@@ -532,6 +627,10 @@ func (s *PostgresStore) ensureSchema(ctx context.Context) error {
 		return wrapPostgresErr("ensureSchema", err)
 	}
 	if bothExist {
+		_ = tx.Commit(ctx)
+		if err := s.tryMigrateReportColumns(ctx); err != nil {
+			return wrapPostgresErr("ensureSchema", err)
+		}
 		s.schemaReady.Store(true)
 		return nil
 	}
@@ -575,7 +674,9 @@ func (s *PostgresStore) ensureSchema(ctx context.Context) error {
 			updated_at_ms BIGINT NOT NULL,
 			expires_at_ms BIGINT NOT NULL,
 			active_op_token BIGINT NOT NULL DEFAULT 0,
-			active_op_until_ms BIGINT NOT NULL DEFAULT 0
+			active_op_until_ms BIGINT NOT NULL DEFAULT 0,
+			job_kind TEXT NOT NULL DEFAULT '',
+			report_json TEXT NOT NULL DEFAULT ''
 		)`, s.jobsTable),
 		fmt.Sprintf(`CREATE INDEX IF NOT EXISTS %s ON %s (org_id, updated_at_ms, job_id)`,
 			pgx.Identifier{s.tablePrefix + "jobs_org_updated_idx"}.Sanitize(), s.jobsTable),
@@ -603,6 +704,8 @@ func (s *PostgresStore) ensureSchema(ctx context.Context) error {
 	if err := tx.Commit(ctx); err != nil {
 		return wrapPostgresErr("ensureSchema", err)
 	}
+	s.supportsReportStorage.Store(true)
+	s.lastReportProbeNs.Store(time.Now().UnixNano())
 	s.schemaReady.Store(true)
 	return nil
 }
@@ -824,6 +927,11 @@ func (s *PostgresStore) CreateGenerating(ctx context.Context, params CreateGener
 	if err := s.ensureSchema(ctx); err != nil {
 		return OpLease{}, err
 	}
+	if params.JobKind == JobKindReport {
+		if err := s.ensureReportStorageReady(ctx); err != nil {
+			return OpLease{}, err
+		}
+	}
 
 	limits := params.Limits.normalized()
 	slotID := params.SlotID
@@ -890,25 +998,54 @@ func (s *PostgresStore) CreateGenerating(ctx context.Context, params CreateGener
 	expiresAtMs := nowMs + jobTTLMs
 	leaseUntilMs := nowMs + leaseTTLMs
 
-	_, err = tx.Exec(ctx, fmt.Sprintf(`INSERT INTO %s (
-		job_id, org_id, user_login, owner_key, datasource_uid, query_kind,
-		scope_json, status, max_repair_attempts, known_gauges_json,
-		created_at_ms, updated_at_ms, expires_at_ms, active_op_token, active_op_until_ms
-	) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$11,$12,1,$13)`, s.jobsTable),
-		params.JobID,
-		params.Owner.OrgID,
-		params.Owner.UserLogin,
-		oKey,
-		params.DatasourceUID,
-		string(params.QueryKind),
-		scopeJSON,
-		string(StatusGenerating),
-		params.MaxRepairAttempts,
-		gaugesJSON,
-		nowMs,
-		expiresAtMs,
-		leaseUntilMs,
-	)
+	initStatus := StatusGenerating
+	if params.JobKind == JobKindReport {
+		initStatus = StatusAnalyzing
+	}
+
+	if s.supportsReportStorage.Load() {
+		_, err = tx.Exec(ctx, fmt.Sprintf(`INSERT INTO %s (
+			job_id, org_id, user_login, owner_key, datasource_uid, query_kind,
+			scope_json, status, max_repair_attempts, known_gauges_json,
+			created_at_ms, updated_at_ms, expires_at_ms, active_op_token, active_op_until_ms,
+			job_kind, report_json
+		) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$11,$12,1,$13,$14,'')`, s.jobsTable),
+			params.JobID,
+			params.Owner.OrgID,
+			params.Owner.UserLogin,
+			oKey,
+			params.DatasourceUID,
+			string(params.QueryKind),
+			scopeJSON,
+			string(initStatus),
+			params.MaxRepairAttempts,
+			gaugesJSON,
+			nowMs,
+			expiresAtMs,
+			leaseUntilMs,
+			params.JobKind,
+		)
+	} else {
+		_, err = tx.Exec(ctx, fmt.Sprintf(`INSERT INTO %s (
+			job_id, org_id, user_login, owner_key, datasource_uid, query_kind,
+			scope_json, status, max_repair_attempts, known_gauges_json,
+			created_at_ms, updated_at_ms, expires_at_ms, active_op_token, active_op_until_ms
+		) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$11,$12,1,$13)`, s.jobsTable),
+			params.JobID,
+			params.Owner.OrgID,
+			params.Owner.UserLogin,
+			oKey,
+			params.DatasourceUID,
+			string(params.QueryKind),
+			scopeJSON,
+			string(initStatus),
+			params.MaxRepairAttempts,
+			gaugesJSON,
+			nowMs,
+			expiresAtMs,
+			leaseUntilMs,
+		)
+	}
 	if err != nil {
 		if isPgUniqueViolation(err) {
 			return OpLease{}, fmt.Errorf("job id %q already exists", params.JobID)
@@ -1082,6 +1219,8 @@ type pgJobRow struct {
 	expiresAtMs        int64
 	activeOpToken      uint64
 	activeOpUntilMs    int64
+	jobKind            string
+	reportJSON         string
 }
 
 func (r *pgJobRow) isActive(nowMs int64) bool {
@@ -1137,6 +1276,14 @@ func (r *pgJobRow) toSnapshot(opName string) (JobSnapshot, error) {
 		}
 		currentIR = &doc
 	}
+	var statusReport *ir.StatusReportIR
+	if r.reportJSON != "" {
+		var rep ir.StatusReportIR
+		if err := json.Unmarshal([]byte(r.reportJSON), &rep); err != nil {
+			return JobSnapshot{}, wrapPostgresErr(opName, fmt.Errorf("unmarshal statusReport: %w", err))
+		}
+		statusReport = &rep
+	}
 	var diffs []ir.DiffEntry
 	if r.lastDiffJSON != "" {
 		if err := json.Unmarshal([]byte(r.lastDiffJSON), &diffs); err != nil {
@@ -1158,17 +1305,19 @@ func (r *pgJobRow) toSnapshot(opName string) (JobSnapshot, error) {
 		meta = &m
 	}
 	qKind := query.Kind(r.queryKind)
-	if qKind == "" {
+	if qKind == "" && r.jobKind != JobKindReport {
 		qKind = query.KindPromQL
 	}
 	return JobSnapshot{
 		JobID:              r.id,
+		JobKind:            r.jobKind,
 		Status:             JobStatus(r.status),
 		DatasourceUID:      r.datasourceUID,
 		QueryKind:          string(qKind),
 		Scope:              scope,
 		ImportSource:       importSrc,
 		CurrentIR:          currentIR,
+		StatusReport:       statusReport,
 		LastDiff:           diffs,
 		Summary:            r.summary,
 		Warnings:           warns,
@@ -1182,6 +1331,13 @@ func (r *pgJobRow) toSnapshot(opName string) (JobSnapshot, error) {
 }
 
 func (s *PostgresStore) selectJobRowWithClock(ctx context.Context, q pgQueryRower, jobID string, includeHistory bool, forUpdate bool, explicitNow time.Time) (*pgJobRow, int64, error) {
+	if !s.supportsReportStorage.Load() {
+		last := s.lastReportProbeNs.Load()
+		if last == 0 || time.Since(time.Unix(0, last)) >= postgresReportProbeInterval {
+			_, _ = s.probeReportColumnsWith(ctx, q)
+		}
+	}
+
 	histExpr := "''"
 	if includeHistory {
 		histExpr = "history_json"
@@ -1194,36 +1350,59 @@ func (s *PostgresStore) selectJobRowWithClock(ctx context.Context, q pgQueryRowe
 	if !explicitNow.IsZero() {
 		clockExpr = strconv.FormatInt(normalizeTimestamp(explicitNow).UnixMilli(), 10) + "::BIGINT"
 	}
-	querySQL := fmt.Sprintf(`SELECT
-		job_id, org_id, user_login, datasource_uid, query_kind,
-		scope_json, import_source_json, status, current_ir_json, current_rev,
-		%s, history_len, last_diff_json, summary, warnings_json,
-		error_message, repair_attempts_used, max_repair_attempts, llm_meta_json,
-		known_gauges_json, updated_at_ms, expires_at_ms, active_op_token, active_op_until_ms,
-		%s
-	FROM %s WHERE job_id = $1%s`, histExpr, clockExpr, s.jobsTable, lockClause)
 
-	var row pgJobRow
-	var opTokenSigned int64
-	var nowMs int64
-	err := q.QueryRow(ctx, querySQL, jobID).Scan(
-		&row.id, &row.orgID, &row.userLogin, &row.datasourceUID, &row.queryKind,
-		&row.scopeJSON, &row.importSourceJSON, &row.status, &row.currentIRJSON, &row.currentRev,
-		&row.historyJSON, &row.historyLen, &row.lastDiffJSON, &row.summary, &row.warningsJSON,
-		&row.errorMessage, &row.repairAttemptsUsed, &row.maxRepairAttempts, &row.llmMetaJSON,
-		&row.knownGaugesJSON, &row.updatedAtMs, &row.expiresAtMs, &opTokenSigned, &row.activeOpUntilMs,
-		&nowMs,
-	)
-	if err != nil {
-		if errors.Is(err, pgx.ErrNoRows) {
-			return nil, 0, ErrJobNotFound
+	runSelect := func(withReportCols bool) (*pgJobRow, int64, error) {
+		reportColsExpr := "'', ''"
+		if withReportCols {
+			reportColsExpr = "job_kind, report_json"
 		}
+		querySQL := fmt.Sprintf(`SELECT
+			job_id, org_id, user_login, datasource_uid, query_kind,
+			scope_json, import_source_json, status, current_ir_json, current_rev,
+			%s, history_len, last_diff_json, summary, warnings_json,
+			error_message, repair_attempts_used, max_repair_attempts, llm_meta_json,
+			known_gauges_json, updated_at_ms, expires_at_ms, active_op_token, active_op_until_ms,
+			%s, %s
+		FROM %s WHERE job_id = $1%s`, histExpr, reportColsExpr, clockExpr, s.jobsTable, lockClause)
+
+		var row pgJobRow
+		var opTokenSigned int64
+		var nowMs int64
+		err := q.QueryRow(ctx, querySQL, jobID).Scan(
+			&row.id, &row.orgID, &row.userLogin, &row.datasourceUID, &row.queryKind,
+			&row.scopeJSON, &row.importSourceJSON, &row.status, &row.currentIRJSON, &row.currentRev,
+			&row.historyJSON, &row.historyLen, &row.lastDiffJSON, &row.summary, &row.warningsJSON,
+			&row.errorMessage, &row.repairAttemptsUsed, &row.maxRepairAttempts, &row.llmMetaJSON,
+			&row.knownGaugesJSON, &row.updatedAtMs, &row.expiresAtMs, &opTokenSigned, &row.activeOpUntilMs,
+			&row.jobKind, &row.reportJSON,
+			&nowMs,
+		)
+		if err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				return nil, 0, ErrJobNotFound
+			}
+			return nil, 0, err
+		}
+		if opTokenSigned > 0 {
+			row.activeOpToken = uint64(opTokenSigned)
+		}
+		return &row, nowMs, nil
+	}
+
+	withReportCols := s.supportsReportStorage.Load()
+	row, nowMs, err := runSelect(withReportCols)
+	if err != nil {
 		return nil, 0, err
 	}
-	if opTokenSigned > 0 {
-		row.activeOpToken = uint64(opTokenSigned)
+	// Multi-replica zero-restart DML-only migration guard: if another replica already created a report
+	// row (empty query_kind or report-only status) after DBA added columns, immediately re-probe on q
+	// and re-select job_kind + report_json so GET/Cancel/Patch/Repair/Undo never see a split-brain row.
+	if !withReportCols && (row.queryKind == "" || JobStatus(row.status) == StatusAnalyzing || JobStatus(row.status) == StatusValidatingReport || JobStatus(row.status) == StatusReady) {
+		if supported, probeErr := s.probeReportColumnsWith(ctx, q); probeErr == nil && supported {
+			return runSelect(true)
+		}
 	}
-	return &row, nowMs, nil
+	return row, nowMs, nil
 }
 
 func (s *PostgresStore) verifyOwnedRowTx(ctx context.Context, tx pgx.Tx, owner Owner, jobID string, nowMs int64, includeHistory bool) (*pgJobRow, error) {
@@ -1307,6 +1486,9 @@ func (s *PostgresStore) GetRepairCandidate(ctx context.Context, owner Owner, job
 	if row.orgID != owner.OrgID || row.userLogin != owner.UserLogin {
 		return RepairCandidate{}, ErrForbidden
 	}
+	if row.jobKind == JobKindReport {
+		return RepairCandidate{}, ErrWrongJobKind
+	}
 
 	var docPtr *ir.DashboardIR
 	if row.currentIRJSON != "" {
@@ -1369,6 +1551,9 @@ func (s *PostgresStore) BeginPatch(ctx context.Context, params BeginPatchParams)
 			return BeginOpResult{}, err
 		}
 		return BeginOpResult{}, wrapPostgresErr("BeginPatch", err)
+	}
+	if row.jobKind == JobKindReport {
+		return BeginOpResult{}, ErrWrongJobKind
 	}
 	if row.currentIRJSON == "" {
 		return BeginOpResult{}, errors.New("job has no active IR draft to patch")
@@ -1496,6 +1681,9 @@ func (s *PostgresStore) BeginRepair(ctx context.Context, params BeginRepairParam
 			return BeginOpResult{}, err
 		}
 		return BeginOpResult{}, wrapPostgresErr("BeginRepair", err)
+	}
+	if row.jobKind == JobKindReport {
+		return BeginOpResult{}, ErrWrongJobKind
 	}
 	if row.currentIRJSON == "" {
 		return BeginOpResult{}, errors.New("job has no active IR draft to repair")
@@ -1662,6 +1850,16 @@ func (s *PostgresStore) FinishJob(ctx context.Context, params FinishJobParams) (
 	if err != nil {
 		return JobSnapshot{}, fmt.Errorf("marshal warnings: %w", err)
 	}
+	var reportJSON string
+	hasReport := false
+	if params.Report != nil {
+		b, err := json.Marshal(params.Report)
+		if err != nil {
+			return JobSnapshot{}, fmt.Errorf("%w: marshal report: %v", ErrStoreUnavailable, err)
+		}
+		reportJSON = string(b)
+		hasReport = true
+	}
 	var metaJSON string
 	hasMeta := false
 	if params.LLMMeta != nil {
@@ -1709,6 +1907,9 @@ func (s *PostgresStore) FinishJob(ctx context.Context, params FinishJobParams) (
 		row.currentIRJSON = docJSON
 		row.currentRev = docRev
 	}
+	if hasReport {
+		row.reportJSON = reportJSON
+	}
 	row.lastDiffJSON = diffsJSON
 	row.summary = params.Summary
 	row.warningsJSON = warnsJSON
@@ -1719,16 +1920,30 @@ func (s *PostgresStore) FinishJob(ctx context.Context, params FinishJobParams) (
 	row.updatedAtMs = nowMs
 	row.expiresAtMs = nowMs + ttlMs
 
-	_, err = tx.Exec(ctx, fmt.Sprintf(`UPDATE %s
-		SET active_op_token = $1, active_op_until_ms = 0, status = $2,
-		    current_ir_json = $3, current_rev = $4, last_diff_json = $5,
-		    summary = $6, warnings_json = $7, error_message = $8,
-		    llm_meta_json = $9, updated_at_ms = $10, expires_at_ms = $11
-		WHERE job_id = $12`, s.jobsTable),
-		opTokenToInt64(newToken), row.status,
-		row.currentIRJSON, row.currentRev, row.lastDiffJSON,
-		row.summary, row.warningsJSON, row.errorMessage,
-		row.llmMetaJSON, row.updatedAtMs, row.expiresAtMs, params.JobID)
+	if s.supportsReportStorage.Load() {
+		_, err = tx.Exec(ctx, fmt.Sprintf(`UPDATE %s
+			SET active_op_token = $1, active_op_until_ms = 0, status = $2,
+			    current_ir_json = $3, current_rev = $4, last_diff_json = $5,
+			    summary = $6, warnings_json = $7, error_message = $8,
+			    llm_meta_json = $9, updated_at_ms = $10, expires_at_ms = $11,
+			    report_json = $12
+			WHERE job_id = $13`, s.jobsTable),
+			opTokenToInt64(newToken), row.status,
+			row.currentIRJSON, row.currentRev, row.lastDiffJSON,
+			row.summary, row.warningsJSON, row.errorMessage,
+			row.llmMetaJSON, row.updatedAtMs, row.expiresAtMs, row.reportJSON, params.JobID)
+	} else {
+		_, err = tx.Exec(ctx, fmt.Sprintf(`UPDATE %s
+			SET active_op_token = $1, active_op_until_ms = 0, status = $2,
+			    current_ir_json = $3, current_rev = $4, last_diff_json = $5,
+			    summary = $6, warnings_json = $7, error_message = $8,
+			    llm_meta_json = $9, updated_at_ms = $10, expires_at_ms = $11
+			WHERE job_id = $12`, s.jobsTable),
+			opTokenToInt64(newToken), row.status,
+			row.currentIRJSON, row.currentRev, row.lastDiffJSON,
+			row.summary, row.warningsJSON, row.errorMessage,
+			row.llmMetaJSON, row.updatedAtMs, row.expiresAtMs, params.JobID)
+	}
 	if err != nil {
 		return JobSnapshot{}, wrapPostgresErr("FinishJob", err)
 	}
@@ -1997,12 +2212,16 @@ func (s *PostgresStore) RevertOnCancel(ctx context.Context, owner Owner, jobID s
 		}
 		row.activeOpToken = newToken
 		row.activeOpUntilMs = 0
-		if row.currentIRJSON != "" {
+		if row.jobKind == JobKindReport {
+			row.status = string(StatusCancelled)
+			row.summary = "Status analysis was cancelled."
+		} else if row.currentIRJSON != "" {
 			row.status = string(StatusAwaitingPreview)
+			row.summary = "処理がキャンセルされたためドラフトは変更されていません。"
 		} else {
 			row.status = string(StatusCancelled)
+			row.summary = "処理がキャンセルされたためドラフトは変更されていません。"
 		}
-		row.summary = "処理がキャンセルされたためドラフトは変更されていません。"
 		row.updatedAtMs = nowMs
 		row.expiresAtMs = nowMs + ttlMs
 
@@ -2053,6 +2272,9 @@ func (s *PostgresStore) Undo(ctx context.Context, owner Owner, jobID string, now
 			return MutationResult{}, err
 		}
 		return MutationResult{}, wrapPostgresErr("Undo", err)
+	}
+	if row.jobKind == JobKindReport {
+		return MutationResult{}, ErrWrongJobKind
 	}
 	if row.historyLen == 0 || row.currentIRJSON == "" {
 		return MutationResult{}, ErrNoUndoHistory
@@ -2168,18 +2390,30 @@ func (s *PostgresStore) Cancel(ctx context.Context, owner Owner, jobID string, n
 		return MutationResult{}, wrapPostgresErr("Cancel", err)
 	}
 
+	if row.jobKind == JobKindReport && !row.isActive(nowMs) && isTerminalReportStatus(JobStatus(row.status)) {
+		snap, snapErr := row.toSnapshot("Cancel")
+		if snapErr != nil {
+			return MutationResult{}, snapErr
+		}
+		return MutationResult{Snapshot: snap, OpToken: row.activeOpToken}, nil
+	}
+
 	newToken, err := nextOpToken(row.activeOpToken)
 	if err != nil {
 		return MutationResult{}, wrapPostgresErr("Cancel", err)
 	}
 	row.activeOpToken = newToken
 	row.activeOpUntilMs = 0
-	if row.currentIRJSON == "" {
+	if row.jobKind == JobKindReport {
 		row.status = string(StatusCancelled)
+		row.summary = "Status analysis was cancelled."
+	} else if row.currentIRJSON == "" {
+		row.status = string(StatusCancelled)
+		row.summary = "実行中の処理をキャンセルしました。"
 	} else {
 		row.status = string(StatusAwaitingPreview)
+		row.summary = "実行中の処理をキャンセルしました。"
 	}
-	row.summary = "実行中の処理をキャンセルしました。"
 	row.updatedAtMs = nowMs
 	row.expiresAtMs = nowMs + ttlMs
 
@@ -2500,6 +2734,8 @@ func isDomainJobErr(err error) bool {
 		errors.Is(err, ErrBudgetExhausted) ||
 		errors.Is(err, ErrNoUndoHistory) ||
 		errors.Is(err, ErrJobCancelled) ||
+		errors.Is(err, ErrWrongJobKind) ||
+		errors.Is(err, ErrReportStorageMigrationRequired) ||
 		errors.Is(err, ir.ErrRevisionConflict) ||
 		errors.Is(err, ir.ErrPanelNotFound)
 }

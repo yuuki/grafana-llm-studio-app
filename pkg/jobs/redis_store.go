@@ -290,6 +290,11 @@ func (s *RedisStore) CreateGenerating(ctx context.Context, params CreateGenerati
 	leaseTTLMs := maxInt64(limits.OpLeaseTTL.Milliseconds(), 1)
 	oKey := ownerKey(params.Owner)
 
+	initStatus := StatusGenerating
+	if params.JobKind == JobKindReport {
+		initStatus = StatusAnalyzing
+	}
+
 	res, err := redisScriptCreateGenerating.Run(ctx, s.client,
 		[]string{
 			s.jobKey(params.JobID),
@@ -319,6 +324,8 @@ func (s *RedisStore) CreateGenerating(ctx context.Context, params CreateGenerati
 		strconv.Itoa(limits.MaxConcurrentJobsPerUser),
 		strconv.FormatInt(redisIndexTTLBufferMs, 10),
 		strconv.Itoa(maxKnownGaugesPerJob),
+		params.JobKind,
+		string(initStatus),
 	).Result()
 	if err != nil {
 		return OpLease{}, wrapRedisErr("CreateGenerating", err)
@@ -667,6 +674,16 @@ func (s *RedisStore) FinishJob(ctx context.Context, params FinishJobParams) (Job
 		docRev = strconv.Itoa(params.Doc.Revision)
 		panelIDs = strings.Join(extractPanelIDs(params.Doc.Panels), "\n")
 	}
+	hasReport := "0"
+	reportJSON := ""
+	if params.Report != nil {
+		b, err := json.Marshal(params.Report)
+		if err != nil {
+			return JobSnapshot{}, fmt.Errorf("%w: marshal report: %v", ErrStoreUnavailable, err)
+		}
+		hasReport = "1"
+		reportJSON = string(b)
+	}
 	diffsJSON, err := marshalOptionalDiffs(params.Diffs)
 	if err != nil {
 		return JobSnapshot{}, fmt.Errorf("marshal diffs: %w", err)
@@ -712,6 +729,8 @@ func (s *RedisStore) FinishJob(ctx context.Context, params FinishJobParams) (Job
 		redisNowArgMs(params.Now),
 		strconv.FormatInt(ttlMs, 10),
 		strconv.FormatInt(redisIndexTTLBufferMs, 10),
+		hasReport,
+		reportJSON,
 	).Result()
 	if err != nil {
 		return JobSnapshot{}, wrapRedisErr("FinishJob", err)
@@ -1156,6 +1175,8 @@ func mapRedisScriptError(args []any, _ string, _ string) error {
 		return ErrConcurrencyLimited
 	case "NO_UNDO_HISTORY":
 		return ErrNoUndoHistory
+	case "WRONG_JOB_KIND":
+		return ErrWrongJobKind
 	case "REVISION_LIMIT":
 		return fmt.Errorf("revision limit %d reached", ir.MaxRevision)
 	case "DUPLICATE_JOB":
@@ -1165,18 +1186,19 @@ func mapRedisScriptError(args []any, _ string, _ string) error {
 	}
 }
 
-// snapshotFromHMGetReply decodes the fixed 17-element HMGET sequence returned by Lua read_snapshot():
+// snapshotFromHMGetReply decodes the HMGET sequence returned by Lua read_snapshot():
 // [0]=id, [1]=datasource_uid, [2]=query_kind, [3]=scope_json, [4]=import_source_json,
 // [5]=status, [6]=current_ir_json, [7]=current_revision, [8]=hist_len, [9]=last_diff_json,
 // [10]=summary, [11]=warnings_json, [12]=error_message, [13]=repair_attempts_used,
-// [14]=max_repair_attempts, [15]=llm_meta_json, [16]=updated_at_ms.
+// [14]=max_repair_attempts, [15]=llm_meta_json, [16]=updated_at_ms,
+// optional additive fields: [17]=job_kind, [18]=report_json.
 func snapshotFromHMGetReply(v any, opName string) (JobSnapshot, error) {
 	vals, ok := v.([]any)
 	if !ok || len(vals) < 17 {
 		return JobSnapshot{}, wrapRedisErr(opName, fmt.Errorf("unexpected HMGET reply %T", v))
 	}
 	field := func(idx int) string {
-		if vals[idx] == nil {
+		if idx >= len(vals) || vals[idx] == nil {
 			return ""
 		}
 		return asString(vals[idx])
@@ -1209,6 +1231,14 @@ func snapshotFromHMGetReply(v any, opName string) (JobSnapshot, error) {
 		}
 		currentIR = &doc
 	}
+	var statusReport *ir.StatusReportIR
+	if raw := field(18); raw != "" {
+		var rep ir.StatusReportIR
+		if err := json.Unmarshal([]byte(raw), &rep); err != nil {
+			return JobSnapshot{}, wrapRedisErr(opName, fmt.Errorf("unmarshal statusReport: %w", err))
+		}
+		statusReport = &rep
+	}
 	var diffs []ir.DiffEntry
 	if raw := field(9); raw != "" {
 		if err := json.Unmarshal([]byte(raw), &diffs); err != nil {
@@ -1233,18 +1263,21 @@ func snapshotFromHMGetReply(v any, opName string) (JobSnapshot, error) {
 	used, _ := strconv.Atoi(field(13))
 	maxRep, _ := strconv.Atoi(field(14))
 	updatedMs, _ := strconv.ParseInt(field(16), 10, 64)
+	jobKind := field(17)
 	qKind := query.Kind(field(2))
-	if qKind == "" {
+	if qKind == "" && jobKind != JobKindReport {
 		qKind = query.KindPromQL
 	}
 	return JobSnapshot{
 		JobID:              field(0),
+		JobKind:            jobKind,
 		Status:             JobStatus(field(5)),
 		DatasourceUID:      field(1),
 		QueryKind:          string(qKind),
 		Scope:              scope,
 		ImportSource:       importSrc,
 		CurrentIR:          currentIR,
+		StatusReport:       statusReport,
 		LastDiff:           diffs,
 		Summary:            field(10),
 		Warnings:           warns,
@@ -1475,7 +1508,9 @@ local function read_snapshot(jobKey)
 		'repair_attempts_used',
 		'max_repair_attempts',
 		'llm_meta_json',
-		'updated_at_ms'
+		'updated_at_ms',
+		'job_kind',
+		'report_json'
 	)
 end
 
@@ -1569,6 +1604,11 @@ local maxConcurrent = tonumber(ARGV[16]) or 1
 local maxConcurrentPerUser = tonumber(ARGV[17]) or 1
 local idxBufMs = tonumber(ARGV[18]) or 60000
 local maxGauges = tonumber(ARGV[19]) or 512
+local jobKind = ARGV[20] or ''
+local initStatus = ARGV[21]
+if not initStatus or initStatus == '' then
+	initStatus = 'generating'
+end
 
 -- 1. Reap expired concurrency slot leases and check per-org & per-user limits.
 redis.call('ZREMRANGEBYSCORE', orgSlots, '-inf', nowMs)
@@ -1662,7 +1702,9 @@ redis.call('HSET', jobKey,
 	'query_kind', qKind,
 	'scope_json', scopeJSON,
 	'import_source_json', '',
-	'status', 'generating',
+	'status', initStatus,
+	'job_kind', jobKind,
+	'report_json', '',
 	'current_ir_json', '',
 	'current_revision', '0',
 	'panel_ids', '',
@@ -1850,6 +1892,10 @@ if errReply then
 	return errReply
 end
 
+if hget_str(jobKey, 'job_kind') == 'report' then
+	return {'ERR', 'WRONG_JOB_KIND'}
+end
+
 local vals = redis.call('HMGET', jobKey,
 	'current_ir_json',
 	'current_revision',
@@ -1897,6 +1943,10 @@ local maxGauges = tonumber(ARGV[15]) or 512
 local errReply = check_owned_job(jobKey, orgIdx, userIdx, orgMeta, jobID, orgID, userLogin, nowMs)
 if errReply then
 	return errReply
+end
+
+if hget_str(jobKey, 'job_kind') == 'report' then
+	return {'ERR', 'WRONG_JOB_KIND'}
 end
 
 local currentIR = hget_str(jobKey, 'current_ir_json')
@@ -1986,6 +2036,10 @@ local maxGauges = tonumber(ARGV[14]) or 512
 local errReply = check_owned_job(jobKey, orgIdx, userIdx, orgMeta, jobID, orgID, userLogin, nowMs)
 if errReply then
 	return errReply
+end
+
+if hget_str(jobKey, 'job_kind') == 'report' then
+	return {'ERR', 'WRONG_JOB_KIND'}
 end
 
 local currentIR = hget_str(jobKey, 'current_ir_json')
@@ -2118,6 +2172,8 @@ local metaJSON = ARGV[16]
 local nowMs = resolve_now_ms(tonumber(ARGV[17]) or 0)
 local jobTTLMs = tonumber(ARGV[18]) or 1
 local idxBufMs = tonumber(ARGV[19]) or 60000
+local hasReport = ARGV[20] or '0'
+local reportJSON = ARGV[21] or ''
 
 local errReply = check_owned_job(jobKey, orgIdx, userIdx, orgMeta, jobID, orgID, userLogin, nowMs)
 if errReply then
@@ -2148,6 +2204,9 @@ if hasDoc == '1' then
 		'current_revision', docRev,
 		'panel_ids', panelIDs
 	)
+end
+if hasReport == '1' then
+	redis.call('HSET', jobKey, 'report_json', reportJSON)
 end
 if hasMeta == '1' then
 	redis.call('HSET', jobKey, 'llm_meta_json', metaJSON)
@@ -2345,9 +2404,14 @@ end
 
 local storedToken = hget_num(jobKey, 'active_op_token')
 if opToken > 0 and storedToken == opToken and is_active(jobKey, nowMs) then
+	local jobKind = hget_str(jobKey, 'job_kind')
 	local currentIR = hget_str(jobKey, 'current_ir_json')
 	local nextStatus = 'cancelled'
-	if currentIR ~= '' then
+	local nextSummary = cancelSummary
+	if jobKind == 'report' then
+		nextStatus = 'cancelled'
+		nextSummary = 'Status analysis was cancelled.'
+	elseif currentIR ~= '' then
 		nextStatus = 'awaiting_preview'
 	end
 	local expiresAtMs = nowMs + jobTTLMs
@@ -2356,7 +2420,7 @@ if opToken > 0 and storedToken == opToken and is_active(jobKey, nowMs) then
 		'active_op_token', tostring(nextToken),
 		'active_op_until_ms', '0',
 		'status', nextStatus,
-		'summary', cancelSummary,
+		'summary', nextSummary,
 		'updated_at_ms', tostring(nowMs),
 		'expires_at_ms', tostring(expiresAtMs)
 	)
@@ -2392,6 +2456,10 @@ local cancelChannel = ARGV[10]
 local errReply = check_owned_job(jobKey, orgIdx, userIdx, orgMeta, jobID, orgID, userLogin, nowMs)
 if errReply then
 	return errReply
+end
+
+if hget_str(jobKey, 'job_kind') == 'report' then
+	return {'ERR', 'WRONG_JOB_KIND'}
 end
 
 local histLen = hget_num(jobKey, 'hist_len')
@@ -2470,10 +2538,20 @@ if errReply then
 	return errReply
 end
 
+local jobKind = hget_str(jobKey, 'job_kind')
+local curStatus = hget_str(jobKey, 'status')
+if jobKind == 'report' and not is_active(jobKey, nowMs) and (curStatus == 'ready' or curStatus == 'failed' or curStatus == 'cancelled') then
+	return {'OK', read_snapshot(jobKey), tostring(hget_num(jobKey, 'active_op_token'))}
+end
+
 local nextToken = hget_num(jobKey, 'active_op_token') + 1
 local currentIR = hget_str(jobKey, 'current_ir_json')
 local nextStatus = 'cancelled'
-if currentIR ~= '' then
+local nextSummary = cancelSummary
+if jobKind == 'report' then
+	nextStatus = 'cancelled'
+	nextSummary = 'Status analysis was cancelled.'
+elseif currentIR ~= '' then
 	nextStatus = 'awaiting_preview'
 end
 local expiresAtMs = nowMs + jobTTLMs
@@ -2482,7 +2560,7 @@ redis.call('HSET', jobKey,
 	'active_op_token', tostring(nextToken),
 	'active_op_until_ms', '0',
 	'status', nextStatus,
-	'summary', cancelSummary,
+	'summary', nextSummary,
 	'updated_at_ms', tostring(nowMs),
 	'expires_at_ms', tostring(expiresAtMs)
 )
